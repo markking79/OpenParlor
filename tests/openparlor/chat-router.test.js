@@ -431,3 +431,238 @@ test('requires an authenticated user with directories', async () => {
     }
     assert.equal(mock.calls.length, 0);
 });
+
+// ─── Chat persistence tests ──────────────────────────────────────────────────
+
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import * as persistence from '../../src/openparlor/persistence.js';
+
+function makeTempDirs() {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'openparlor-chat-persist-'));
+    return { root, cleanup: () => fs.rmSync(root, { recursive: true, force: true }) };
+}
+
+test('non-stream chat with conversation_id persists user and assistant messages with server-derived participant ID', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'C' });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'Test');
+        const participant = conv.participants.find(p => p.role === 'character');
+        const mock = mockProvider(() => completion);
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+        }, user, async baseUrl => {
+            const result = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'hello' }],
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+        });
+
+        const messages = persistence.getMessages(dirs, conv.id);
+        assert.equal(messages.length, 2);
+        assert.equal(messages[0].role, 'user');
+        assert.equal(messages[0].content, 'hello');
+        assert.equal(messages[0].participant_id, participant.id);
+        assert.equal(messages[1].role, 'character');
+        assert.equal(messages[1].content, 'hi there');
+        assert.equal(messages[1].participant_id, participant.id);
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('stream success with conversation_id persists assistant exactly once', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'C' });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'Test');
+        const participant = conv.participants.find(p => p.role === 'character');
+        const chunks = [sseDelta('hello '), sseDelta('world'), 'data: [DONE]\n\n'];
+        const mock = mockStreamProvider(chunks);
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+        }, user, async baseUrl => {
+            const result = await postChatStream(baseUrl, {
+                messages: [{ role: 'user', content: 'hi' }],
+                stream: true,
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+            assert.deepEqual(result.records[2], { type: 'done', conversation_id: conv.id });
+        });
+
+        const messages = persistence.getMessages(dirs, conv.id);
+        assert.equal(messages.length, 2);
+        assert.equal(messages[0].role, 'user');
+        assert.equal(messages[0].content, 'hi');
+        assert.equal(messages[0].participant_id, participant.id);
+        assert.equal(messages[1].role, 'character');
+        assert.equal(messages[1].content, 'hello world');
+        assert.equal(messages[1].participant_id, participant.id);
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('stream error with conversation_id persists user message but NOT assistant', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'C' });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'Test');
+        const participant = conv.participants.find(p => p.role === 'character');
+        const chunks = [sseDelta('partial')];
+        const mock = mockStreamProvider(chunks, {
+            error: new ModelProviderError('upstream failed', { status: 503 }),
+        });
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+        }, user, async baseUrl => {
+            const result = await postChatStream(baseUrl, {
+                messages: [{ role: 'user', content: 'hi' }],
+                stream: true,
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+            assert.equal(result.records[1].type, 'error');
+        });
+
+        const messages = persistence.getMessages(dirs, conv.id);
+        assert.equal(messages.length, 1);
+        assert.equal(messages[0].role, 'user');
+        assert.equal(messages[0].content, 'hi');
+        assert.equal(messages[0].participant_id, participant.id);
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('stream abort with conversation_id persists user message but NOT assistant', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'C' });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'Test');
+        const participant = conv.participants.find(p => p.role === 'character');
+
+        // Provider that never resolves (simulates a hang that gets aborted)
+        const mock = {
+            calls: [],
+            provider: {
+                chatCompletion: async () => { throw new Error('not expected'); },
+                streamChatCompletion: async (messages, options) => {
+                    mock.calls.push({ messages, options });
+                    return (async function* () {
+                        yield new TextEncoder().encode(sseDelta('partial'));
+                        // Wait until aborted
+                        await new Promise((resolve, reject) => {
+                            const onAbort = () => reject(new Error('Aborted'));
+                            options.signal.addEventListener('abort', onAbort, { once: true });
+                        });
+                    })();
+                },
+            },
+        };
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+        }, user, async baseUrl => {
+            const controller = new AbortController();
+            const response = await fetch(`${baseUrl}/api/openparlor/chat`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    messages: [{ role: 'user', content: 'hi' }],
+                    stream: true,
+                    conversation_id: conv.id,
+                }),
+                signal: controller.signal,
+            });
+            // Read one chunk then abort
+            const reader = response.body.getReader();
+            await reader.read();
+            controller.abort();
+            try { await reader.read(); } catch { /* expected */ }
+        });
+
+        const messages = persistence.getMessages(dirs, conv.id);
+        assert.equal(messages.length, 1);
+        assert.equal(messages[0].role, 'user');
+        assert.equal(messages[0].content, 'hi');
+        assert.equal(messages[0].participant_id, participant.id);
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('chat with another user\'s conversation returns 403', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'bob', { name: 'C' });
+        const conv = persistence.createConversation(dirs, 'bob', char.id, 'BobConv');
+        const mock = mockProvider(() => completion);
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+        }, user, async baseUrl => {
+            const result = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'hello' }],
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 403);
+            assert.deepEqual(result.body, { error: 'Forbidden' });
+        });
+        assert.equal(mock.calls.length, 0);
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('chat with non-existent conversation returns 404', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const mock = mockProvider(() => completion);
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+        }, user, async baseUrl => {
+            const result = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'hello' }],
+                conversation_id: 'nonexistent-id',
+            });
+            assert.equal(result.status, 404);
+            assert.deepEqual(result.body, { error: 'Conversation not found' });
+        });
+        assert.equal(mock.calls.length, 0);
+    } finally {
+        tmp.cleanup();
+    }
+});

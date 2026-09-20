@@ -1,31 +1,35 @@
-# TASK-DATA-001 — Define OpenParlor persistence boundary
+# TASK-DATA-002 — Persist one-on-one chats
 
 ## Goal
 
-Audit and complete the preserved filesystem persistence boundary for the six
-OpenParlor entities. Keep data strictly within the authenticated user's
-`directories.root/openparlor` area and provide a small, server-only API for
-later route/UI tasks.
+Expose an authenticated, server-owned one-on-one conversation API and connect
+chat generation persistence to it. Do not accept the preserved overbroad data
+router; character/memory/settings APIs belong to later tasks.
 
 ## Acceptance criteria
 
-- Character, Conversation, ConversationParticipant, Message, Memory, and
-  UserOpenParlorSettings have documented IDs, timestamps, ownership, and a
-  schema-version migration anchor.
-- New records and metadata are created beneath the user root; no persistence
-  API accepts a browser-supplied filesystem path.
-- Entity writes are atomic where a full JSON document is replaced. Message
-  storage tolerates a trailing corrupt/incomplete JSONL record after a crash.
-- Reading a missing collection returns an empty result; malformed persisted
-  JSON does not crash a list operation.
-- Focused Node tests verify ownership filtering, round trips, recency order,
-  and corrupted-tail recovery.
+- Authenticated API supports create, list recent, load, rename, and archive
+  or delete conversations, without filesystem path exposure or cross-user
+  access.
+- Conversations have one character participant and append valid user and
+  assistant messages with timestamps; chat requests referencing a conversation
+  persist exactly those messages.
+- Chat never trusts browser participant IDs or roles for server persistence;
+  stream success persists the completed assistant content once, while aborts
+  and errors never fabricate a successful assistant record.
+- Focused tests cover route ownership, lifecycle, restart/read round trip,
+  chat persistence, and stream/error behavior.
 
 ## Exact allowlist for worker
 
 - `src/openparlor/persistence.js`
-- `tests/openparlor/persistence.test.js` (new)
+- `src/openparlor/chat-router.js`
+- `src/openparlor/conversation-router.js` (new)
+- `src/server-startup.js`
+- `tests/openparlor/persistence.test.js`
+- `tests/openparlor/chat-router.test.js`
+- `tests/openparlor/conversation-router.test.js` (new)
 
-Do not edit routes, startup wiring, chat code, public files, package files,
-or any `.agent` control files. Do not commit, push, stage, reset, clean, or
-discard existing work.
+Do not edit `src/openparlor/router.js`, public files, package files, or any
+`.agent` control files. Do not commit, push, stage, reset, clean, or discard
+existing work.

@@ -2,6 +2,13 @@
 
 ## Current state
 
+TASK-DATA-002 accepted: authenticated one-on-one conversation lifecycle and
+chat persistence are available at `/api/openparlor/conversations`. Focused
+tests: 54 passed; changed-source lint passed. The broad pre-existing
+`/api/openparlor/data` mount and `router.js` remain intentionally uncommitted.
+
+## Current state
+
 TASK-DATA-001 is accepted. OpenParlor now has a server-only, per-user
 filesystem persistence boundary under `<directories.root>/openparlor`.
 
