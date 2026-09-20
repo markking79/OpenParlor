@@ -2,9 +2,9 @@
 
 ## Last completed task
 
-TASK-DATA-001 — Define OpenParlor persistence boundary
+TASK-DATA-002 — Persist one-on-one chats
 
-Local commit: c9d99db07
+Local commit: 9450f5b8a
 
 Push status: manual; no push was attempted by the supervisor.
 

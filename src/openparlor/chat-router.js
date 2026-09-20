@@ -2,6 +2,7 @@ import express from 'express';
 
 import { loadOpenParlorConfig } from './config.js';
 import { createModelProvider, ModelProviderError } from './model-provider.js';
+import * as persistence from './persistence.js';
 
 /**
  * @typedef {Object} ChatMessage
@@ -103,6 +104,23 @@ export function createOpenParlorChatRouter({
         }
 
         const stream = request.body.stream === true;
+        const conversationId = typeof request.body.conversation_id === 'string' ? request.body.conversation_id : null;
+        const handle = user.profile?.handle ?? 'unknown';
+
+        // Validate conversation and persist the user's message
+        if (conversationId) {
+            const conversation = persistence.getConversation(user.directories, conversationId);
+            if (!conversation) {
+                return response.status(404).json({ error: 'Conversation not found' });
+            }
+            if (conversation.owner_id !== handle) {
+                return response.status(403).json({ error: 'Forbidden' });
+            }
+            const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
+            if (lastUserMsg) {
+                persistence.appendMessage(user.directories, conversationId, 'user', lastUserMsg.content, 'user');
+            }
+        }
 
         try {
             const config = await loadConfig(user.directories);
@@ -110,7 +128,13 @@ export function createOpenParlorChatRouter({
 
             if (!stream) {
                 const completion = await provider.chatCompletion(messages);
-                return response.json(completion);
+                if (conversationId) {
+                    const assistantContent = typeof completion?.choices?.[0]?.message?.content === 'string'
+                        ? completion.choices[0].message.content
+                        : JSON.stringify(completion);
+                    persistence.appendMessage(user.directories, conversationId, 'assistant', assistantContent, 'assistant');
+                }
+                return response.json({ ...completion, conversation_id: conversationId });
             }
 
             response.writeHead(200, {
@@ -121,6 +145,7 @@ export function createOpenParlorChatRouter({
 
             const decoder = new TextDecoder('utf-8', { stream: true });
             let buffer = '';
+            let assistantText = '';
             const abortController = new AbortController();
             const abortStream = () => abortController.abort();
             request.once('aborted', abortStream);
@@ -139,6 +164,7 @@ export function createOpenParlorChatRouter({
                     for (const line of lines) {
                         const delta = extractSseDelta(line);
                         if (delta !== null) {
+                            assistantText += delta;
                             writeRecord({ type: 'delta', text: delta });
                         }
                     }
@@ -147,10 +173,11 @@ export function createOpenParlorChatRouter({
                 if (buffer) {
                     const delta = extractSseDelta(buffer);
                     if (delta !== null) {
+                        assistantText += delta;
                         writeRecord({ type: 'delta', text: delta });
                     }
                 }
-                writeRecord({ type: 'done' });
+                writeRecord({ type: 'done', conversation_id: conversationId });
             } catch (streamError) {
                 if (streamError instanceof ModelProviderError) {
                     writeRecord({ type: 'error', error: streamError.message });
@@ -160,6 +187,13 @@ export function createOpenParlorChatRouter({
             } finally {
                 request.off('aborted', abortStream);
                 response.off('close', abortStream);
+                if (conversationId && assistantText) {
+                    try {
+                        persistence.appendMessage(user.directories, conversationId, 'assistant', assistantText, 'assistant');
+                    } catch (persistErr) {
+                        console.error('OpenParlor: failed to persist assistant message', persistErr);
+                    }
+                }
             }
             response.end();
         } catch (error) {

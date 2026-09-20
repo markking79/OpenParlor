@@ -35,6 +35,7 @@ import { sync as writeFileAtomicSync } from 'write-file-atomic';
  * @property {string} created_at ISO 8601
  * @property {string} updated_at ISO 8601
  * @property {ConversationParticipant[]} participants
+ * @property {boolean} [archived] Whether the conversation is archived
  */
 
 /**
@@ -279,6 +280,7 @@ export function createConversation(directories, owner_id, character_id, title, p
         created_at: now,
         updated_at: now,
         participants: parts,
+        archived: false,
     };
 
     writeFileAtomicSync(conversationPath(directories, convId), JSON.stringify(conversation, null, 2));
@@ -304,6 +306,7 @@ export function getConversation(directories, id) {
 }
 
 /**
+ * Lists non-archived conversations for a user, sorted by most recently updated first.
  * @param {import('../users.js').UserDirectoryList} directories
  * @param {string} owner_id
  * @returns {Conversation[]}
@@ -314,7 +317,8 @@ export function listConversations(directories, owner_id) {
     return fs.readdirSync(dir)
         .filter(f => f.endsWith('.json'))
         .map(f => JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')))
-        .filter(c => c.owner_id === owner_id);
+        .filter(c => c.owner_id === owner_id && !c.archived)
+        .sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime());
 }
 
 /**

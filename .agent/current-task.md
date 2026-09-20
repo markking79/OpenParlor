@@ -1,25 +1,25 @@
-# TASK-DATA-001 — Define OpenParlor persistence boundary
+# TASK-DATA-002 — Persist one-on-one chats
 
 ## Goal
 
-## TASK-DATA-001 — Define OpenParlor persistence boundary
+## TASK-DATA-002 — Persist one-on-one chats
 
-Choose the simplest persistence that fits the existing app.
+Requirements:
 
-Prefer reusing safe existing SillyTavern storage conventions where doing so reduces risk, while placing OpenParlor-specific data behind OpenParlor APIs.
+- create conversation;
+- append messages;
+- load conversation;
+- list recent conversations;
+- rename conversation;
+- delete/archive conversation;
+- preserve timestamps;
+- crash-safe writes.
 
-Do not expose filesystem paths to the browser.
+Acceptance:
 
-Define entities:
-
-- Character
-- Conversation
-- ConversationParticipant
-- Message
-- Memory
-- UserOpenParlorSettings
-
-Document IDs, timestamps, ownership, and migration strategy.
+- restart server;
+- reload browser;
+- previous chat remains.
 
 ## Allowed files
 
