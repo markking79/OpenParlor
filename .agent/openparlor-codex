@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO="${OPENPARLOR_REPO:-$HOME/openparlor}"
+TMP="/tmp/openparlor-supervisor"
+AIDER_BIN="${AIDER_BIN:-$HOME/.local/bin/aider}"
+QWEN_BASE="${OPENPARLOR_QWEN_BASE:-http://127.0.0.1:8080/v1}"
+QWEN_KEY="${OPENPARLOR_QWEN_KEY:-local}"
+QWEN_MODEL="${OPENPARLOR_QWEN_MODEL:-openai/local}"
+MODE="${1:-}"
+CHECK_ONLY="${2:-}"
+mkdir -p "$TMP"; cd "$REPO"
+
+banner(){ printf '\n==================================================\nOPENPARLOR — %s\n==================================================\n' "$1"; }
+workers(){ pgrep -af '[a]ider.*openparlor\|[c]line -P openai-compatible' || true; }
+if [[ -n "$(workers)" ]]; then echo 'ERROR: existing OpenParlor worker detected:'; workers; exit 1; fi
+if [[ "$MODE" != '--resume' && -n "$(git status --porcelain)" ]]; then echo 'ERROR: dirty worktree; use --resume.'; exit 1; fi
+
+banner 'PHASE 1: CODEX SPECIFICATION'
+echo "task: $(head -1 .agent/current-task.md)"
+mapfile -t files < <(sed -n '/## Allowed files/,/##/p' .agent/current-task.md | grep -oE '`[^`]+`' | tr -d '`' | grep -E '^(src|public|tests)/' || true)
+printf 'allowed files:\n%s\n' "${files[*]:-none}"
+if (( ${#files[@]} == 0 )); then echo 'ERROR: task card has no parseable allowlist.'; exit 1; fi
+
+if [[ "$MODE" == '--resume' && "$CHECK_ONLY" == '--check-only' ]]; then
+  banner 'RESUME VALIDATION'
+  echo "Repository: $REPO"
+  echo "Current task: $(head -1 .agent/current-task.md | cut -d' ' -f2)"
+  echo 'Working tree: dirty, expected'
+  printf 'Expected task files:\n%s\n' ".agent/current-task.md ${files[*]}"
+  mapfile -t dirty < <(git status --porcelain | awk '{print $2}')
+  unexpected=()
+  for file in "${dirty[@]}"; do
+    case " $file " in
+      *' .agent/current-task.md '*|*' .agent/CODEX_SUPERVISOR.md '*|*' .agent/WORKER_RULES.md '*|*' .agent/openparlor-codex '*) ;;
+      *) if [[ ! " ${files[*]} " =~ " $file " ]]; then unexpected+=("$file"); fi ;;
+    esac
+  done
+  if (( ${#unexpected[@]} )); then
+    printf 'Unexpected dirty files: %s\n' "${unexpected[*]}"; echo 'Resume state: INVALID'; exit 1
+  fi
+  echo 'Unexpected dirty files: none'
+  echo 'Worker active: no'
+  echo 'Resume state: VALID'
+  echo 'No worker launched.'
+  exit 0
+fi
+
+banner 'PHASE 2: QWEN IMPLEMENTATION'
+pass=0
+for file in "${files[@]}"; do
+  ((pass+=1)); echo "pass $pass file $file"
+  prompt="Read .agent/current-task.md and existing diff. Edit ONLY $file. Preserve other dirty work. Implement the smallest remaining scoped change. Do not commit, push, or edit supervisor files."
+  (OPENAI_API_BASE="$QWEN_BASE" OPENAI_API_KEY="$QWEN_KEY" timeout --signal=INT --kill-after=30s 15m "$AIDER_BIN" "$file" --model "$QWEN_MODEL" --edit-format diff --map-tokens 0 --no-auto-commits --no-show-model-warnings --no-gitignore --yes --message "$prompt") &
+  pid=$!; echo "worker PID: $pid"
+  while kill -0 "$pid" 2>/dev/null; do sleep 30; kill -0 "$pid" 2>/dev/null && echo "Qwen still working (PID $pid)"; done
+  wait "$pid" || echo "Qwen pass exited non-zero; preserve work for Codex review."
+done
+
+banner 'PHASE 3: VERIFICATION'
+git diff --check
+changed=$(git diff --name-only; git ls-files --others --exclude-standard)
+js=$(printf '%s\n' "$changed" | grep -E '^(src|public)/.*\.js$' || true)
+[[ -z "$js" ]] || npm run lint -- --no-cache $js
+tests=$(printf '%s\n' "$changed" | grep '^tests/openparlor/.*\.test\.js$' || true)
+[[ -z "$tests" ]] || node --test $tests
+banner 'PHASE 4: CODEX REVIEW'
+git status --short; git diff --stat
+echo 'Review diff, update handoff, and stage/commit exact approved files manually after acceptance.'
