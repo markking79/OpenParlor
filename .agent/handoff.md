@@ -2,9 +2,9 @@
 
 ## Last completed task
 
-TASK-LOCAL-001 — Establish exact current state
+TASK-LOCAL-002 — Discover local AI services
 
-Local commit: 0dd47da0e
+Local commit: ad6dbd699
 
 Push status: manual; no push was attempted by the supervisor.
 
