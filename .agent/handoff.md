@@ -2,38 +2,46 @@
 
 ## Current state
 
-TASK-003 is accepted. The first authenticated OpenParlor backend chat endpoint is ready for a later browser integration.
+TASK-DATA-001 is accepted. OpenParlor now has a server-only, per-user
+filesystem persistence boundary under `<directories.root>/openparlor`.
 
 ## Last completed task
 
-TASK-003 — Authenticated OpenParlor chat endpoint.
+TASK-DATA-001 — Define OpenParlor persistence boundary.
 
-## Important decisions
+## Accepted implementation
 
-- Configuration is read exclusively from `<directories.root>/openparlor/config.json`.
-- Missing, unreadable, invalid JSON, and malformed configuration return a fresh normalized disabled configuration without creating files or logging content.
-- Runtime defaults never contain endpoints or secrets. The only local URL strings are non-routable-port placeholders in the checked-in example configuration required by the task card.
-- Providers consume normalized model configuration supplied by callers; they do not read user configuration files directly.
-- `fetch` is injectable, API keys are optional, and cancellation is represented by per-request `AbortSignal`.
-- `POST /api/openparlor/chat` is mounted inside SillyTavern's already-authenticated private endpoint setup and resolves configuration only from `request.user.directories`.
+- `persistence.js` documents Character, Conversation,
+  ConversationParticipant, Message, Memory, and UserOpenParlorSettings with
+  UUID IDs, timestamps, ownership, and a schema version anchor.
+- Full JSON entity writes use atomic replacement. JSONL reads recover from a
+  trailing malformed record after a crash and list operations skip corrupt
+  JSON records.
+- Update helpers preserve immutable IDs, creation timestamps, and ownership.
+  Their update timestamps are monotonic even inside one millisecond.
+- Persistence stays under the authenticated user's directory root and has no
+  provider/browser configuration surface.
 
-## Known issues
+## Verification
 
-- The repository has no `node_modules/.bin/jest`; TASK-002 uses Node's built-in test runner and adds no dependencies.
-- The local Qwen terminal worker was repeatedly terminated by its 30-second execution wrapper before its first edit. Its scoped implementation was completed directly after those failed attempts.
-- The focused endpoint test needs an ephemeral loopback listener and must run outside this sandbox; all provider interactions remain mocked.
+- `git diff --check`
+- `node --test tests/openparlor/persistence.test.js` — 15 passed
+- `npm run lint -- --no-cache src/openparlor/persistence.js` — passed
+- `tests/node_modules/.bin/eslint --no-cache tests/openparlor/persistence.test.js` — passed
 
-## Next dependency-first task
+The broad `tests` lint wrapper remains unsuitable as task evidence: it scans
+unrelated pre-existing TASK-004 tests and reports their two comma-dangle
+errors. No out-of-scope file was edited to hide those failures.
 
-TASK-004: add bounded streaming support to the authenticated OpenParlor chat endpoint and browser integration.
+## Preserved later-task work
 
-## Relevant commands
+`src/openparlor/router.js`, the `src/server-startup.js` router mount, and the
+chat persistence edits remain deliberately uncommitted. They pre-implement
+parts of later DATA/CHAR/MEM tasks and require separate task-scoped audit;
+they were not accepted by TASK-DATA-001.
 
-```bash
-npm run lint -- --no-cache src/openparlor/chat-router.js src/server-startup.js
-node --test tests/openparlor/chat-router.test.js
-```
+## Next dependency-safe task
 
-## Notes for the next session
-
-The chat route is intentionally non-streaming and accepts only `messages`; request provider URLs, keys, models, and message extras are ignored. Do not begin TASK-004 automatically.
+TASK-DATA-002 — audit and complete one-on-one conversation persistence using
+the accepted boundary, then integrate only the required authenticated routes
+and chat flow.
