@@ -51,6 +51,7 @@ import { router as dataMaidRouter } from './endpoints/data-maid.js';
 import { router as backupsRouter } from './endpoints/backups.js';
 import { router as imageMetadataRouter } from './endpoints/image-metadata.js';
 import { router as openParlorChatRouter } from './openparlor/chat-router.js';
+import { router as openParlorDataRouter } from './openparlor/router.js';
 import { router as volcengineRouter } from './endpoints/volcengine.js';
 
 /**
@@ -187,6 +188,7 @@ export function setupPrivateEndpoints(app) {
     app.use('/api/backups', backupsRouter);
     app.use('/api/image-metadata', imageMetadataRouter);
     app.use('/api/openparlor', openParlorChatRouter);
+    app.use('/api/openparlor/data', openParlorDataRouter);
 }
 
 /**

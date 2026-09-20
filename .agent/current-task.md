@@ -1,21 +1,25 @@
-# TASK-CHAT-003 — Generation cancellation
+# TASK-DATA-001 — Define OpenParlor persistence boundary
 
 ## Goal
 
-## TASK-CHAT-003 — Generation cancellation
+## TASK-DATA-001 — Define OpenParlor persistence boundary
 
-Add Stop Generation.
+Choose the simplest persistence that fits the existing app.
 
-Requirements:
+Prefer reusing safe existing SillyTavern storage conventions where doing so reduces risk, while placing OpenParlor-specific data behind OpenParlor APIs.
 
-- browser uses `AbortController`;
-- server sees disconnect/abort;
-- provider request aborts;
-- UI remains usable afterward.
+Do not expose filesystem paths to the browser.
 
----
+Define entities:
 
-# 7. Phase 2 — Persistence and Conversation Model
+- Character
+- Conversation
+- ConversationParticipant
+- Message
+- Memory
+- UserOpenParlorSettings
+
+Document IDs, timestamps, ownership, and migration strategy.
 
 ## Allowed files
 

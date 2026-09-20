@@ -2,9 +2,9 @@
 
 ## Last completed task
 
-TASK-CHAT-003 — Generation cancellation
+TASK-DATA-001 — Define OpenParlor persistence boundary
 
-Local commit: 9d17821e7
+Local commit: c9d99db07
 
 Push status: manual; no push was attempted by the supervisor.
 
