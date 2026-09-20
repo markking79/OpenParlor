@@ -1,21 +1,21 @@
-# TASK-CHAT-002 — Conversation history sent correctly
+# TASK-CHAT-003 — Generation cancellation
 
 ## Goal
 
-## TASK-CHAT-002 — Conversation history sent correctly
+## TASK-CHAT-003 — Generation cancellation
 
-The current browser/API must send relevant conversation history, not only the newest line.
+Add Stop Generation.
 
-Implement a server-controlled message-building layer.
+Requirements:
 
-Do not yet mix memory retrieval into this task.
+- browser uses `AbortController`;
+- server sees disconnect/abort;
+- provider request aborts;
+- UI remains usable afterward.
 
-Acceptance:
+---
 
-- multi-turn context works;
-- system/user/assistant roles remain valid;
-- malformed client roles are rejected/sanitized;
-- token growth is bounded.
+# 7. Phase 2 — Persistence and Conversation Model
 
 ## Allowed files
 
