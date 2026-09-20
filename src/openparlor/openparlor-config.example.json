@@ -1,0 +1,16 @@
+{
+    "model": {
+        "provider": "openai-compatible",
+        "baseUrl": "http://127.0.0.1:PORT/v1",
+        "model": "MODEL_NAME"
+    },
+    "stt": {
+        "provider": "PROVIDER_NAME",
+        "baseUrl": "http://127.0.0.1:PORT/stt"
+    },
+    "tts": {
+        "provider": "PROVIDER_NAME",
+        "baseUrl": "http://127.0.0.1:PORT/tts",
+        "voice": "VOICE_ID"
+    }
+}
