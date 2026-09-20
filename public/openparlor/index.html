@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OpenParlor</title>
+    <link rel="stylesheet" href="/openparlor/openparlor.css">
+</head>
+
+<body>
+    <div class="app">
+
+        <!-- LEFT: conversations -->
+        <aside class="sidebar sidebar-left">
+            <div class="brand">
+                <div class="brand-mark">OP</div>
+                <div>
+                    <div class="brand-name">OpenParlor</div>
+                    <div class="brand-subtitle">AI Characters</div>
+                </div>
+            </div>
+
+            <button class="new-chat">+ New conversation</button>
+
+            <div class="section-title">Conversations</div>
+
+            <div class="conversation active">
+                <div class="conversation-title">Friday Night</div>
+                <div class="conversation-preview">Emma, Rachel, Sarah</div>
+            </div>
+
+            <div class="conversation">
+                <div class="conversation-title">Coffee with Emma</div>
+                <div class="conversation-preview">Emma</div>
+            </div>
+
+            <div class="conversation">
+                <div class="conversation-title">Road Trip</div>
+                <div class="conversation-preview">Emma, Rachel</div>
+            </div>
+        </aside>
+
+
+        <!-- CENTER: chat -->
+        <main class="chat">
+
+            <header class="chat-header">
+                <div>
+                    <h1>Friday Night</h1>
+                    <div class="chat-subtitle">3 characters</div>
+                </div>
+
+                <button class="icon-button">•••</button>
+            </header>
+
+
+            <section class="messages">
+
+                <div class="message">
+                    <div class="avatar avatar-emma">E</div>
+
+                    <div class="message-content">
+                        <div class="speaker">Emma</div>
+                        <div class="bubble">
+                            So what are we actually doing tonight?
+                        </div>
+                    </div>
+                </div>
+
+
+                <div class="message">
+                    <div class="avatar avatar-rachel">R</div>
+
+                    <div class="message-content">
+                        <div class="speaker">Rachel</div>
+                        <div class="bubble">
+                            Dinner somewhere. I'm starving.
+                        </div>
+                    </div>
+                </div>
+
+
+                <div class="message user-message">
+                    <div class="message-content">
+                        <div class="speaker">You</div>
+                        <div class="bubble">
+                            I'm good with dinner. Where do you guys want to go?
+                        </div>
+                    </div>
+                </div>
+
+
+                <div class="message">
+                    <div class="avatar avatar-sarah">S</div>
+
+                    <div class="message-content">
+                        <div class="speaker">Sarah</div>
+                        <div class="bubble">
+                            Somewhere casual. I don't feel like dressing up.
+                        </div>
+                    </div>
+                </div>
+
+            </section>
+
+
+            <footer class="composer">
+                <div class="composer-box">
+                    <textarea
+                        id="messageInput"
+                        rows="1"
+                        placeholder="Message everyone..."
+                    ></textarea>
+
+                    <button id="sendButton" class="send-button">
+                        Send
+                    </button>
+                </div>
+            </footer>
+
+        </main>
+
+
+        <!-- RIGHT: characters -->
+        <aside class="sidebar sidebar-right">
+
+            <div class="section-title character-heading">
+                Characters
+            </div>
+
+            <div class="character-card">
+                <div class="avatar avatar-emma">E</div>
+                <div class="character-info">
+                    <div class="character-name">Emma</div>
+                    <div class="character-status">
+                        <span class="online"></span>
+                        In conversation
+                    </div>
+                </div>
+            </div>
+
+            <div class="character-card">
+                <div class="avatar avatar-rachel">R</div>
+                <div class="character-info">
+                    <div class="character-name">Rachel</div>
+                    <div class="character-status">
+                        <span class="online"></span>
+                        In conversation
+                    </div>
+                </div>
+            </div>
+
+            <div class="character-card">
+                <div class="avatar avatar-sarah">S</div>
+                <div class="character-info">
+                    <div class="character-name">Sarah</div>
+                    <div class="character-status">
+                        <span class="online"></span>
+                        In conversation
+                    </div>
+                </div>
+            </div>
+
+            <button class="add-character">
+                + Add character
+            </button>
+
+        </aside>
+
+    </div>
+
+    <script src="/openparlor/openparlor.js"></script>
+</body>
+</html>
