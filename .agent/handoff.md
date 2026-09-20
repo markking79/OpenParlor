@@ -2,9 +2,9 @@
 
 ## Last completed task
 
-TASK-LOCAL-002 — Discover local AI services
+TASK-CHAT-002 — Conversation history sent correctly
 
-Local commit: ad6dbd699
+Local commit: 3fc003dc0
 
 Push status: manual; no push was attempted by the supervisor.
 
