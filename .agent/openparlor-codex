@@ -10,10 +10,15 @@ QWEN_MODEL="${OPENPARLOR_QWEN_MODEL:-openai/local}"
 MODE="${1:-}"
 CHECK_ONLY="${2:-}"
 mkdir -p "$TMP"; cd "$REPO"
+WORKER_PID_FILE="$TMP/worker.pid"
+WORKER_PGID_FILE="$TMP/worker.pgid"
 
 banner(){ printf '\n==================================================\nOPENPARLOR — %s\n==================================================\n' "$1"; }
-workers(){ pgrep -af '[a]ider.*openparlor\|[c]line -P openai-compatible' || true; }
-if [[ -n "$(workers)" ]]; then echo 'ERROR: existing OpenParlor worker detected:'; workers; exit 1; fi
+clear_stale_worker(){
+  if [[ -f "$WORKER_PID_FILE" ]] && ! kill -0 "$(<"$WORKER_PID_FILE")" 2>/dev/null; then rm -f "$WORKER_PID_FILE" "$WORKER_PGID_FILE"; fi
+}
+owned_worker_active(){ clear_stale_worker; [[ -f "$WORKER_PID_FILE" ]] && kill -0 "$(<"$WORKER_PID_FILE")" 2>/dev/null; }
+if owned_worker_active; then echo "ERROR: launcher-owned worker is active (PID $(<"$WORKER_PID_FILE"), PGID $(<"$WORKER_PGID_FILE" 2>/dev/null || true))."; exit 1; fi
 if [[ "$MODE" != '--resume' && -n "$(git status --porcelain)" ]]; then echo 'ERROR: dirty worktree; use --resume.'; exit 1; fi
 
 banner 'PHASE 1: CODEX SPECIFICATION'
@@ -23,7 +28,7 @@ printf 'allowed files:\n%s\n' "${files[*]:-none}"
 if (( ${#files[@]} == 0 )); then echo 'ERROR: task card has no parseable allowlist.'; exit 1; fi
 
 if [[ "$MODE" == '--resume' && "$CHECK_ONLY" == '--check-only' ]]; then
-  banner 'RESUME VALIDATION'
+  banner 'RESUME VALIDATION ONLY'
   echo "Repository: $REPO"
   echo "Current task: $(head -1 .agent/current-task.md | cut -d' ' -f2)"
   echo 'Working tree: dirty, expected'
@@ -40,21 +45,26 @@ if [[ "$MODE" == '--resume' && "$CHECK_ONLY" == '--check-only' ]]; then
     printf 'Unexpected dirty files: %s\n' "${unexpected[*]}"; echo 'Resume state: INVALID'; exit 1
   fi
   echo 'Unexpected dirty files: none'
-  echo 'Worker active: no'
+  echo 'Worker launch: DISABLED'
+  echo 'Active worker: none'
   echo 'Resume state: VALID'
-  echo 'No worker launched.'
+  echo 'No files modified. No worker launched.'
   exit 0
 fi
+
+if [[ "$MODE" == '--resume' && -n "$CHECK_ONLY" ]]; then echo 'ERROR: use --resume --check-only.'; exit 2; fi
 
 banner 'PHASE 2: QWEN IMPLEMENTATION'
 pass=0
 for file in "${files[@]}"; do
   ((pass+=1)); echo "pass $pass file $file"
   prompt="Read .agent/current-task.md and existing diff. Edit ONLY $file. Preserve other dirty work. Implement the smallest remaining scoped change. Do not commit, push, or edit supervisor files."
-  (OPENAI_API_BASE="$QWEN_BASE" OPENAI_API_KEY="$QWEN_KEY" timeout --signal=INT --kill-after=30s 15m "$AIDER_BIN" "$file" --model "$QWEN_MODEL" --edit-format diff --map-tokens 0 --no-auto-commits --no-show-model-warnings --no-gitignore --yes --message "$prompt") &
-  pid=$!; echo "worker PID: $pid"
+  setsid env OPENAI_API_BASE="$QWEN_BASE" OPENAI_API_KEY="$QWEN_KEY" timeout --signal=INT --kill-after=30s 15m "$AIDER_BIN" "$file" --model "$QWEN_MODEL" --edit-format diff --map-tokens 0 --no-auto-commits --no-show-model-warnings --no-gitignore --yes --message "$prompt" &
+  pid=$!; pgid=$(ps -o pgid= -p "$pid" | tr -d ' '); printf '%s\n' "$pid" > "$WORKER_PID_FILE"; printf '%s\n' "$pgid" > "$WORKER_PGID_FILE"; echo "worker PID: $pid PGID: $pgid"
   while kill -0 "$pid" 2>/dev/null; do sleep 30; kill -0 "$pid" 2>/dev/null && echo "Qwen still working (PID $pid)"; done
   wait "$pid" || echo "Qwen pass exited non-zero; preserve work for Codex review."
+  if kill -0 "$pid" 2>/dev/null || pgrep -g "$pgid" >/dev/null 2>&1; then echo 'ERROR: launcher-owned worker group did not exit.'; exit 1; fi
+  rm -f "$WORKER_PID_FILE" "$WORKER_PGID_FILE"
 done
 
 banner 'PHASE 3: VERIFICATION'
