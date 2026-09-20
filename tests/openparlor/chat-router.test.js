@@ -243,6 +243,180 @@ test('reports statusless provider errors as 503 without configuration values', a
     });
 });
 
+function mockStreamProvider(chunks, { error } = {}) {
+    const calls = [];
+    const encoder = new TextEncoder();
+    return {
+        calls,
+        provider: {
+            chatCompletion: async () => { throw new Error('not expected'); },
+            streamChatCompletion: async (messages, options) => {
+                calls.push({ messages, options });
+                return (async function* () {
+                    for (const chunk of chunks) {
+                        yield encoder.encode(chunk);
+                    }
+                    if (error) {
+                        throw error;
+                    }
+                })();
+            },
+        },
+    };
+}
+
+function sseDelta(content) {
+    return `data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\n\n`;
+}
+
+async function postChatStream(baseUrl, body) {
+    const response = await fetch(`${baseUrl}/api/openparlor/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+    });
+    const text = await response.text();
+    const lines = text.split('\n').filter(line => line.trim() !== '');
+    const records = lines.map(line => JSON.parse(line));
+    return { status: response.status, text, records };
+}
+
+test('streams provider SSE deltas as NDJSON delta records followed by done', async () => {
+    const chunks = [sseDelta('hello '), sseDelta('world'), 'data: [DONE]\n\n'];
+    const mock = mockStreamProvider(chunks);
+    await withChatServer({
+        loadConfig: async () => configuredConfig,
+        createProvider: () => mock.provider,
+    }, { profile: { handle: 'alice' }, directories }, async baseUrl => {
+        const result = await postChatStream(baseUrl, { messages: [{ role: 'user', content: 'hi' }], stream: true });
+        assert.equal(result.status, 200);
+        assert.deepEqual(result.records, [
+            { type: 'delta', text: 'hello ' },
+            { type: 'delta', text: 'world' },
+            { type: 'done' },
+        ]);
+    });
+    assert.equal(mock.calls.length, 1);
+    assert.deepEqual(mock.calls[0].messages, [{ role: 'user', content: 'hi' }]);
+    assert.ok(mock.calls[0].options.signal instanceof AbortSignal);
+});
+
+test('handles SSE data split across arbitrary chunk boundaries', async () => {
+    const full = sseDelta('split') + sseDelta('across') + 'data: [DONE]\n\n';
+    // Split the full SSE text into arbitrary small chunks
+    const chunks = [];
+    for (let i = 0; i < full.length; i += 3) {
+        chunks.push(full.slice(i, i + 3));
+    }
+    const mock = mockStreamProvider(chunks);
+    await withChatServer({
+        loadConfig: async () => configuredConfig,
+        createProvider: () => mock.provider,
+    }, { profile: { handle: 'alice' }, directories }, async baseUrl => {
+        const result = await postChatStream(baseUrl, { messages: [{ role: 'user', content: 'hi' }], stream: true });
+        assert.equal(result.status, 200);
+        assert.deepEqual(result.records, [
+            { type: 'delta', text: 'split' },
+            { type: 'delta', text: 'across' },
+            { type: 'done' },
+        ]);
+    });
+});
+
+test('returns controlled JSON error before streaming starts for invalid config', async () => {
+    const mock = mockStreamProvider([]);
+    await withChatServer({
+        loadConfig: async () => ({
+            model: { provider: 'openai-compatible', baseUrl: '', model: '' },
+            stt: { provider: '', baseUrl: '' },
+            tts: { provider: '', baseUrl: '', voice: '' },
+        }),
+        createProvider: () => {
+            throw new ModelProviderError('OpenAI-compatible base URL is not configured');
+        },
+    }, { profile: { handle: 'alice' }, directories }, async baseUrl => {
+        const response = await fetch(`${baseUrl}/api/openparlor/chat`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }], stream: true }),
+        });
+        const body = await response.json();
+        assert.equal(response.status, 503);
+        assert.deepEqual(body, { error: 'OpenAI-compatible base URL is not configured' });
+    });
+    assert.equal(mock.calls.length, 0);
+});
+
+test('frames safe error record when stream fails mid-stream', async () => {
+    const chunks = [sseDelta('partial')];
+    const mock = mockStreamProvider(chunks, {
+        error: new ModelProviderError('OpenAI-compatible server returned HTTP 503: upstream unavailable', { status: 503 }),
+    });
+    await withChatServer({
+        loadConfig: async () => configuredConfig,
+        createProvider: () => mock.provider,
+    }, { profile: { handle: 'alice' }, directories }, async baseUrl => {
+        const result = await postChatStream(baseUrl, { messages: [{ role: 'user', content: 'hi' }], stream: true });
+        assert.equal(result.status, 200);
+        assert.deepEqual(result.records, [
+            { type: 'delta', text: 'partial' },
+            { type: 'error', error: 'OpenAI-compatible server returned HTTP 503: upstream unavailable' },
+        ]);
+    });
+});
+
+test('sanitizes unexpected stream errors to generic message without leaking secrets', async () => {
+    const chunks = [sseDelta('ok')];
+    const mock = mockStreamProvider(chunks, {
+        error: new Error('socket failure reading /data/alice/openparlor/config.json with secret-model-key'),
+    });
+    await withChatServer({
+        loadConfig: async () => configuredConfig,
+        createProvider: () => mock.provider,
+    }, { profile: { handle: 'alice' }, directories }, async baseUrl => {
+        const result = await postChatStream(baseUrl, { messages: [{ role: 'user', content: 'hi' }], stream: true });
+        assert.equal(result.status, 200);
+        assert.deepEqual(result.records, [
+            { type: 'delta', text: 'ok' },
+            { type: 'error', error: 'Chat completion failed' },
+        ]);
+        assert.ok(!result.text.includes('secret-model-key'));
+        assert.ok(!result.text.includes('/data/alice'));
+        assert.ok(!result.text.includes('socket failure'));
+    });
+});
+
+test('sets a ndjson content-type on streaming responses', async () => {
+    const chunks = [sseDelta('hi'), 'data: [DONE]\n\n'];
+    const mock = mockStreamProvider(chunks);
+    await withChatServer({
+        loadConfig: async () => configuredConfig,
+        createProvider: () => mock.provider,
+    }, { profile: { handle: 'alice' }, directories }, async baseUrl => {
+        const response = await fetch(`${baseUrl}/api/openparlor/chat`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }], stream: true }),
+        });
+        assert.equal(response.status, 200);
+        assert.match(response.headers.get('content-type'), /ndjson/);
+        await response.text();
+    });
+});
+
+test('rejects malformed stream requests with 400 before any streaming', async () => {
+    const mock = mockStreamProvider([]);
+    await withChatServer({
+        loadConfig: async () => configuredConfig,
+        createProvider: () => mock.provider,
+    }, { profile: { handle: 'alice' }, directories }, async baseUrl => {
+        const result = await postChatStream(baseUrl, { messages: [], stream: true });
+        assert.equal(result.status, 400);
+        assert.equal(result.records[0].error, 'The request body must contain a non-empty "messages" array of objects with string "role" and string "content" fields');
+    });
+    assert.equal(mock.calls.length, 0);
+});
+
 test('requires an authenticated user with directories', async () => {
     const mock = mockProvider(() => completion);
     for (const user of [undefined, null, { profile: { handle: 'alice' } }]) {

@@ -38,6 +38,49 @@ function parseChatMessages(body) {
 }
 
 /**
+ * Extracts a safe delta content from one provider SSE line. Only `data:`
+ * lines whose JSON payload contains a non-empty string
+ * `choices[0].delta.content` produce output; the `[DONE]` marker, comments,
+ * other event fields, and malformed payloads are ignored. No provider
+ * configuration, secrets, or upstream data beyond that field is ever part of
+ * the result.
+ * @param {string} line One line of an OpenAI-compatible SSE stream
+ * @returns {string | null} The delta content, or null when the line carries none
+ */
+function extractSseDelta(line) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) {
+        return null;
+    }
+    const payload = trimmed.slice(5).trimStart();
+    if (payload === '' || payload === '[DONE]') {
+        return null;
+    }
+    let parsed;
+    try {
+        parsed = JSON.parse(payload);
+    } catch {
+        return null;
+    }
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return null;
+    }
+    const choices = parsed.choices;
+    if (!Array.isArray(choices) || choices.length === 0) {
+        return null;
+    }
+    const choice = choices[0];
+    if (choice === null || typeof choice !== 'object' || Array.isArray(choice)) {
+        return null;
+    }
+    const delta = choice.delta;
+    if (delta === null || typeof delta !== 'object' || Array.isArray(delta)) {
+        return null;
+    }
+    return typeof delta.content === 'string' && delta.content !== '' ? delta.content : null;
+}
+
+/**
  * Creates the OpenParlor chat router.
  * @param {{ loadConfig?: (directories: object) => Promise<object>, createProvider?: (modelConfig: object) => { chatCompletion: (messages: ChatMessage[]) => Promise<unknown> } }} [dependencies] Injectable dependencies for tests; the production defaults use the OpenParlor configuration loader and model provider factory
  * @returns {import('express').Router} The chat router
@@ -59,11 +102,66 @@ export function createOpenParlorChatRouter({
             return response.status(401).json({ error: 'Authentication is required' });
         }
 
+        const stream = request.body.stream === true;
+
         try {
             const config = await loadConfig(user.directories);
             const provider = createProvider(config.model);
-            const completion = await provider.chatCompletion(messages);
-            return response.json(completion);
+
+            if (!stream) {
+                const completion = await provider.chatCompletion(messages);
+                return response.json(completion);
+            }
+
+            response.writeHead(200, {
+                'Content-Type': 'application/x-ndjson; charset=utf-8',
+                'Cache-Control': 'no-cache',
+                'X-Accel-Buffering': 'no',
+            });
+
+            const decoder = new TextDecoder('utf-8', { stream: true });
+            let buffer = '';
+            const abortController = new AbortController();
+            const abortStream = () => abortController.abort();
+            request.once('aborted', abortStream);
+            response.once('close', abortStream);
+
+            const writeRecord = (record) => {
+                response.write(JSON.stringify(record) + '\n');
+            };
+
+            try {
+                const result = await provider.streamChatCompletion(messages, { signal: abortController.signal });
+                for await (const chunk of result) {
+                    buffer += decoder.decode(chunk, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop();
+                    for (const line of lines) {
+                        const delta = extractSseDelta(line);
+                        if (delta !== null) {
+                            writeRecord({ type: 'delta', text: delta });
+                        }
+                    }
+                }
+                buffer += decoder.decode();
+                if (buffer) {
+                    const delta = extractSseDelta(buffer);
+                    if (delta !== null) {
+                        writeRecord({ type: 'delta', text: delta });
+                    }
+                }
+                writeRecord({ type: 'done' });
+            } catch (streamError) {
+                if (streamError instanceof ModelProviderError) {
+                    writeRecord({ type: 'error', error: streamError.message });
+                } else {
+                    writeRecord({ type: 'error', error: 'Chat completion failed' });
+                }
+            } finally {
+                request.off('aborted', abortStream);
+                response.off('close', abortStream);
+            }
+            response.end();
         } catch (error) {
             if (error instanceof ModelProviderError) {
                 const status = typeof error.status === 'number' ? error.status : 503;
