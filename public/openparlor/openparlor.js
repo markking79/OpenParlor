@@ -54,6 +54,23 @@ export function normalizeAutoSpeakState(raw) {
     return raw === 'true' || raw === true;
 }
 
+export function normalizeVoiceModeState(raw) {
+    return raw === 'true' || raw === true;
+}
+
+/**
+ * Pure decision helper: determines whether a successful transcription
+ * should be auto-sent through the chat flow.
+ * @param {{
+ *   voiceModeEnabled: boolean,
+ *   transcriptionSucceeded: boolean,
+ * }} params
+ * @returns {boolean}
+ */
+export function shouldAutoSendTranscription({ voiceModeEnabled, transcriptionSucceeded }) {
+    return voiceModeEnabled && transcriptionSucceeded;
+}
+
 /**
  * Pure decision helper: determines whether a completed assistant reply
  * should be auto-spoken. All conditions must be true.
@@ -519,6 +536,7 @@ if (typeof document !== 'undefined') {
     const modelStatusDot = document.getElementById('modelStatusDot');
     const modelStatusBody = document.getElementById('modelStatusBody');
     const autoSpeakButton = document.getElementById('autoSpeakButton');
+    const voiceModeButton = document.getElementById('voiceModeButton');
 
     let characters = [];
     let conversations = [];
@@ -560,6 +578,38 @@ if (typeof document !== 'undefined') {
         const enabled = getAutoSpeakState(currentConversation.id);
         autoSpeakButton.setAttribute('aria-pressed', String(enabled));
         autoSpeakButton.textContent = enabled ? 'Auto-speak: On' : 'Auto-speak: Off';
+    }
+
+    // ── Voice mode state ───────────────────────────────────────────────────
+
+    function getVoiceModeState(conversationId) {
+        if (!conversationId) return false;
+        try {
+            return normalizeVoiceModeState(localStorage.getItem('openparlor-voice-mode-' + conversationId));
+        } catch {
+            return false;
+        }
+    }
+
+    function setVoiceModeState(conversationId, enabled) {
+        if (!conversationId) return;
+        try {
+            localStorage.setItem('openparlor-voice-mode-' + conversationId, enabled ? 'true' : 'false');
+        } catch {
+            // storage unavailable
+        }
+    }
+
+    function updateVoiceModeButton() {
+        if (!voiceModeButton) return;
+        if (!currentConversation) {
+            voiceModeButton.hidden = true;
+            return;
+        }
+        voiceModeButton.hidden = false;
+        const enabled = getVoiceModeState(currentConversation.id);
+        voiceModeButton.setAttribute('aria-pressed', String(enabled));
+        voiceModeButton.textContent = enabled ? 'Voice: On' : 'Voice: Off';
     }
 
     // ── Rendering helpers ──────────────────────────────────────────────────
@@ -813,6 +863,7 @@ if (typeof document !== 'undefined') {
             messageInput.disabled = true;
             sendButton.disabled = true;
             updateAutoSpeakButton();
+            updateVoiceModeButton();
             return;
         }
         const char = characters.find(c => c.id === currentConversation.characterId);
@@ -821,6 +872,7 @@ if (typeof document !== 'undefined') {
         messageInput.disabled = false;
         sendButton.disabled = false;
         updateAutoSpeakButton();
+        updateVoiceModeButton();
     }
 
     function scrollMessages() {
@@ -1145,7 +1197,7 @@ if (typeof document !== 'undefined') {
                     selectionEpoch,
                     streamDone,
                     hadStreamError,
-                    autoSpeakEnabled: getAutoSpeakState(sendConversationId),
+                    autoSpeakEnabled: getAutoSpeakState(sendConversationId) || getVoiceModeState(sendConversationId),
                     hasContent: !!assistantMsg.content,
                 })
             ) {
@@ -1202,6 +1254,19 @@ if (typeof document !== 'undefined') {
                 updatePlaybackButtons();
             }
             updateAutoSpeakButton();
+        });
+    }
+
+    if (voiceModeButton) {
+        voiceModeButton.addEventListener('click', () => {
+            if (!currentConversation) return;
+            const newState = !getVoiceModeState(currentConversation.id);
+            setVoiceModeState(currentConversation.id, newState);
+            if (!newState) {
+                playback.stop();
+                updatePlaybackButtons();
+            }
+            updateVoiceModeButton();
         });
     }
 
@@ -1298,8 +1363,14 @@ if (typeof document !== 'undefined') {
             updateTranscriptionStatus();
             const text = await transcription.transcribe(blob);
             if (text) {
-                messageInput.value = text;
-                messageInput.focus();
+                const voiceMode = getVoiceModeState(currentConversation ? currentConversation.id : '');
+                if (shouldAutoSendTranscription({ voiceModeEnabled: voiceMode, transcriptionSucceeded: true })) {
+                    messageInput.value = text;
+                    await sendMessage();
+                } else {
+                    messageInput.value = text;
+                    messageInput.focus();
+                }
             }
             recorder.discard();
             updateRecorderUI();

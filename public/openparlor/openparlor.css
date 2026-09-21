@@ -609,6 +609,32 @@ button {
 }
 
 
+/* Voice mode toggle */
+
+.voice-mode-btn {
+    border: 1px solid #34363b;
+    background: #202226;
+    color: #9b9fa7;
+    border-radius: 7px;
+    padding: 6px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.voice-mode-btn:hover {
+    background: #292b30;
+    color: #ececec;
+}
+
+.voice-mode-btn[aria-pressed="true"] {
+    background: #2a2a3a;
+    border-color: #4a4a7a;
+    color: #8f8fce;
+}
+
+
 /* Playback controls */
 
 .message-actions {

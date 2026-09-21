@@ -11,6 +11,8 @@ import {
     normalizeModelStatus,
     normalizeTtsVoices,
     normalizeAutoSpeakState,
+    normalizeVoiceModeState,
+    shouldAutoSendTranscription,
     createPlaybackController,
     shouldAutoSpeak,
     selectSupportedMime,
@@ -797,6 +799,66 @@ describe('normalizeAutoSpeakState', () => {
 
     test('returns false for number', () => {
         assert.equal(normalizeAutoSpeakState(1), false);
+    });
+});
+
+// ─── normalizeVoiceModeState ────────────────────────────────────────────────
+
+describe('normalizeVoiceModeState', () => {
+    test('returns true for string "true"', () => {
+        assert.equal(normalizeVoiceModeState('true'), true);
+    });
+
+    test('returns true for boolean true', () => {
+        assert.equal(normalizeVoiceModeState(true), true);
+    });
+
+    test('returns false for string "false"', () => {
+        assert.equal(normalizeVoiceModeState('false'), false);
+    });
+
+    test('returns false for boolean false', () => {
+        assert.equal(normalizeVoiceModeState(false), false);
+    });
+
+    test('returns false for null', () => {
+        assert.equal(normalizeVoiceModeState(null), false);
+    });
+
+    test('returns false for undefined', () => {
+        assert.equal(normalizeVoiceModeState(undefined), false);
+    });
+
+    test('returns false for empty string', () => {
+        assert.equal(normalizeVoiceModeState(''), false);
+    });
+
+    test('returns false for arbitrary string', () => {
+        assert.equal(normalizeVoiceModeState('yes'), false);
+    });
+
+    test('returns false for number', () => {
+        assert.equal(normalizeVoiceModeState(1), false);
+    });
+});
+
+// ─── shouldAutoSendTranscription ────────────────────────────────────────────
+
+describe('shouldAutoSendTranscription', () => {
+    test('returns true when voice mode is enabled and transcription succeeded', () => {
+        assert.equal(shouldAutoSendTranscription({ voiceModeEnabled: true, transcriptionSucceeded: true }), true);
+    });
+
+    test('returns false when voice mode is disabled', () => {
+        assert.equal(shouldAutoSendTranscription({ voiceModeEnabled: false, transcriptionSucceeded: true }), false);
+    });
+
+    test('returns false when transcription did not succeed', () => {
+        assert.equal(shouldAutoSendTranscription({ voiceModeEnabled: true, transcriptionSucceeded: false }), false);
+    });
+
+    test('returns false when both are false', () => {
+        assert.equal(shouldAutoSendTranscription({ voiceModeEnabled: false, transcriptionSucceeded: false }), false);
     });
 });
 
