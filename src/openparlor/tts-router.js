@@ -1,6 +1,7 @@
 import express from 'express';
 import { loadOpenParlorConfig } from './config.js';
 import { createTtsProvider } from './tts-provider.js';
+import { transformForSpeech } from './speech-text.js';
 
 /**
  * Normalizes a provider listVoices() response to a flat array of safe voice ID strings.
@@ -112,6 +113,11 @@ export function createOpenParlorTtsRouter({ ttsProvider } = {}) {
             return response.status(400).json({ error: 'Voice is required' });
         }
 
+        const speechText = transformForSpeech(text);
+        if (speechText.length === 0) {
+            return response.status(400).json({ error: 'No speakable text after cleanup' });
+        }
+
         try {
             const validVoices = await getValidVoiceIds(ttsProvider, user.directories);
             if (validVoices.size === 0) {
@@ -126,7 +132,7 @@ export function createOpenParlorTtsRouter({ ttsProvider } = {}) {
                 return response.status(503).json({ error: 'TTS is not available' });
             }
 
-            const result = await provider.synthesize(text, { voice });
+            const result = await provider.synthesize(speechText, { voice });
             if (!result || result.ok !== true) {
                 return response.status(503).json({ error: 'TTS synthesis failed' });
             }

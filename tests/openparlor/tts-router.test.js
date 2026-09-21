@@ -472,6 +472,122 @@ describe('OpenParlor TTS Router', () => {
         });
     });
 
+    describe('speech text cleanup integration', () => {
+        it('returns 400 when text becomes empty after cleanup', async () => {
+            const provider = {
+                listVoices: () => ['af_heart'],
+                synthesize: async () => ({ ok: true, data: Buffer.from('x') }),
+            };
+            const app = createTestApp(provider, makeUser('alice'));
+            ({ server, baseUrl } = await startServer(app));
+            const res = await fetch(`${baseUrl}/api/openparlor/tts/synthesize`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text: '<think>only reasoning</think>', voice: 'af_heart' }),
+            });
+            assert.equal(res.status, 400);
+            const body = await res.json();
+            assert.equal(body.error, 'No speakable text after cleanup');
+        });
+
+        it('returns 400 when text is only a fenced code block', async () => {
+            const provider = {
+                listVoices: () => ['af_heart'],
+                synthesize: async () => ({ ok: true, data: Buffer.from('x') }),
+            };
+            const app = createTestApp(provider, makeUser('alice'));
+            ({ server, baseUrl } = await startServer(app));
+            const res = await fetch(`${baseUrl}/api/openparlor/tts/synthesize`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text: '```\ncode only\n```', voice: 'af_heart' }),
+            });
+            assert.equal(res.status, 400);
+            const body = await res.json();
+            assert.equal(body.error, 'No speakable text after cleanup');
+        });
+
+        it('forwards cleaned text to the provider (think blocks removed)', async () => {
+            let receivedText = null;
+            const provider = {
+                listVoices: () => ['af_heart'],
+                synthesize: async (text) => {
+                    receivedText = text;
+                    return { ok: true, data: Buffer.from('audio') };
+                },
+            };
+            const app = createTestApp(provider, makeUser('alice'));
+            ({ server, baseUrl } = await startServer(app));
+            const res = await fetch(`${baseUrl}/api/openparlor/tts/synthesize`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text: '<think>reasoning</think>Hello world', voice: 'af_heart' }),
+            });
+            assert.equal(res.status, 200);
+            assert.equal(receivedText, 'Hello world');
+        });
+
+        it('forwards cleaned text to the provider (fenced code removed)', async () => {
+            let receivedText = null;
+            const provider = {
+                listVoices: () => ['af_heart'],
+                synthesize: async (text) => {
+                    receivedText = text;
+                    return { ok: true, data: Buffer.from('audio') };
+                },
+            };
+            const app = createTestApp(provider, makeUser('alice'));
+            ({ server, baseUrl } = await startServer(app));
+            const res = await fetch(`${baseUrl}/api/openparlor/tts/synthesize`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text: 'Before\n```\ncode\n```\nAfter', voice: 'af_heart' }),
+            });
+            assert.equal(res.status, 200);
+            assert.equal(receivedText, 'Before After');
+        });
+
+        it('forwards cleaned text to the provider (inline code markers stripped)', async () => {
+            let receivedText = null;
+            const provider = {
+                listVoices: () => ['af_heart'],
+                synthesize: async (text) => {
+                    receivedText = text;
+                    return { ok: true, data: Buffer.from('audio') };
+                },
+            };
+            const app = createTestApp(provider, makeUser('alice'));
+            ({ server, baseUrl } = await startServer(app));
+            const res = await fetch(`${baseUrl}/api/openparlor/tts/synthesize`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text: 'Run `npm install` now', voice: 'af_heart' }),
+            });
+            assert.equal(res.status, 200);
+            assert.equal(receivedText, 'Run npm install now');
+        });
+
+        it('does not call provider when cleanup yields empty text', async () => {
+            let synthCalled = false;
+            const provider = {
+                listVoices: () => ['af_heart'],
+                synthesize: async () => {
+                    synthCalled = true;
+                    return { ok: true, data: Buffer.from('audio') };
+                },
+            };
+            const app = createTestApp(provider, makeUser('alice'));
+            ({ server, baseUrl } = await startServer(app));
+            const res = await fetch(`${baseUrl}/api/openparlor/tts/synthesize`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text: '<analysis>only analysis</analysis>', voice: 'af_heart' }),
+            });
+            assert.equal(res.status, 400);
+            assert.equal(synthCalled, false);
+        });
+    });
+
     describe('getValidVoiceIds', () => {
         it('returns a Set of valid voice IDs from the provider', async () => {
             const provider = { listVoices: () => ['af_heart', 'am_adam'] };
