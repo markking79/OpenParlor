@@ -6,6 +6,8 @@ import {
     normalizeCharacter,
     createNdjsonParser,
     mapChatRole,
+    validateCharacterForm,
+    sanitizeCharacterInput,
 } from '../../public/openparlor/openparlor.js';
 
 // ─── formatRelativeTime ─────────────────────────────────────────────────────
@@ -201,5 +203,117 @@ describe('mapChatRole', () => {
 
     test('returns unknown roles unchanged', () => {
         assert.equal(mapChatRole('tool'), 'tool');
+    });
+});
+
+// ─── validateCharacterForm ──────────────────────────────────────────────────
+
+describe('validateCharacterForm', () => {
+    test('returns invalid for null input', () => {
+        const result = validateCharacterForm(null);
+        assert.equal(result.valid, false);
+        assert.ok(result.errors.length > 0);
+    });
+
+    test('returns invalid for non-object input', () => {
+        const result = validateCharacterForm('hello');
+        assert.equal(result.valid, false);
+    });
+
+    test('returns invalid when name is empty', () => {
+        const result = validateCharacterForm({ name: '' });
+        assert.equal(result.valid, false);
+        assert.ok(result.errors.some(e => e.includes('required')));
+    });
+
+    test('returns invalid when name is whitespace only', () => {
+        const result = validateCharacterForm({ name: '   ' });
+        assert.equal(result.valid, false);
+    });
+
+    test('returns invalid when name exceeds 100 chars', () => {
+        const result = validateCharacterForm({ name: 'a'.repeat(101) });
+        assert.equal(result.valid, false);
+        assert.ok(result.errors.some(e => e.includes('100')));
+    });
+
+    test('returns valid for a proper name', () => {
+        const result = validateCharacterForm({ name: 'Emma' });
+        assert.equal(result.valid, true);
+        assert.equal(result.errors.length, 0);
+        assert.equal(result.name, 'Emma');
+    });
+
+    test('trims name in result', () => {
+        const result = validateCharacterForm({ name: '  Emma  ' });
+        assert.equal(result.valid, true);
+        assert.equal(result.name, 'Emma');
+    });
+
+    test('returns valid for name at exactly 100 chars', () => {
+        const result = validateCharacterForm({ name: 'a'.repeat(100) });
+        assert.equal(result.valid, true);
+    });
+});
+
+// ─── sanitizeCharacterInput ─────────────────────────────────────────────────
+
+describe('sanitizeCharacterInput', () => {
+    test('returns empty strings for null input', () => {
+        assert.deepEqual(sanitizeCharacterInput(null), { name: '', avatarUrl: '' });
+    });
+
+    test('returns empty strings for non-object input', () => {
+        assert.deepEqual(sanitizeCharacterInput(42), { name: '', avatarUrl: '' });
+    });
+
+    test('trims and returns clean name', () => {
+        const result = sanitizeCharacterInput({ name: '  Emma  ', avatar_url: '' });
+        assert.equal(result.name, 'Emma');
+    });
+
+    test('strips control characters from name', () => {
+        const result = sanitizeCharacterInput({ name: 'Em\x00ma\x1f', avatar_url: '' });
+        assert.equal(result.name, 'Emma');
+    });
+
+    test('truncates name to 100 chars', () => {
+        const result = sanitizeCharacterInput({ name: 'a'.repeat(200), avatar_url: '' });
+        assert.equal(result.name.length, 100);
+    });
+
+    test('blocks file:// protocol in avatar_url', () => {
+        const result = sanitizeCharacterInput({ name: 'Test', avatar_url: 'file:///etc/passwd' });
+        assert.equal(result.avatarUrl, '');
+    });
+
+    test('blocks javascript: protocol in avatar_url', () => {
+        const result = sanitizeCharacterInput({ name: 'Test', avatar_url: 'javascript:alert(1)' });
+        assert.equal(result.avatarUrl, '');
+    });
+
+    test('blocks data: protocol in avatar_url', () => {
+        const result = sanitizeCharacterInput({ name: 'Test', avatar_url: 'data:text/html,<script>' });
+        assert.equal(result.avatarUrl, '');
+    });
+
+    test('blocks path traversal in avatar_url', () => {
+        const result = sanitizeCharacterInput({ name: 'Test', avatar_url: '/avatars/../../etc/passwd' });
+        assert.equal(result.avatarUrl, '');
+    });
+
+    test('allows safe relative avatar URL', () => {
+        const result = sanitizeCharacterInput({ name: 'Test', avatar_url: '/avatars/emma.png' });
+        assert.equal(result.avatarUrl, '/avatars/emma.png');
+    });
+
+    test('allows empty avatar_url', () => {
+        const result = sanitizeCharacterInput({ name: 'Test', avatar_url: '' });
+        assert.equal(result.avatarUrl, '');
+    });
+
+    test('handles missing avatar_url field', () => {
+        const result = sanitizeCharacterInput({ name: 'Test' });
+        assert.equal(result.avatarUrl, '');
     });
 });

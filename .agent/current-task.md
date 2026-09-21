@@ -1,31 +1,26 @@
-# TASK-DATA-003 — Conversation list UI
+# TASK-CHAR-003 — Character UI
 
 ## Goal
 
-Replace the static demo conversation screen with an authenticated UI backed by
-the accepted character and conversation APIs. Keep server-owned provider
-configuration and the uncommitted broad data router out of scope.
+Complete the browser character-management experience using the accepted
+authenticated character API. Extend the real character list introduced by the
+conversation UI; do not use the uncommitted broad data router.
 
 ## Acceptance criteria
 
-- The sidebar lists stored recent conversations with title, last activity, and
-  the selected character's name/avatar; no demo conversation content remains.
-- Selecting a conversation loads its persisted messages and uses its ID for
-  subsequent streamed chat requests.
-- New conversation lets the user select one of their stored characters and
-  creates a conversation through the authenticated API.
-- The UI handles empty/loading/error states without exposing filesystem paths
-  or provider configuration.
-- Add focused browser-independent tests for pure UI helpers when practical;
-  keep the existing authenticated Playwright acceptance as a recorded runtime
-  follow-up if its storage state is unavailable.
+- List real characters with avatar/name and support create, edit, select, and
+  start chat using the authenticated character/conversation APIs.
+- Forms validate required character name locally and surface safe API errors.
+- Character content never controls provider configuration or filesystem paths.
+- Extend focused browser-independent UI tests for pure form/normalization
+  helpers; preserve the existing authenticated browser-test deferral.
 
 ## Exact allowlist
 
 - `public/openparlor/index.html`
 - `public/openparlor/openparlor.js`
 - `public/openparlor/openparlor.css`
-- `tests/openparlor/openparlor-ui.test.js` (new)
+- `tests/openparlor/openparlor-ui.test.js`
 
 Do not edit OpenParlor server routes, `src/openparlor/router.js`, package files, or other
 `.agent` control files. Do not stage, reset, clean, discard, or modify

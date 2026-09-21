@@ -2,6 +2,12 @@
 
 ## Current state
 
+TASK-CHAR-003 accepted: the browser now supports creating and editing stored
+characters, validates required names, displays safe avatar/name data, and lets
+the user start a chat with a selected character. Focused UI helpers: 47 passed.
+
+## Current state
+
 TASK-DATA-003 accepted: the OpenParlor browser UI now loads stored characters
 and conversations, creates a one-on-one chat from the selected character,
 loads persisted messages, and associates streamed chat requests with the active

@@ -83,6 +83,36 @@ export function mapChatRole(role) {
     return role;
 }
 
+export function validateCharacterForm(data) {
+    const errors = [];
+    if (!data || typeof data !== 'object') {
+        return { valid: false, errors: ['Invalid form data'], name: '' };
+    }
+    const name = typeof data.name === 'string' ? data.name.trim() : '';
+    if (!name) {
+        errors.push('Name is required');
+    } else if (name.length > 100) {
+        errors.push('Name must be 100 characters or fewer');
+    }
+    return { valid: errors.length === 0, errors, name };
+}
+
+export function sanitizeCharacterInput(data) {
+    if (!data || typeof data !== 'object') return { name: '', avatarUrl: '' };
+    let name = typeof data.name === 'string' ? data.name.trim() : '';
+    name = name.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 100);
+
+    let avatarUrl = typeof data.avatar_url === 'string' ? data.avatar_url.trim() : '';
+    if (avatarUrl) {
+        const lower = avatarUrl.toLowerCase();
+        if (lower.startsWith('file:') || lower.startsWith('javascript:') || lower.startsWith('data:') || avatarUrl.includes('..')) {
+            avatarUrl = '';
+        }
+    }
+
+    return { name, avatarUrl };
+}
+
 // ─── Browser application ─────────────────────────────────────────────────────
 
 if (typeof document !== 'undefined') {
@@ -95,12 +125,20 @@ if (typeof document !== 'undefined') {
     const chatSubtitle = document.getElementById('chatSubtitle');
     const messageInput = document.getElementById('messageInput');
     const sendButton = document.getElementById('sendButton');
+    const characterForm = document.getElementById('characterForm');
+    const charNameInput = document.getElementById('charNameInput');
+    const charAvatarInput = document.getElementById('charAvatarInput');
+    const charFormError = document.getElementById('charFormError');
+    const charFormSave = document.getElementById('charFormSave');
+    const charFormCancel = document.getElementById('charFormCancel');
+    const newCharacterButton = document.getElementById('newCharacterButton');
 
     let characters = [];
     let conversations = [];
     let currentConversation = null;
     let currentMessages = [];
     let isSending = false;
+    let editingCharacterId = null;
 
     // ── Rendering helpers ──────────────────────────────────────────────────
 
@@ -159,6 +197,7 @@ if (typeof document !== 'undefined') {
             // Sidebar card
             const card = document.createElement('div');
             card.className = 'character-card';
+            card.dataset.id = char.id;
 
             const avatar = document.createElement('div');
             avatar.className = 'avatar';
@@ -180,6 +219,7 @@ if (typeof document !== 'undefined') {
             info.appendChild(nameEl);
 
             card.append(avatar, info);
+            card.addEventListener('click', () => showCharacterForm(char));
             characterList.appendChild(card);
 
             // Select option
@@ -191,6 +231,30 @@ if (typeof document !== 'undefined') {
 
         characterSelect.disabled = false;
         newChatButton.disabled = false;
+    }
+
+    function showCharacterForm(character) {
+        editingCharacterId = character ? character.id : null;
+        charNameInput.value = character ? character.name : '';
+        charAvatarInput.value = character ? character.avatarUrl : '';
+        charFormError.hidden = true;
+        charFormError.textContent = '';
+        characterForm.hidden = false;
+        charNameInput.focus();
+    }
+
+    function hideCharacterForm() {
+        editingCharacterId = null;
+        characterForm.hidden = true;
+        charNameInput.value = '';
+        charAvatarInput.value = '';
+        charFormError.hidden = true;
+        charFormError.textContent = '';
+    }
+
+    function showFormError(message) {
+        charFormError.textContent = message;
+        charFormError.hidden = false;
     }
 
     function renderMessages() {
@@ -323,7 +387,73 @@ if (typeof document !== 'undefined') {
         return normalizeConversation(await res.json());
     }
 
+    async function createCharacter(name, avatarUrl) {
+        const token = await getCsrfToken();
+        const res = await fetch('/api/openparlor/characters', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRF-Token': token,
+            },
+            body: JSON.stringify({ name, avatar_url: avatarUrl }),
+        });
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.error || 'Failed to create character');
+        }
+        return normalizeCharacter(await res.json());
+    }
+
+    async function updateCharacter(id, name, avatarUrl) {
+        const token = await getCsrfToken();
+        const res = await fetch('/api/openparlor/characters/' + encodeURIComponent(id), {
+            method: 'PATCH',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRF-Token': token,
+            },
+            body: JSON.stringify({ name, avatar_url: avatarUrl }),
+        });
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.error || 'Failed to update character');
+        }
+        return normalizeCharacter(await res.json());
+    }
+
     // ── Actions ────────────────────────────────────────────────────────────
+
+    async function handleCharacterFormSubmit() {
+        const rawName = charNameInput.value;
+        const rawAvatar = charAvatarInput.value;
+
+        const validation = validateCharacterForm({ name: rawName });
+        if (!validation.valid) {
+            showFormError(validation.errors.join(' '));
+            return;
+        }
+
+        const sanitized = sanitizeCharacterInput({ name: rawName, avatar_url: rawAvatar });
+
+        try {
+            charFormSave.disabled = true;
+            let saved;
+            if (editingCharacterId) {
+                saved = await updateCharacter(editingCharacterId, sanitized.name, sanitized.avatarUrl);
+                const idx = characters.findIndex(c => c.id === editingCharacterId);
+                if (idx !== -1) characters[idx] = saved;
+            } else {
+                saved = await createCharacter(sanitized.name, sanitized.avatarUrl);
+                characters.push(saved);
+            }
+            hideCharacterForm();
+            renderCharacters();
+        } catch (e) {
+            showFormError(e.message || 'Something went wrong');
+        } finally {
+            charFormSave.disabled = false;
+        }
+    }
 
     async function selectConversation(id) {
         try {
@@ -455,6 +585,19 @@ if (typeof document !== 'undefined') {
         if (event.key === 'Enter' && !event.shiftKey) {
             event.preventDefault();
             sendMessage();
+        }
+    });
+
+    newCharacterButton.addEventListener('click', () => showCharacterForm(null));
+
+    charFormSave.addEventListener('click', handleCharacterFormSubmit);
+
+    charFormCancel.addEventListener('click', hideCharacterForm);
+
+    charNameInput.addEventListener('keydown', event => {
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            handleCharacterFormSubmit();
         }
     });
 

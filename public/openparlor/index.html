@@ -72,6 +72,23 @@
 
             <div class="section-title character-heading">
                 Characters
+                <button id="newCharacterButton" class="new-character-btn" title="New character">+ New</button>
+            </div>
+
+            <div id="characterForm" class="character-form" hidden>
+                <div class="form-field">
+                    <label for="charNameInput">Name *</label>
+                    <input type="text" id="charNameInput" maxlength="100" placeholder="Character name" autocomplete="off">
+                </div>
+                <div class="form-field">
+                    <label for="charAvatarInput">Avatar URL</label>
+                    <input type="text" id="charAvatarInput" placeholder="/avatars/name.png" autocomplete="off">
+                </div>
+                <div id="charFormError" class="form-error" hidden></div>
+                <div class="form-actions">
+                    <button id="charFormSave" class="form-save">Save</button>
+                    <button id="charFormCancel" class="form-cancel">Cancel</button>
+                </div>
             </div>
 
             <div id="characterList" class="character-list">
