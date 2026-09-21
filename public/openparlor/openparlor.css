@@ -583,6 +583,42 @@ button {
 }
 
 
+/* Playback controls */
+
+.message-actions {
+    display: flex;
+    gap: 4px;
+    margin-top: 6px;
+}
+
+.play-btn,
+.stop-btn,
+.replay-btn {
+    border: 1px solid #34363b;
+    background: #202226;
+    color: #9b9fa7;
+    border-radius: 5px;
+    padding: 2px 7px;
+    font-size: 11px;
+    line-height: 1.4;
+    cursor: pointer;
+}
+
+.play-btn:hover:not(:disabled),
+.stop-btn:hover:not(:disabled),
+.replay-btn:hover:not(:disabled) {
+    background: #292b30;
+    color: #ececec;
+}
+
+.play-btn:disabled,
+.stop-btn:disabled,
+.replay-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+
 /* Smaller screens */
 
 @media (max-width: 900px) {

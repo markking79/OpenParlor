@@ -47,6 +47,23 @@ async function resolveVoices(injectedProvider, directories) {
 }
 
 /**
+ * Resolves a TTS provider instance capable of synthesis.
+ * Uses the injected provider if it exposes a synthesize method, otherwise
+ * loads from the user's on-disk config.
+ * @param {{ synthesize?: (text: string, options?: object) => Promise<{ ok: boolean, data: unknown }> } | undefined} injectedProvider
+ * @param {import('../users.js').UserDirectoryList} directories
+ * @returns {Promise<{ synthesize: (text: string, options?: object) => Promise<{ ok: boolean, data: unknown }> } | null>}
+ */
+async function resolveSynthesisProvider(injectedProvider, directories) {
+    if (injectedProvider && typeof injectedProvider.synthesize === 'function') {
+        return injectedProvider;
+    }
+    const config = await loadOpenParlorConfig(directories);
+    if (!config.tts.provider) return null;
+    return createTtsProvider(config.tts);
+}
+
+/**
  * Creates the authenticated OpenParlor TTS router.
  * @param {{ ttsProvider?: { listVoices?: () => string[] | Promise<string[]> } }} [dependencies]
  * @returns {import('express').Router}
@@ -69,6 +86,61 @@ export function createOpenParlorTtsRouter({ ttsProvider } = {}) {
             return response.json({ voices: safeVoices, available: safeVoices.length > 0 });
         } catch {
             return response.json({ voices: [], available: false });
+        }
+    });
+
+    router.post('/synthesize', async (request, response) => {
+        const user = request.user;
+        if (user === null || user === undefined || user.directories === null || user.directories === undefined) {
+            return response.status(401).json({ error: 'Authentication is required' });
+        }
+
+        const body = request.body;
+        if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+            return response.status(400).json({ error: 'Invalid request body' });
+        }
+
+        const { text, voice } = body;
+
+        if (typeof text !== 'string' || text.trim().length === 0) {
+            return response.status(400).json({ error: 'Text is required' });
+        }
+        if (text.length > 5000) {
+            return response.status(400).json({ error: 'Text is too long' });
+        }
+        if (typeof voice !== 'string' || voice.length === 0) {
+            return response.status(400).json({ error: 'Voice is required' });
+        }
+
+        try {
+            const validVoices = await getValidVoiceIds(ttsProvider, user.directories);
+            if (validVoices.size === 0) {
+                return response.status(503).json({ error: 'TTS is not available' });
+            }
+            if (!validVoices.has(voice)) {
+                return response.status(400).json({ error: 'Invalid voice' });
+            }
+
+            const provider = await resolveSynthesisProvider(ttsProvider, user.directories);
+            if (!provider) {
+                return response.status(503).json({ error: 'TTS is not available' });
+            }
+
+            const result = await provider.synthesize(text, { voice });
+            if (!result || result.ok !== true) {
+                return response.status(503).json({ error: 'TTS synthesis failed' });
+            }
+
+            const data = result.data;
+            if (Buffer.isBuffer(data)) {
+                response.set('Content-Type', 'audio/wav');
+                response.set('Content-Disposition', 'inline');
+                return response.send(data);
+            }
+
+            return response.status(503).json({ error: 'TTS synthesis failed' });
+        } catch {
+            return response.status(503).json({ error: 'TTS synthesis failed' });
         }
     });
 

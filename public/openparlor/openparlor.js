@@ -139,6 +139,90 @@ export function normalizeModelStatus(raw) {
     };
 }
 
+/**
+ * Creates a playback controller that manages audio synthesis and playback
+ * for a single message at a time. All external dependencies are injectable
+ * for deterministic testing.
+ * @param {{
+ *   fetchFn?: (url: string, options?: object) => Promise<Response>,
+ *   createObjectURL?: (blob: Blob) => string,
+ *   revokeObjectURL?: (url: string) => void,
+ *   audioFactory?: (url: string) => { play: () => Promise<void>, pause: () => void, src: string }
+ * }} [deps]
+ * @returns {{
+ *   play: (text: string, voice: string) => Promise<string>,
+ *   stop: () => void,
+ *   replay: (text: string, voice: string) => Promise<string>,
+ *   isPlaying: boolean
+ * }}
+ */
+export function createPlaybackController(deps = {}) {
+    const {
+        fetchFn = (url, opts) => fetch(url, opts),
+        createObjectURL = (blob) => URL.createObjectURL(blob),
+        revokeObjectURL = (url) => URL.revokeObjectURL(url),
+        audioFactory = (url) => new Audio(url),
+    } = deps;
+
+    let currentAudio = null;
+    let currentUrl = null;
+    let _isPlaying = false;
+
+    function stop() {
+        if (currentAudio) {
+            currentAudio.pause();
+            currentAudio.src = '';
+            currentAudio = null;
+        }
+        if (currentUrl) {
+            revokeObjectURL(currentUrl);
+            currentUrl = null;
+        }
+        _isPlaying = false;
+    }
+
+    async function play(text, voice) {
+        stop();
+        const res = await fetchFn('/api/openparlor/tts/synthesize', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text, voice }),
+        });
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.error || 'Synthesis failed');
+        }
+        const blob = await res.blob();
+        currentUrl = createObjectURL(blob);
+        currentAudio = audioFactory(currentUrl);
+        const audio = currentAudio;
+        if (typeof audio.addEventListener === 'function') {
+            audio.addEventListener('ended', () => {
+                if (currentAudio === audio) stop();
+            }, { once: true });
+        }
+        _isPlaying = true;
+        try {
+            await audio.play();
+        } catch (error) {
+            if (currentAudio === audio) stop();
+            throw error;
+        }
+        return currentUrl;
+    }
+
+    function replay(text, voice) {
+        return play(text, voice);
+    }
+
+    return {
+        play,
+        stop,
+        replay,
+        get isPlaying() { return _isPlaying; },
+    };
+}
+
 // ─── Browser application ─────────────────────────────────────────────────────
 
 if (typeof document !== 'undefined') {
@@ -169,6 +253,7 @@ if (typeof document !== 'undefined') {
     let isSending = false;
     let editingCharacterId = null;
     let ttsVoices = { voices: [], available: false };
+    const playback = createPlaybackController();
 
     // ── Rendering helpers ──────────────────────────────────────────────────
 
@@ -348,11 +433,70 @@ if (typeof document !== 'undefined') {
             bubble.textContent = msg.content;
 
             content.append(speakerEl, bubble);
+
+            if (!isUser && msg.content) {
+                const actions = document.createElement('div');
+                actions.className = 'message-actions';
+
+                const char = characters.find(c => c.id === currentConversation.characterId);
+                const voice = char ? char.ttsVoice : '';
+
+                const playBtn = document.createElement('button');
+                playBtn.className = 'play-btn';
+                playBtn.setAttribute('aria-label', 'Play message');
+                playBtn.textContent = '▶';
+                playBtn.addEventListener('click', async () => {
+                    try {
+                        await playback.play(msg.content, voice);
+                        updatePlaybackButtons();
+                    } catch {
+                        // silent
+                    }
+                });
+
+                const stopBtn = document.createElement('button');
+                stopBtn.className = 'stop-btn';
+                stopBtn.setAttribute('aria-label', 'Stop playback');
+                stopBtn.textContent = '■';
+                stopBtn.addEventListener('click', () => {
+                    playback.stop();
+                    updatePlaybackButtons();
+                });
+
+                const replayBtn = document.createElement('button');
+                replayBtn.className = 'replay-btn';
+                replayBtn.setAttribute('aria-label', 'Replay message');
+                replayBtn.textContent = '↺';
+                replayBtn.addEventListener('click', async () => {
+                    try {
+                        await playback.replay(msg.content, voice);
+                        updatePlaybackButtons();
+                    } catch {
+                        // silent
+                    }
+                });
+
+                actions.append(playBtn, stopBtn, replayBtn);
+                content.appendChild(actions);
+            }
+
             messageEl.appendChild(content);
             messagesEl.appendChild(messageEl);
         }
 
         scrollMessages();
+    }
+
+    function updatePlaybackButtons() {
+        const buttons = messagesEl.querySelectorAll('.message-actions');
+        for (const actions of buttons) {
+            const playBtn = actions.querySelector('.play-btn');
+            const stopBtn = actions.querySelector('.stop-btn');
+            const replayBtn = actions.querySelector('.replay-btn');
+            if (playBtn) playBtn.disabled = playback.isPlaying;
+            if (stopBtn) stopBtn.disabled = !playback.isPlaying;
+            if (replayBtn) replayBtn.disabled = playback.isPlaying;
+        }
     }
 
     function updateChatHeader() {
@@ -566,6 +710,7 @@ if (typeof document !== 'undefined') {
     }
 
     async function selectConversation(id) {
+        playback.stop();
         try {
             renderState(messagesEl, 'loading', 'Loading…');
             await fetchConversation(id);

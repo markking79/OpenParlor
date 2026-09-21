@@ -2,6 +2,15 @@
 
 ## Current state
 
+TASK-TTS-004 accepted: OpenParlor now proxies authenticated server-side audio
+synthesis and renders accessible assistant-message play, stop, and replay
+controls. Browser playback uses a Blob URL and enforces one active audio item,
+releasing resources on stop, replay, natural completion, rejected play, and
+chat switch. Focused tests: 109 passed; changed-source lint passed; a live
+Kokoro proxy request returned 29,612 audio bytes.
+
+## Current state
+
 TASK-TTS-003 accepted: authenticated server-side voice discovery now powers
 the character editor and validates stored character voices. The router supports
 injected raw arrays plus the live Kokoro adapter response `{ ok, data: {
@@ -77,7 +86,7 @@ filesystem persistence boundary under `<directories.root>/openparlor`.
 
 ## Last completed task
 
-TASK-TTS-003 — Character voice assignment.
+TASK-TTS-004 — Play assistant messages.
 
 ## Accepted implementation
 

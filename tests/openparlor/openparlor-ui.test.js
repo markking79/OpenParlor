@@ -10,6 +10,7 @@ import {
     sanitizeCharacterInput,
     normalizeModelStatus,
     normalizeTtsVoices,
+    createPlaybackController,
 } from '../../public/openparlor/openparlor.js';
 
 // ─── formatRelativeTime ─────────────────────────────────────────────────────
@@ -420,5 +421,171 @@ describe('normalizeTtsVoices', () => {
         const result = normalizeTtsVoices({});
         assert.deepEqual(result.voices, []);
         assert.equal(result.available, false);
+    });
+});
+
+// ─── createPlaybackController ───────────────────────────────────────────────
+
+describe('createPlaybackController', () => {
+    function makeMockAudio() {
+        const audio = {
+            src: '',
+            played: false,
+            paused: false,
+            async play() { this.played = true; },
+            pause() { this.paused = true; },
+        };
+        return audio;
+    }
+
+    function makeDeps({ fetchResponse } = {}) {
+        const createdUrls = [];
+        const revokedUrls = [];
+        let lastAudio = null;
+
+        const deps = {
+            fetchFn: async (url, opts) => {
+                return fetchResponse || {
+                    ok: true,
+                    blob: async () => new Blob(['fake-audio']),
+                    json: async () => ({}),
+                };
+            },
+            createObjectURL: (blob) => {
+                const url = `blob:mock-${createdUrls.length + 1}`;
+                createdUrls.push(url);
+                return url;
+            },
+            revokeObjectURL: (url) => { revokedUrls.push(url); },
+            audioFactory: (url) => {
+                lastAudio = makeMockAudio();
+                lastAudio.src = url;
+                return lastAudio;
+            },
+        };
+
+        return { deps, createdUrls, revokedUrls, getLastAudio: () => lastAudio };
+    }
+
+    test('initial state is not playing', () => {
+        const { deps } = makeDeps();
+        const controller = createPlaybackController(deps);
+        assert.equal(controller.isPlaying, false);
+    });
+
+    test('play fetches the synthesize endpoint with correct body', async () => {
+        let capturedUrl = '';
+        let capturedOpts = null;
+        const deps = {
+            fetchFn: async (url, opts) => {
+                capturedUrl = url;
+                capturedOpts = opts;
+                return { ok: true, blob: async () => new Blob(['audio']) };
+            },
+            createObjectURL: () => 'blob:test-1',
+            revokeObjectURL: () => {},
+            audioFactory: () => makeMockAudio(),
+        };
+        const controller = createPlaybackController(deps);
+        await controller.play('hello world', 'af_heart');
+
+        assert.equal(capturedUrl, '/api/openparlor/tts/synthesize');
+        assert.equal(capturedOpts.method, 'POST');
+        assert.deepEqual(JSON.parse(capturedOpts.body), { text: 'hello world', voice: 'af_heart' });
+    });
+
+    test('play sets isPlaying to true and returns the object URL', async () => {
+        const { deps } = makeDeps();
+        const controller = createPlaybackController(deps);
+        const url = await controller.play('test', 'af_heart');
+        assert.equal(controller.isPlaying, true);
+        assert.equal(url, 'blob:mock-1');
+    });
+
+    test('play calls audio.play()', async () => {
+        const { deps, getLastAudio } = makeDeps();
+        const controller = createPlaybackController(deps);
+        await controller.play('test', 'af_heart');
+        assert.equal(getLastAudio().played, true);
+    });
+
+    test('stop pauses audio and revokes object URL', async () => {
+        const { deps, revokedUrls, getLastAudio } = makeDeps();
+        const controller = createPlaybackController(deps);
+        await controller.play('test', 'af_heart');
+        controller.stop();
+        assert.equal(controller.isPlaying, false);
+        assert.equal(getLastAudio().paused, true);
+        assert.deepEqual(revokedUrls, ['blob:mock-1']);
+    });
+
+    test('stop is safe to call when not playing', () => {
+        const { deps, revokedUrls } = makeDeps();
+        const controller = createPlaybackController(deps);
+        controller.stop();
+        assert.equal(controller.isPlaying, false);
+        assert.deepEqual(revokedUrls, []);
+    });
+
+    test('play stops previous playback before starting new one', async () => {
+        const { deps, revokedUrls } = makeDeps();
+        const controller = createPlaybackController(deps);
+        await controller.play('first', 'af_heart');
+        await controller.play('second', 'am_adam');
+        assert.equal(controller.isPlaying, true);
+        assert.deepEqual(revokedUrls, ['blob:mock-1']);
+    });
+
+    test('replay works the same as play', async () => {
+        const { deps, revokedUrls } = makeDeps();
+        const controller = createPlaybackController(deps);
+        await controller.play('test', 'af_heart');
+        const url = await controller.replay('test', 'af_heart');
+        assert.equal(controller.isPlaying, true);
+        assert.equal(url, 'blob:mock-2');
+        assert.deepEqual(revokedUrls, ['blob:mock-1']);
+    });
+
+    test('play throws when fetch returns non-ok response', async () => {
+        const deps = {
+            fetchFn: async () => ({
+                ok: false,
+                status: 503,
+                json: async () => ({ error: 'TTS is not available' }),
+            }),
+            createObjectURL: () => 'blob:should-not-reach',
+            revokeObjectURL: () => {},
+            audioFactory: () => makeMockAudio(),
+        };
+        const controller = createPlaybackController(deps);
+        await assert.rejects(() => controller.play('test', 'af_heart'), /TTS is not available/);
+        assert.equal(controller.isPlaying, false);
+    });
+
+    test('play throws when fetch returns non-ok with no JSON body', async () => {
+        const deps = {
+            fetchFn: async () => ({
+                ok: false,
+                status: 500,
+                json: async () => { throw new Error('not json'); },
+            }),
+            createObjectURL: () => 'blob:should-not-reach',
+            revokeObjectURL: () => {},
+            audioFactory: () => makeMockAudio(),
+        };
+        const controller = createPlaybackController(deps);
+        await assert.rejects(() => controller.play('test', 'af_heart'), /Synthesis failed/);
+        assert.equal(controller.isPlaying, false);
+    });
+
+    test('only one message plays at a time (sequential plays)', async () => {
+        const { deps, getLastAudio } = makeDeps();
+        const controller = createPlaybackController(deps);
+        await controller.play('msg1', 'af_heart');
+        await controller.play('msg2', 'am_adam');
+        assert.equal(controller.isPlaying, true);
+        // The first audio should have been paused
+        // We can verify by checking that only the latest is active
+        assert.equal(getLastAudio().played, true);
     });
 });
