@@ -68,14 +68,18 @@ function makeUser(handle) {
     };
 }
 
-function createTestApp(persistenceModule, user) {
+const mockTtsProvider = {
+    listVoices: () => ['af_heart', 'am_adam', 'bf_emma', 'bm_daniel'],
+};
+
+function createTestApp(persistenceModule, user, ttsProvider = mockTtsProvider) {
     const app = express();
     app.use(express.json());
     app.use((req, _res, next) => {
         req.user = user;
         next();
     });
-    app.use('/api/openparlor/characters', createOpenParlorCharacterRouter({ persistence: persistenceModule }));
+    app.use('/api/openparlor/characters', createOpenParlorCharacterRouter({ persistence: persistenceModule, ttsProvider }));
     return app;
 }
 
@@ -422,6 +426,111 @@ describe('OpenParlor Character Router', () => {
         it('returns 404 for non-existent character', async () => {
             const res = await fetch(`${baseUrl}/api/openparlor/characters/nonexistent-id`);
             assert.equal(res.status, 404);
+        });
+
+        it('rejects tts_provider field', async () => {
+            const res = await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'X', tts_provider: 'kokoro' }),
+            });
+            assert.equal(res.status, 400);
+            const body = await res.json();
+            assert.match(body.error, /Unsupported/);
+        });
+
+        it('accepts valid tts_voice', async () => {
+            const res = await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'X', tts_voice: 'af_heart' }),
+            });
+            assert.equal(res.status, 201);
+            const body = await res.json();
+            assert.equal(body.tts_voice, 'af_heart');
+        });
+
+        it('accepts empty tts_voice', async () => {
+            const res = await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'X', tts_voice: '' }),
+            });
+            assert.equal(res.status, 201);
+            const body = await res.json();
+            assert.equal(body.tts_voice, '');
+        });
+
+        it('rejects invalid tts_voice', async () => {
+            const res = await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'X', tts_voice: 'not_a_real_voice' }),
+            });
+            assert.equal(res.status, 400);
+            const body = await res.json();
+            assert.match(body.error, /tts_voice/);
+        });
+
+        it('rejects tts_voice that is not a string', async () => {
+            const res = await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'X', tts_voice: 42 }),
+            });
+            assert.equal(res.status, 400);
+        });
+
+        it('rejects tts_voice when TTS provider is not configured', async () => {
+            const app = express();
+            app.use(express.json());
+            app.use((req, _res, next) => { req.user = makeUser('alice'); next(); });
+            app.use('/api/openparlor/characters', createOpenParlorCharacterRouter({ persistence }));
+            const { server: srv, baseUrl: url } = await startServer(app);
+            try {
+                const res = await fetch(`${url}/api/openparlor/characters`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: 'X', tts_voice: 'af_heart' }),
+                });
+                assert.equal(res.status, 400);
+                const body = await res.json();
+                assert.match(body.error, /tts_voice/);
+            } finally {
+                await stopServer(srv);
+            }
+        });
+
+        it('updates tts_voice on existing character', async () => {
+            const created = await (await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'X' }),
+            })).json();
+
+            const res = await fetch(`${baseUrl}/api/openparlor/characters/${created.id}`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ tts_voice: 'am_adam' }),
+            });
+            assert.equal(res.status, 200);
+            const body = await res.json();
+            assert.equal(body.tts_voice, 'am_adam');
+        });
+
+        it('rejects invalid tts_voice on update', async () => {
+            const created = await (await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'X' }),
+            })).json();
+
+            const res = await fetch(`${baseUrl}/api/openparlor/characters/${created.id}`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ tts_voice: 'bogus' }),
+            });
+            assert.equal(res.status, 400);
         });
     });
 

@@ -2,6 +2,14 @@
 
 ## Current state
 
+TASK-TTS-003 accepted: authenticated server-side voice discovery now powers
+the character editor and validates stored character voices. The router supports
+injected raw arrays plus the live Kokoro adapter response `{ ok, data: {
+voices: [{ id }] } }` without a hard-coded allowlist. Focused tests: 124
+passed; changed-source lint passed; live local provider probe found 68 voices.
+
+## Current state
+
 TASK-TTS-002 accepted: server-only TTS factory and Kokoro adapter support
 voice listing, synthesis, and health checks with optional authentication,
 safe errors, and `/v1` URL normalization. Focused tests: 20 passed; real
@@ -69,7 +77,7 @@ filesystem persistence boundary under `<directories.root>/openparlor`.
 
 ## Last completed task
 
-TASK-DATA-001 — Define OpenParlor persistence boundary.
+TASK-TTS-003 — Character voice assignment.
 
 ## Accepted implementation
 

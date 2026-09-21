@@ -1,6 +1,7 @@
 import express from 'express';
 
 import * as persistence from './persistence.js';
+import { getValidVoiceIds } from './tts-router.js';
 
 const CHARACTER_FIELDS = new Set([
     'name',
@@ -12,7 +13,6 @@ const CHARACTER_FIELDS = new Set([
     'system_prompt',
     'example_dialogue',
     'tags',
-    'tts_provider',
     'tts_voice',
 ]);
 const MAX_TEXT_LENGTH = 20_000;
@@ -81,10 +81,10 @@ function validateCharacterBody(body, isCreate) {
 
 /**
  * Creates the authenticated OpenParlor character router.
- * @param {{ persistence?: typeof persistence }} [dependencies]
+ * @param {{ persistence?: typeof persistence, ttsProvider?: { listVoices?: () => string[] | Promise<string[]> } }} [dependencies]
  * @returns {import('express').Router}
  */
-export function createOpenParlorCharacterRouter({ persistence: persistenceModule = persistence } = {}) {
+export function createOpenParlorCharacterRouter({ persistence: persistenceModule = persistence, ttsProvider } = {}) {
     const router = express.Router();
 
     function withAuth(request, response) {
@@ -119,11 +119,18 @@ export function createOpenParlorCharacterRouter({ persistence: persistenceModule
         return response.json(persistenceModule.listCharacters(auth.directories, auth.handle));
     });
 
-    router.post('/', (request, response) => {
+    router.post('/', async (request, response) => {
         const auth = withAuth(request, response);
         if (!auth) return;
         const validated = validateCharacterBody(request.body, true);
         if ('error' in validated) return response.status(400).json({ error: validated.error });
+        const ttsVoice = validated.value.tts_voice;
+        if (ttsVoice !== undefined && ttsVoice !== '') {
+            const validVoices = await getValidVoiceIds(ttsProvider, auth.directories);
+            if (!validVoices.has(ttsVoice)) {
+                return response.status(400).json({ error: '"tts_voice" must be a valid voice ID or empty' });
+            }
+        }
         return response.status(201).json(persistenceModule.createCharacter(auth.directories, auth.handle, validated.value));
     });
 
@@ -134,12 +141,19 @@ export function createOpenParlorCharacterRouter({ persistence: persistenceModule
         return character ? response.json(character) : undefined;
     });
 
-    router.patch('/:id', (request, response) => {
+    router.patch('/:id', async (request, response) => {
         const auth = withAuth(request, response);
         if (!auth) return;
         if (!getOwnedCharacter(request, response, auth)) return;
         const validated = validateCharacterBody(request.body, false);
         if ('error' in validated) return response.status(400).json({ error: validated.error });
+        const ttsVoice = validated.value.tts_voice;
+        if (ttsVoice !== undefined && ttsVoice !== '') {
+            const validVoices = await getValidVoiceIds(ttsProvider, auth.directories);
+            if (!validVoices.has(ttsVoice)) {
+                return response.status(400).json({ error: '"tts_voice" must be a valid voice ID or empty' });
+            }
+        }
         return response.json(persistenceModule.updateCharacter(auth.directories, request.params.id, validated.value));
     });
 

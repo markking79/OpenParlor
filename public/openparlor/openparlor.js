@@ -36,6 +36,17 @@ export function normalizeCharacter(raw) {
         id: typeof raw.id === 'string' ? raw.id : String(raw.id || ''),
         name: typeof raw.name === 'string' ? raw.name : 'Unknown',
         avatarUrl: typeof raw.avatar_url === 'string' ? raw.avatar_url : '',
+        ttsVoice: typeof raw.tts_voice === 'string' ? raw.tts_voice : '',
+    };
+}
+
+export function normalizeTtsVoices(raw) {
+    if (!raw || typeof raw !== 'object') {
+        return { voices: [], available: false };
+    }
+    return {
+        voices: Array.isArray(raw.voices) ? raw.voices.filter(v => typeof v === 'string') : [],
+        available: raw.available === true,
     };
 }
 
@@ -98,7 +109,7 @@ export function validateCharacterForm(data) {
 }
 
 export function sanitizeCharacterInput(data) {
-    if (!data || typeof data !== 'object') return { name: '', avatarUrl: '' };
+    if (!data || typeof data !== 'object') return { name: '', avatarUrl: '', ttsVoice: '' };
     let name = typeof data.name === 'string' ? data.name.trim() : '';
     name = name.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 100);
 
@@ -110,7 +121,9 @@ export function sanitizeCharacterInput(data) {
         }
     }
 
-    return { name, avatarUrl };
+    const ttsVoice = typeof data.tts_voice === 'string' ? data.tts_voice : '';
+
+    return { name, avatarUrl, ttsVoice };
 }
 
 export function normalizeModelStatus(raw) {
@@ -144,6 +157,7 @@ if (typeof document !== 'undefined') {
     const charFormError = document.getElementById('charFormError');
     const charFormSave = document.getElementById('charFormSave');
     const charFormCancel = document.getElementById('charFormCancel');
+    const charVoiceSelect = document.getElementById('charVoiceSelect');
     const newCharacterButton = document.getElementById('newCharacterButton');
     const modelStatusDot = document.getElementById('modelStatusDot');
     const modelStatusBody = document.getElementById('modelStatusBody');
@@ -154,6 +168,7 @@ if (typeof document !== 'undefined') {
     let currentMessages = [];
     let isSending = false;
     let editingCharacterId = null;
+    let ttsVoices = { voices: [], available: false };
 
     // ── Rendering helpers ──────────────────────────────────────────────────
 
@@ -252,10 +267,22 @@ if (typeof document !== 'undefined') {
         editingCharacterId = character ? character.id : null;
         charNameInput.value = character ? character.name : '';
         charAvatarInput.value = character ? character.avatarUrl : '';
+        populateVoiceSelect(character ? character.ttsVoice : '');
         charFormError.hidden = true;
         charFormError.textContent = '';
         characterForm.hidden = false;
         charNameInput.focus();
+    }
+
+    function populateVoiceSelect(selectedVoice) {
+        charVoiceSelect.innerHTML = '<option value="">No voice</option>';
+        for (const voice of ttsVoices.voices) {
+            const opt = document.createElement('option');
+            opt.value = voice;
+            opt.textContent = voice;
+            charVoiceSelect.appendChild(opt);
+        }
+        charVoiceSelect.value = selectedVoice || '';
     }
 
     function hideCharacterForm() {
@@ -263,6 +290,7 @@ if (typeof document !== 'undefined') {
         characterForm.hidden = true;
         charNameInput.value = '';
         charAvatarInput.value = '';
+        charVoiceSelect.value = '';
         charFormError.hidden = true;
         charFormError.textContent = '';
     }
@@ -458,7 +486,7 @@ if (typeof document !== 'undefined') {
         return normalizeConversation(await res.json());
     }
 
-    async function createCharacter(name, avatarUrl) {
+    async function createCharacter(name, avatarUrl, ttsVoice) {
         const token = await getCsrfToken();
         const res = await fetch('/api/openparlor/characters', {
             method: 'POST',
@@ -466,7 +494,7 @@ if (typeof document !== 'undefined') {
                 'Content-Type': 'application/json',
                 'X-CSRF-Token': token,
             },
-            body: JSON.stringify({ name, avatar_url: avatarUrl }),
+            body: JSON.stringify({ name, avatar_url: avatarUrl, tts_voice: ttsVoice }),
         });
         if (!res.ok) {
             const err = await res.json().catch(() => ({}));
@@ -475,7 +503,7 @@ if (typeof document !== 'undefined') {
         return normalizeCharacter(await res.json());
     }
 
-    async function updateCharacter(id, name, avatarUrl) {
+    async function updateCharacter(id, name, avatarUrl, ttsVoice) {
         const token = await getCsrfToken();
         const res = await fetch('/api/openparlor/characters/' + encodeURIComponent(id), {
             method: 'PATCH',
@@ -483,13 +511,23 @@ if (typeof document !== 'undefined') {
                 'Content-Type': 'application/json',
                 'X-CSRF-Token': token,
             },
-            body: JSON.stringify({ name, avatar_url: avatarUrl }),
+            body: JSON.stringify({ name, avatar_url: avatarUrl, tts_voice: ttsVoice }),
         });
         if (!res.ok) {
             const err = await res.json().catch(() => ({}));
             throw new Error(err.error || 'Failed to update character');
         }
         return normalizeCharacter(await res.json());
+    }
+
+    async function fetchTtsVoices() {
+        try {
+            const res = await fetch('/api/openparlor/tts/voices');
+            if (!res.ok) throw new Error('Failed to load TTS voices');
+            ttsVoices = normalizeTtsVoices(await res.json());
+        } catch {
+            ttsVoices = { voices: [], available: false };
+        }
     }
 
     // ── Actions ────────────────────────────────────────────────────────────
@@ -504,17 +542,18 @@ if (typeof document !== 'undefined') {
             return;
         }
 
-        const sanitized = sanitizeCharacterInput({ name: rawName, avatar_url: rawAvatar });
+        const rawVoice = charVoiceSelect.value;
+        const sanitized = sanitizeCharacterInput({ name: rawName, avatar_url: rawAvatar, tts_voice: rawVoice });
 
         try {
             charFormSave.disabled = true;
             let saved;
             if (editingCharacterId) {
-                saved = await updateCharacter(editingCharacterId, sanitized.name, sanitized.avatarUrl);
+                saved = await updateCharacter(editingCharacterId, sanitized.name, sanitized.avatarUrl, sanitized.ttsVoice);
                 const idx = characters.findIndex(c => c.id === editingCharacterId);
                 if (idx !== -1) characters[idx] = saved;
             } else {
-                saved = await createCharacter(sanitized.name, sanitized.avatarUrl);
+                saved = await createCharacter(sanitized.name, sanitized.avatarUrl, sanitized.ttsVoice);
                 characters.push(saved);
             }
             hideCharacterForm();
@@ -676,7 +715,7 @@ if (typeof document !== 'undefined') {
 
     async function init() {
         try {
-            await Promise.all([fetchCharacters(), fetchConversations()]);
+            await Promise.all([fetchCharacters(), fetchConversations(), fetchTtsVoices()]);
             renderCharacters();
             renderConversations();
             updateChatHeader();

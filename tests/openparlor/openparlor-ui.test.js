@@ -9,6 +9,7 @@ import {
     validateCharacterForm,
     sanitizeCharacterInput,
     normalizeModelStatus,
+    normalizeTtsVoices,
 } from '../../public/openparlor/openparlor.js';
 
 // ─── formatRelativeTime ─────────────────────────────────────────────────────
@@ -121,11 +122,13 @@ describe('normalizeCharacter', () => {
             id: 'c1',
             name: 'Emma',
             avatar_url: '/avatars/emma.png',
+            tts_voice: 'af_heart',
         };
         assert.deepEqual(normalizeCharacter(raw), {
             id: 'c1',
             name: 'Emma',
             avatarUrl: '/avatars/emma.png',
+            ttsVoice: 'af_heart',
         });
     });
 
@@ -134,6 +137,7 @@ describe('normalizeCharacter', () => {
         assert.equal(result.id, '');
         assert.equal(result.name, 'Unknown');
         assert.equal(result.avatarUrl, '');
+        assert.equal(result.ttsVoice, '');
     });
 });
 
@@ -261,11 +265,11 @@ describe('validateCharacterForm', () => {
 
 describe('sanitizeCharacterInput', () => {
     test('returns empty strings for null input', () => {
-        assert.deepEqual(sanitizeCharacterInput(null), { name: '', avatarUrl: '' });
+        assert.deepEqual(sanitizeCharacterInput(null), { name: '', avatarUrl: '', ttsVoice: '' });
     });
 
     test('returns empty strings for non-object input', () => {
-        assert.deepEqual(sanitizeCharacterInput(42), { name: '', avatarUrl: '' });
+        assert.deepEqual(sanitizeCharacterInput(42), { name: '', avatarUrl: '', ttsVoice: '' });
     });
 
     test('trims and returns clean name', () => {
@@ -316,6 +320,21 @@ describe('sanitizeCharacterInput', () => {
     test('handles missing avatar_url field', () => {
         const result = sanitizeCharacterInput({ name: 'Test' });
         assert.equal(result.avatarUrl, '');
+    });
+
+    test('passes through valid tts_voice', () => {
+        const result = sanitizeCharacterInput({ name: 'Test', tts_voice: 'af_heart' });
+        assert.equal(result.ttsVoice, 'af_heart');
+    });
+
+    test('defaults tts_voice to empty string when missing', () => {
+        const result = sanitizeCharacterInput({ name: 'Test' });
+        assert.equal(result.ttsVoice, '');
+    });
+
+    test('defaults tts_voice to empty string when not a string', () => {
+        const result = sanitizeCharacterInput({ name: 'Test', tts_voice: 42 });
+        assert.equal(result.ttsVoice, '');
     });
 });
 
@@ -368,5 +387,38 @@ describe('normalizeModelStatus', () => {
         assert.equal(result.endpointLabel, '');
         assert.deepEqual(result.models, []);
         assert.equal(result.connected, false);
+    });
+});
+
+// ─── normalizeTtsVoices ─────────────────────────────────────────────────────
+
+describe('normalizeTtsVoices', () => {
+    test('returns default for null input', () => {
+        assert.deepEqual(normalizeTtsVoices(null), { voices: [], available: false });
+    });
+
+    test('returns default for non-object input', () => {
+        assert.deepEqual(normalizeTtsVoices('hello'), { voices: [], available: false });
+    });
+
+    test('normalizes a valid response', () => {
+        const raw = { voices: ['af_heart', 'am_adam'], available: true };
+        assert.deepEqual(normalizeTtsVoices(raw), { voices: ['af_heart', 'am_adam'], available: true });
+    });
+
+    test('filters non-string voices', () => {
+        const result = normalizeTtsVoices({ voices: ['valid', 42, null, 'also-valid'], available: true });
+        assert.deepEqual(result.voices, ['valid', 'also-valid']);
+    });
+
+    test('coerces available to boolean', () => {
+        assert.equal(normalizeTtsVoices({ voices: [], available: 'yes' }).available, false);
+        assert.equal(normalizeTtsVoices({ voices: [], available: true }).available, true);
+    });
+
+    test('handles missing fields with defaults', () => {
+        const result = normalizeTtsVoices({});
+        assert.deepEqual(result.voices, []);
+        assert.equal(result.available, false);
     });
 });
