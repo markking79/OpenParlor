@@ -2,6 +2,13 @@
 
 ## Current state
 
+TASK-TTS-001 accepted: the existing Kokoro-FastAPI service is running locally
+on port 8880. Its verified OpenAI-compatible base URL, models, voice listing,
+and WAV synthesis request/response format are recorded in
+`.agent/LOCAL_RUNTIME_DISCOVERY.md`. A real local synthesis request succeeded.
+
+## Current state
+
 TASK-MODEL-001 accepted: authenticated `GET /api/openparlor/model-status`
 uses the per-user OpenParlor config loader and configured model-provider
 abstraction to safely report provider, configured model, endpoint hostname,
