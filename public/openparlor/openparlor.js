@@ -425,6 +425,135 @@ export function createTranscriptionController(deps = {}) {
 }
 
 /**
+ * Creates a voice-turn latency timer for development-only instrumentation.
+ * Tracks phases: recording→STT, send→first token, first token→complete,
+ * complete→TTS ready, and total turn time. Never logs content.
+ * @param {{ now?: () => number, logFn?: (data: object) => void }} [deps]
+ * @returns {{
+ *   start: () => void,
+ *   cancel: () => void,
+ *   markRecordingEnd: () => void,
+ *   markSttComplete: () => void,
+ *   markSendStart: () => void,
+ *   markFirstToken: () => void,
+ *   markStreamComplete: () => void,
+ *   markTtsReady: () => void,
+ *   report: () => object | null,
+ *   log: () => void,
+ *   active: boolean,
+ * }}
+ */
+export function createVoiceTurnTimer(deps = {}) {
+    const now = deps.now || (() => performance.now());
+    const logFn = deps.logFn || null;
+
+    let recordingEnd = null;
+    let sttComplete = null;
+    let sendStart = null;
+    let firstToken = null;
+    let streamComplete = null;
+    let ttsReady = null;
+    let active = false;
+
+    function start() {
+        active = true;
+        recordingEnd = null;
+        sttComplete = null;
+        sendStart = null;
+        firstToken = null;
+        streamComplete = null;
+        ttsReady = null;
+    }
+
+    function cancel() {
+        active = false;
+        recordingEnd = null;
+        sttComplete = null;
+        sendStart = null;
+        firstToken = null;
+        streamComplete = null;
+        ttsReady = null;
+    }
+
+    function markRecordingEnd() {
+        if (!active) return;
+        recordingEnd = now();
+    }
+
+    function markSttComplete() {
+        if (!active) return;
+        sttComplete = now();
+    }
+
+    function markSendStart() {
+        if (!active) return;
+        sendStart = now();
+    }
+
+    function markFirstToken() {
+        if (!active) return;
+        if (firstToken === null) firstToken = now();
+    }
+
+    function markStreamComplete() {
+        if (!active) return;
+        streamComplete = now();
+    }
+
+    function markTtsReady() {
+        if (!active) return;
+        ttsReady = now();
+    }
+
+    function getPhaseMs(from, to) {
+        if (from == null || to == null) return null;
+        return to - from;
+    }
+
+    function report() {
+        if (!active) return null;
+        return {
+            recordingToStt: getPhaseMs(recordingEnd, sttComplete),
+            sendToFirstToken: getPhaseMs(sendStart, firstToken),
+            firstTokenToComplete: getPhaseMs(firstToken, streamComplete),
+            completeToTts: getPhaseMs(streamComplete, ttsReady),
+            totalTurn: getPhaseMs(recordingEnd, ttsReady),
+        };
+    }
+
+    function log() {
+        const phases = report();
+        if (!phases) return;
+        const output = {
+            recordingToStt: phases.recordingToStt != null ? Math.round(phases.recordingToStt) + 'ms' : 'n/a',
+            sendToFirstToken: phases.sendToFirstToken != null ? Math.round(phases.sendToFirstToken) + 'ms' : 'n/a',
+            firstTokenToComplete: phases.firstTokenToComplete != null ? Math.round(phases.firstTokenToComplete) + 'ms' : 'n/a',
+            completeToTts: phases.completeToTts != null ? Math.round(phases.completeToTts) + 'ms' : 'n/a',
+            totalTurn: phases.totalTurn != null ? Math.round(phases.totalTurn) + 'ms' : 'n/a',
+        };
+        if (logFn) {
+            logFn(output);
+        } else {
+            console.debug('[voice-turn]', output);
+        }
+    }
+
+    return {
+        start,
+        cancel,
+        markRecordingEnd,
+        markSttComplete,
+        markSendStart,
+        markFirstToken,
+        markStreamComplete,
+        markTtsReady,
+        report,
+        log,
+        get active() { return active; },
+    };
+}
+
+/**
  * Creates a playback controller that manages audio synthesis and playback
  * for a single message at a time. All external dependencies are injectable
  * for deterministic testing.
@@ -547,6 +676,8 @@ if (typeof document !== 'undefined') {
     let ttsVoices = { voices: [], available: false };
     const playback = createPlaybackController();
     let selectionEpoch = 0;
+    const isDev = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+    const voiceTurnTimer = createVoiceTurnTimer();
 
     // ── Auto-speak state ───────────────────────────────────────────────────
 
@@ -1073,6 +1204,7 @@ if (typeof document !== 'undefined') {
     async function selectConversation(id) {
         selectionEpoch++;
         playback.stop();
+        voiceTurnTimer.cancel();
         try {
             renderState(messagesEl, 'loading', 'Loading…');
             await fetchConversation(id);
@@ -1117,6 +1249,7 @@ if (typeof document !== 'undefined') {
         isSending = true;
         sendButton.disabled = true;
         messageInput.value = '';
+        voiceTurnTimer.markSendStart();
 
         // Append user message locally
         currentMessages.push({ role: 'user', content: text });
@@ -1149,6 +1282,8 @@ if (typeof document !== 'undefined') {
                 assistantMsg.content = err.error || 'Request failed';
                 if (lastBubble) lastBubble.textContent = assistantMsg.content;
                 scrollMessages();
+                if (isDev) voiceTurnTimer.log();
+                voiceTurnTimer.cancel();
                 return;
             }
 
@@ -1162,6 +1297,7 @@ if (typeof document !== 'undefined') {
                 for (let i = processedCount; i < parser.records.length; i++) {
                     const record = parser.records[i];
                     if (record.type === 'delta') {
+                        voiceTurnTimer.markFirstToken();
                         assistantMsg.content += record.text;
                         if (lastBubble) lastBubble.textContent = assistantMsg.content;
                         scrollMessages();
@@ -1187,8 +1323,10 @@ if (typeof document !== 'undefined') {
 
             parser.flush();
             processNewRecords();
+            if (streamDone) voiceTurnTimer.markStreamComplete();
 
             // Auto-speak: play completed reply if enabled and conversation unchanged
+            let ttsHandled = false;
             if (
                 shouldAutoSpeak({
                     sendConversationId,
@@ -1204,14 +1342,26 @@ if (typeof document !== 'undefined') {
                 const char = characters.find(c => c.id === currentConversation.characterId);
                 const voice = char ? char.ttsVoice : '';
                 if (voice) {
-                    playback.play(assistantMsg.content, voice).catch(() => {});
+                    ttsHandled = true;
+                    playback.play(assistantMsg.content, voice).then((url) => {
+                        if (url) voiceTurnTimer.markTtsReady();
+                    }).catch(() => {}).finally(() => {
+                        if (isDev) voiceTurnTimer.log();
+                        voiceTurnTimer.cancel();
+                    });
                     updatePlaybackButtons();
                 }
+            }
+            if (!ttsHandled) {
+                if (isDev) voiceTurnTimer.log();
+                voiceTurnTimer.cancel();
             }
         } catch {
             assistantMsg.content = 'Connection error';
             if (lastBubble) lastBubble.textContent = assistantMsg.content;
             scrollMessages();
+            if (isDev) voiceTurnTimer.log();
+            voiceTurnTimer.cancel();
         } finally {
             isSending = false;
             sendButton.disabled = false;
@@ -1310,7 +1460,21 @@ if (typeof document !== 'undefined') {
         }
     }
 
-    const recorder = createRecorderController({ onStateChange: updateRecorderUI });
+    const recorder = createRecorderController({
+        onStateChange: (s) => {
+            updateRecorderUI();
+            if (s === 'stopped') {
+                const voiceMode = getVoiceModeState(currentConversation ? currentConversation.id : '');
+                if (voiceMode) {
+                    voiceTurnTimer.start();
+                    voiceTurnTimer.markRecordingEnd();
+                }
+            }
+            if (s === 'idle' || s === 'error') {
+                voiceTurnTimer.cancel();
+            }
+        },
+    });
     const transcription = createTranscriptionController({
         getCsrfToken,
         onStateChange: () => {
@@ -1363,6 +1527,7 @@ if (typeof document !== 'undefined') {
             updateTranscriptionStatus();
             const text = await transcription.transcribe(blob);
             if (text) {
+                voiceTurnTimer.markSttComplete();
                 const voiceMode = getVoiceModeState(currentConversation ? currentConversation.id : '');
                 if (shouldAutoSendTranscription({ voiceModeEnabled: voiceMode, transcriptionSucceeded: true })) {
                     messageInput.value = text;
@@ -1370,7 +1535,12 @@ if (typeof document !== 'undefined') {
                 } else {
                     messageInput.value = text;
                     messageInput.focus();
+                    if (isDev) voiceTurnTimer.log();
+                    voiceTurnTimer.cancel();
                 }
+            } else {
+                if (isDev) voiceTurnTimer.log();
+                voiceTurnTimer.cancel();
             }
             recorder.discard();
             updateRecorderUI();

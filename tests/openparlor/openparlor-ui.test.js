@@ -18,6 +18,7 @@ import {
     selectSupportedMime,
     createRecorderController,
     createTranscriptionController,
+    createVoiceTurnTimer,
 } from '../../public/openparlor/openparlor.js';
 
 // ─── formatRelativeTime ─────────────────────────────────────────────────────
@@ -1154,6 +1155,192 @@ describe('createRecorderController', () => {
         const controller2 = createRecorderController(fixedDeps.deps);
         await controller2.start();
         assert.equal(controller2.state, 'recording');
+    });
+});
+
+// ─── createVoiceTurnTimer ───────────────────────────────────────────────────
+
+describe('createVoiceTurnTimer', () => {
+    function makeClock() {
+        let t = 0;
+        return {
+            now: () => t,
+            advance: (ms) => { t += ms; },
+        };
+    }
+
+    test('initial state is not active', () => {
+        const timer = createVoiceTurnTimer({ now: () => 0 });
+        assert.equal(timer.active, false);
+    });
+
+    test('start makes timer active', () => {
+        const timer = createVoiceTurnTimer({ now: () => 0 });
+        timer.start();
+        assert.equal(timer.active, true);
+    });
+
+    test('cancel makes timer inactive and clears marks', () => {
+        const clock = makeClock();
+        const timer = createVoiceTurnTimer({ now: clock.now });
+        timer.start();
+        timer.markRecordingEnd();
+        clock.advance(100);
+        timer.markSttComplete();
+        timer.cancel();
+        assert.equal(timer.active, false);
+        assert.equal(timer.report(), null);
+    });
+
+    test('marks are ignored when not active', () => {
+        const clock = makeClock();
+        const timer = createVoiceTurnTimer({ now: clock.now });
+        timer.markRecordingEnd();
+        timer.markSttComplete();
+        assert.equal(timer.report(), null);
+    });
+
+    test('report returns null when not active', () => {
+        const timer = createVoiceTurnTimer({ now: () => 0 });
+        assert.equal(timer.report(), null);
+    });
+
+    test('report returns correct phase durations for a complete turn', () => {
+        const clock = makeClock();
+        const timer = createVoiceTurnTimer({ now: clock.now });
+        timer.start();
+        timer.markRecordingEnd();       // t=0
+        clock.advance(200);
+        timer.markSttComplete();       // t=200
+        clock.advance(50);
+        timer.markSendStart();         // t=250
+        clock.advance(300);
+        timer.markFirstToken();        // t=550
+        clock.advance(1000);
+        timer.markStreamComplete();    // t=1550
+        clock.advance(400);
+        timer.markTtsReady();          // t=1950
+
+        const report = timer.report();
+        assert.equal(report.recordingToStt, 200);
+        assert.equal(report.sendToFirstToken, 300);
+        assert.equal(report.firstTokenToComplete, 1000);
+        assert.equal(report.completeToTts, 400);
+        assert.equal(report.totalTurn, 1950);
+    });
+
+    test('report returns null for missing phases', () => {
+        const clock = makeClock();
+        const timer = createVoiceTurnTimer({ now: clock.now });
+        timer.start();
+        timer.markRecordingEnd();
+        clock.advance(100);
+        timer.markSttComplete();
+        // No send, no tokens, no TTS
+
+        const report = timer.report();
+        assert.equal(report.recordingToStt, 100);
+        assert.equal(report.sendToFirstToken, null);
+        assert.equal(report.firstTokenToComplete, null);
+        assert.equal(report.completeToTts, null);
+        assert.equal(report.totalTurn, null);
+    });
+
+    test('markFirstToken is idempotent (only records first call)', () => {
+        const clock = makeClock();
+        const timer = createVoiceTurnTimer({ now: clock.now });
+        timer.start();
+        timer.markSendStart();         // t=0
+        clock.advance(100);
+        timer.markFirstToken();        // t=100
+        clock.advance(200);
+        timer.markFirstToken();        // t=300 (should be ignored)
+        clock.advance(100);
+        timer.markStreamComplete();    // t=400
+
+        const report = timer.report();
+        assert.equal(report.sendToFirstToken, 100);
+        assert.equal(report.firstTokenToComplete, 300);
+    });
+
+    test('log calls injected logFn with rounded ms strings', () => {
+        const clock = makeClock();
+        const logged = [];
+        const timer = createVoiceTurnTimer({ now: clock.now, logFn: (d) => logged.push(d) });
+        timer.start();
+        timer.markRecordingEnd();
+        clock.advance(150);
+        timer.markSttComplete();
+        clock.advance(200);
+        timer.markSendStart();
+        clock.advance(350);
+        timer.markFirstToken();
+        clock.advance(500);
+        timer.markStreamComplete();
+        clock.advance(100);
+        timer.markTtsReady();
+
+        timer.log();
+        assert.equal(logged.length, 1);
+        assert.equal(logged[0].recordingToStt, '150ms');
+        assert.equal(logged[0].sendToFirstToken, '350ms');
+        assert.equal(logged[0].firstTokenToComplete, '500ms');
+        assert.equal(logged[0].completeToTts, '100ms');
+        assert.equal(logged[0].totalTurn, '1300ms');
+    });
+
+    test('log is a no-op when not active', () => {
+        const logged = [];
+        const timer = createVoiceTurnTimer({ now: () => 0, logFn: (d) => logged.push(d) });
+        timer.log();
+        assert.equal(logged.length, 0);
+    });
+
+    test('log shows n/a for missing phases', () => {
+        const clock = makeClock();
+        const logged = [];
+        const timer = createVoiceTurnTimer({ now: clock.now, logFn: (d) => logged.push(d) });
+        timer.start();
+        timer.markRecordingEnd();
+        clock.advance(100);
+        timer.markSttComplete();
+
+        timer.log();
+        assert.equal(logged.length, 1);
+        assert.equal(logged[0].recordingToStt, '100ms');
+        assert.equal(logged[0].sendToFirstToken, 'n/a');
+        assert.equal(logged[0].firstTokenToComplete, 'n/a');
+        assert.equal(logged[0].completeToTts, 'n/a');
+        assert.equal(logged[0].totalTurn, 'n/a');
+    });
+
+    test('start resets previous marks', () => {
+        const clock = makeClock();
+        const timer = createVoiceTurnTimer({ now: clock.now });
+        timer.start();
+        timer.markRecordingEnd();
+        clock.advance(500);
+        timer.markSttComplete();
+
+        // Start a new turn
+        timer.start();
+        assert.equal(timer.active, true);
+        const report = timer.report();
+        assert.equal(report.recordingToStt, null);
+        assert.equal(report.totalTurn, null);
+    });
+
+    test('cancel then start produces a fresh timer', () => {
+        const clock = makeClock();
+        const timer = createVoiceTurnTimer({ now: clock.now });
+        timer.start();
+        timer.markRecordingEnd();
+        timer.cancel();
+
+        timer.start();
+        assert.equal(timer.active, true);
+        const report = timer.report();
+        assert.equal(report.recordingToStt, null);
     });
 });
 
