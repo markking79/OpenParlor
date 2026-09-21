@@ -2,6 +2,17 @@
 
 ## Current state
 
+TASK-MODEL-001 accepted: authenticated `GET /api/openparlor/model-status`
+uses the per-user OpenParlor config loader and configured model-provider
+abstraction to safely report provider, configured model, endpoint hostname,
+discovered model IDs, and availability. The browser now shows this status in a
+small sidebar panel without receiving credentials or a configurable provider
+URL. Focused tests: 76 passed; changed-source lint passed; test lint has only
+the inherited Playwright `expect-expect` warnings. Local llama.cpp
+`/v1/models` probe succeeded and advertises the Qwen GGUF model.
+
+## Current state
+
 TASK-CHAR-004 accepted: server-side prompt assembly now derives global
 behavior, character system prompt, character scenario, bounded persisted
 conversation history, and newest user content without trusting browser

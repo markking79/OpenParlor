@@ -53,6 +53,7 @@ import { router as imageMetadataRouter } from './endpoints/image-metadata.js';
 import { router as openParlorChatRouter } from './openparlor/chat-router.js';
 import { router as openParlorCharacterRouter } from './openparlor/character-router.js';
 import { router as openParlorConversationRouter } from './openparlor/conversation-router.js';
+import { router as openParlorModelStatusRouter } from './openparlor/model-status-router.js';
 import { router as volcengineRouter } from './endpoints/volcengine.js';
 
 /**
@@ -189,6 +190,7 @@ export function setupPrivateEndpoints(app) {
     app.use('/api/backups', backupsRouter);
     app.use('/api/image-metadata', imageMetadataRouter);
     app.use('/api/openparlor', openParlorChatRouter);
+    app.use('/api/openparlor', openParlorModelStatusRouter);
     app.use('/api/openparlor/characters', openParlorCharacterRouter);
     app.use('/api/openparlor/conversations', openParlorConversationRouter);
 }

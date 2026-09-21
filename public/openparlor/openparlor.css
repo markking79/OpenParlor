@@ -499,6 +499,75 @@ button {
 }
 
 
+/* Model Status Panel */
+
+.model-status-panel {
+    margin-top: 20px;
+    padding: 12px;
+    background: #1d1f22;
+    border: 1px solid #292b2f;
+    border-radius: 10px;
+}
+
+.model-status-header {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    margin-bottom: 8px;
+}
+
+.model-status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #666;
+}
+
+.model-status-dot.connected {
+    background: #69ce88;
+}
+
+.model-status-dot.unavailable {
+    background: #e06060;
+}
+
+.model-status-title {
+    font-size: 11px;
+    font-weight: 650;
+    color: #777b84;
+    text-transform: uppercase;
+    letter-spacing: .07em;
+}
+
+.model-status-body {
+    font-size: 12px;
+    color: #b0b4bc;
+}
+
+.model-status-model {
+    font-weight: 600;
+    color: #ececec;
+    margin-bottom: 3px;
+}
+
+.model-status-endpoint {
+    color: #858991;
+    font-size: 11px;
+    margin-bottom: 4px;
+}
+
+.model-status-models {
+    color: #858991;
+    font-size: 11px;
+    line-height: 1.4;
+}
+
+.model-status-unavailable {
+    color: #e06060;
+    font-size: 12px;
+}
+
+
 /* Smaller screens */
 
 @media (max-width: 900px) {

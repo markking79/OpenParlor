@@ -8,6 +8,7 @@ import {
     mapChatRole,
     validateCharacterForm,
     sanitizeCharacterInput,
+    normalizeModelStatus,
 } from '../../public/openparlor/openparlor.js';
 
 // ─── formatRelativeTime ─────────────────────────────────────────────────────
@@ -315,5 +316,57 @@ describe('sanitizeCharacterInput', () => {
     test('handles missing avatar_url field', () => {
         const result = sanitizeCharacterInput({ name: 'Test' });
         assert.equal(result.avatarUrl, '');
+    });
+});
+
+// ─── normalizeModelStatus ───────────────────────────────────────────────────
+
+describe('normalizeModelStatus', () => {
+    test('returns default for null input', () => {
+        assert.deepEqual(normalizeModelStatus(null), {
+            provider: '', model: '', endpointLabel: '', models: [], connected: false,
+        });
+    });
+
+    test('returns default for non-object input', () => {
+        assert.deepEqual(normalizeModelStatus('hello'), {
+            provider: '', model: '', endpointLabel: '', models: [], connected: false,
+        });
+    });
+
+    test('normalizes a valid status', () => {
+        const raw = {
+            provider: 'openai',
+            model: 'gpt-4',
+            endpointLabel: 'api.openai.com',
+            models: ['gpt-4', 'gpt-3.5-turbo'],
+            connected: true,
+        };
+        assert.deepEqual(normalizeModelStatus(raw), {
+            provider: 'openai',
+            model: 'gpt-4',
+            endpointLabel: 'api.openai.com',
+            models: ['gpt-4', 'gpt-3.5-turbo'],
+            connected: true,
+        });
+    });
+
+    test('filters non-string models', () => {
+        const result = normalizeModelStatus({ models: ['valid', 42, null, 'also-valid'] });
+        assert.deepEqual(result.models, ['valid', 'also-valid']);
+    });
+
+    test('coerces connected to boolean', () => {
+        assert.equal(normalizeModelStatus({ connected: 'yes' }).connected, false);
+        assert.equal(normalizeModelStatus({ connected: true }).connected, true);
+    });
+
+    test('handles missing fields with defaults', () => {
+        const result = normalizeModelStatus({});
+        assert.equal(result.provider, '');
+        assert.equal(result.model, '');
+        assert.equal(result.endpointLabel, '');
+        assert.deepEqual(result.models, []);
+        assert.equal(result.connected, false);
     });
 });

@@ -113,6 +113,19 @@ export function sanitizeCharacterInput(data) {
     return { name, avatarUrl };
 }
 
+export function normalizeModelStatus(raw) {
+    if (!raw || typeof raw !== 'object') {
+        return { provider: '', model: '', endpointLabel: '', models: [], connected: false };
+    }
+    return {
+        provider: typeof raw.provider === 'string' ? raw.provider : '',
+        model: typeof raw.model === 'string' ? raw.model : '',
+        endpointLabel: typeof raw.endpointLabel === 'string' ? raw.endpointLabel : '',
+        models: Array.isArray(raw.models) ? raw.models.filter(m => typeof m === 'string') : [],
+        connected: raw.connected === true,
+    };
+}
+
 // ─── Browser application ─────────────────────────────────────────────────────
 
 if (typeof document !== 'undefined') {
@@ -132,6 +145,8 @@ if (typeof document !== 'undefined') {
     const charFormSave = document.getElementById('charFormSave');
     const charFormCancel = document.getElementById('charFormCancel');
     const newCharacterButton = document.getElementById('newCharacterButton');
+    const modelStatusDot = document.getElementById('modelStatusDot');
+    const modelStatusBody = document.getElementById('modelStatusBody');
 
     let characters = [];
     let conversations = [];
@@ -332,6 +347,62 @@ if (typeof document !== 'undefined') {
     }
 
     // ── API helpers ────────────────────────────────────────────────────────
+
+    async function fetchModelStatus() {
+        try {
+            const res = await fetch('/api/openparlor/model-status');
+            if (!res.ok) throw new Error('Failed to load model status');
+            const data = await res.json();
+            return normalizeModelStatus(data);
+        } catch {
+            return normalizeModelStatus(null);
+        }
+    }
+
+    function renderModelStatus(status) {
+        if (!modelStatusDot || !modelStatusBody) return;
+
+        modelStatusDot.className = 'model-status-dot' + (status.connected ? ' connected' : ' unavailable');
+
+        modelStatusBody.innerHTML = '';
+
+        if (!status.provider && !status.model) {
+            const el = document.createElement('div');
+            el.className = 'model-status-unavailable';
+            el.textContent = 'No model configured';
+            modelStatusBody.appendChild(el);
+            return;
+        }
+
+        if (status.model) {
+            const modelEl = document.createElement('div');
+            modelEl.className = 'model-status-model';
+            modelEl.textContent = status.model;
+            modelStatusBody.appendChild(modelEl);
+        }
+
+        if (status.endpointLabel) {
+            const endpointEl = document.createElement('div');
+            endpointEl.className = 'model-status-endpoint';
+            endpointEl.textContent = status.endpointLabel;
+            modelStatusBody.appendChild(endpointEl);
+        }
+
+        if (status.connected && status.models.length > 0) {
+            const modelsEl = document.createElement('div');
+            modelsEl.className = 'model-status-models';
+            modelsEl.textContent = status.models.slice(0, 5).join(', ');
+            if (status.models.length > 5) {
+                modelsEl.textContent += ` +${status.models.length - 5} more`;
+            }
+            modelStatusBody.appendChild(modelsEl);
+        } else if (!status.connected) {
+            const unavailableEl = document.createElement('div');
+            unavailableEl.className = 'model-status-unavailable';
+            unavailableEl.textContent = 'Unavailable';
+            modelStatusBody.appendChild(unavailableEl);
+        }
+    }
 
     async function getCsrfToken() {
         const res = await fetch('/csrf-token');
@@ -613,6 +684,9 @@ if (typeof document !== 'undefined') {
             renderState(conversationList, 'error', 'Failed to load data.');
             renderState(characterList, 'error', 'Failed to load data.');
         }
+
+        const status = await fetchModelStatus();
+        renderModelStatus(status);
     }
 
     init();
