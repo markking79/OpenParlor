@@ -10,7 +10,9 @@ import {
     sanitizeCharacterInput,
     normalizeModelStatus,
     normalizeTtsVoices,
+    normalizeAutoSpeakState,
     createPlaybackController,
+    shouldAutoSpeak,
 } from '../../public/openparlor/openparlor.js';
 
 // ─── formatRelativeTime ─────────────────────────────────────────────────────
@@ -587,5 +589,210 @@ describe('createPlaybackController', () => {
         // The first audio should have been paused
         // We can verify by checking that only the latest is active
         assert.equal(getLastAudio().played, true);
+    });
+
+    test('superseded play does not create or start audio (race)', async () => {
+        let resolveFirst;
+        const firstFetchPromise = new Promise(r => { resolveFirst = r; });
+
+        const createdUrls = [];
+        const revokedUrls = [];
+        const audios = [];
+
+        const deps = {
+            fetchFn: (url, opts) => {
+                // First call hangs until we resolve it
+                if (createdUrls.length === 0) {
+                    return firstFetchPromise.then(() => ({
+                        ok: true,
+                        blob: async () => new Blob(['first-audio']),
+                    }));
+                }
+                // Second call resolves immediately
+                return Promise.resolve({
+                    ok: true,
+                    blob: async () => new Blob(['second-audio']),
+                });
+            },
+            createObjectURL: (blob) => {
+                const url = `blob:race-${createdUrls.length + 1}`;
+                createdUrls.push(url);
+                return url;
+            },
+            revokeObjectURL: (url) => { revokedUrls.push(url); },
+            audioFactory: (url) => {
+                const audio = {
+                    src: url,
+                    played: false,
+                    paused: false,
+                    async play() { this.played = true; },
+                    pause() { this.paused = true; },
+                };
+                audios.push(audio);
+                return audio;
+            },
+        };
+
+        const controller = createPlaybackController(deps);
+
+        // Start first play (will hang on fetch)
+        const firstPlay = controller.play('first', 'af_heart');
+
+        // Start second play while first is still awaiting
+        const secondPlay = controller.play('second', 'am_adam');
+
+        // Resolve the first fetch — it should now be superseded
+        resolveFirst();
+
+        const firstResult = await firstPlay;
+        const secondResult = await secondPlay;
+
+        // The superseded first play should return null (no audio created)
+        assert.equal(firstResult, null);
+        // The second play should succeed
+        assert.equal(secondResult, 'blob:race-1');
+        // Only one audio object should have been created
+        assert.equal(audios.length, 1);
+        assert.equal(audios[0].played, true);
+        assert.equal(controller.isPlaying, true);
+    });
+
+    test('stop during pending play prevents audio creation', async () => {
+        let resolveFetch;
+        const fetchPromise = new Promise(r => { resolveFetch = r; });
+
+        const createdUrls = [];
+        const audios = [];
+
+        const deps = {
+            fetchFn: () => fetchPromise.then(() => ({
+                ok: true,
+                blob: async () => new Blob(['audio']),
+            })),
+            createObjectURL: (blob) => {
+                const url = `blob:stop-${createdUrls.length + 1}`;
+                createdUrls.push(url);
+                return url;
+            },
+            revokeObjectURL: () => {},
+            audioFactory: (url) => {
+                const audio = {
+                    src: url,
+                    played: false,
+                    paused: false,
+                    async play() { this.played = true; },
+                    pause() { this.paused = true; },
+                };
+                audios.push(audio);
+                return audio;
+            },
+        };
+
+        const controller = createPlaybackController(deps);
+
+        // Start play (will hang on fetch)
+        const playPromise = controller.play('test', 'af_heart');
+
+        // Stop while fetch is in flight
+        controller.stop();
+
+        // Resolve the fetch — should be superseded
+        resolveFetch();
+
+        const result = await playPromise;
+        assert.equal(result, null);
+        assert.equal(audios.length, 0);
+        assert.equal(controller.isPlaying, false);
+    });
+});
+
+// ─── shouldAutoSpeak ────────────────────────────────────────────────────────
+
+describe('shouldAutoSpeak', () => {
+    const base = {
+        sendConversationId: 'conv-1',
+        currentConversationId: 'conv-1',
+        sendEpoch: 0,
+        selectionEpoch: 0,
+        streamDone: true,
+        hadStreamError: false,
+        autoSpeakEnabled: true,
+        hasContent: true,
+    };
+
+    test('returns true when all conditions are met', () => {
+        assert.equal(shouldAutoSpeak(base), true);
+    });
+
+    test('returns false when conversation changed', () => {
+        assert.equal(shouldAutoSpeak({ ...base, currentConversationId: 'conv-2' }), false);
+    });
+
+    test('returns false when selection epoch changed (user clicked another conversation before fetch resolved)', () => {
+        assert.equal(shouldAutoSpeak({ ...base, selectionEpoch: 1 }), false);
+    });
+
+    test('returns false when stream did not complete with done', () => {
+        assert.equal(shouldAutoSpeak({ ...base, streamDone: false }), false);
+    });
+
+    test('returns false when stream had an error', () => {
+        assert.equal(shouldAutoSpeak({ ...base, hadStreamError: true }), false);
+    });
+
+    test('returns false when auto-speak is disabled', () => {
+        assert.equal(shouldAutoSpeak({ ...base, autoSpeakEnabled: false }), false);
+    });
+
+    test('returns false when there is no content', () => {
+        assert.equal(shouldAutoSpeak({ ...base, hasContent: false }), false);
+    });
+
+    test('returns false when send conversation id is empty', () => {
+        assert.equal(shouldAutoSpeak({ ...base, sendConversationId: '', currentConversationId: '' }), false);
+    });
+
+    test('returns false when both epoch and conversation changed', () => {
+        assert.equal(shouldAutoSpeak({ ...base, currentConversationId: 'conv-2', selectionEpoch: 3 }), false);
+    });
+});
+
+// ─── normalizeAutoSpeakState ────────────────────────────────────────────────
+
+describe('normalizeAutoSpeakState', () => {
+    test('returns true for string "true"', () => {
+        assert.equal(normalizeAutoSpeakState('true'), true);
+    });
+
+    test('returns true for boolean true', () => {
+        assert.equal(normalizeAutoSpeakState(true), true);
+    });
+
+    test('returns false for string "false"', () => {
+        assert.equal(normalizeAutoSpeakState('false'), false);
+    });
+
+    test('returns false for boolean false', () => {
+        assert.equal(normalizeAutoSpeakState(false), false);
+    });
+
+    test('returns false for null', () => {
+        assert.equal(normalizeAutoSpeakState(null), false);
+    });
+
+    test('returns false for undefined', () => {
+        assert.equal(normalizeAutoSpeakState(undefined), false);
+    });
+
+    test('returns false for empty string', () => {
+        assert.equal(normalizeAutoSpeakState(''), false);
+    });
+
+    test('returns false for arbitrary string', () => {
+        assert.equal(normalizeAutoSpeakState('yes'), false);
+    });
+
+    test('returns false for number', () => {
+        assert.equal(normalizeAutoSpeakState(1), false);
     });
 });

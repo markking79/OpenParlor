@@ -50,6 +50,46 @@ export function normalizeTtsVoices(raw) {
     };
 }
 
+export function normalizeAutoSpeakState(raw) {
+    return raw === 'true' || raw === true;
+}
+
+/**
+ * Pure decision helper: determines whether a completed assistant reply
+ * should be auto-spoken. All conditions must be true.
+ * @param {{
+ *   sendConversationId: string,
+ *   currentConversationId: string,
+ *   sendEpoch: number,
+ *   selectionEpoch: number,
+ *   streamDone: boolean,
+ *   hadStreamError: boolean,
+ *   autoSpeakEnabled: boolean,
+ *   hasContent: boolean,
+ * }} params
+ * @returns {boolean}
+ */
+export function shouldAutoSpeak({
+    sendConversationId,
+    currentConversationId,
+    sendEpoch,
+    selectionEpoch,
+    streamDone,
+    hadStreamError,
+    autoSpeakEnabled,
+    hasContent,
+}) {
+    return (
+        sendConversationId !== '' &&
+        sendConversationId === currentConversationId &&
+        sendEpoch === selectionEpoch &&
+        streamDone &&
+        !hadStreamError &&
+        autoSpeakEnabled &&
+        hasContent
+    );
+}
+
 export function createNdjsonParser() {
     const decoder = new TextDecoder('utf-8', { stream: true });
     let buffer = '';
@@ -167,8 +207,10 @@ export function createPlaybackController(deps = {}) {
     let currentAudio = null;
     let currentUrl = null;
     let _isPlaying = false;
+    let generation = 0;
 
     function stop() {
+        generation++;
         if (currentAudio) {
             currentAudio.pause();
             currentAudio.src = '';
@@ -183,16 +225,19 @@ export function createPlaybackController(deps = {}) {
 
     async function play(text, voice) {
         stop();
+        const gen = generation;
         const res = await fetchFn('/api/openparlor/tts/synthesize', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ text, voice }),
         });
+        if (gen !== generation) return null;
         if (!res.ok) {
             const err = await res.json().catch(() => ({}));
             throw new Error(err.error || 'Synthesis failed');
         }
         const blob = await res.blob();
+        if (gen !== generation) return null;
         currentUrl = createObjectURL(blob);
         currentAudio = audioFactory(currentUrl);
         const audio = currentAudio;
@@ -245,6 +290,7 @@ if (typeof document !== 'undefined') {
     const newCharacterButton = document.getElementById('newCharacterButton');
     const modelStatusDot = document.getElementById('modelStatusDot');
     const modelStatusBody = document.getElementById('modelStatusBody');
+    const autoSpeakButton = document.getElementById('autoSpeakButton');
 
     let characters = [];
     let conversations = [];
@@ -254,6 +300,39 @@ if (typeof document !== 'undefined') {
     let editingCharacterId = null;
     let ttsVoices = { voices: [], available: false };
     const playback = createPlaybackController();
+    let selectionEpoch = 0;
+
+    // ── Auto-speak state ───────────────────────────────────────────────────
+
+    function getAutoSpeakState(conversationId) {
+        if (!conversationId) return false;
+        try {
+            return normalizeAutoSpeakState(localStorage.getItem('openparlor-auto-speak-' + conversationId));
+        } catch {
+            return false;
+        }
+    }
+
+    function setAutoSpeakState(conversationId, enabled) {
+        if (!conversationId) return;
+        try {
+            localStorage.setItem('openparlor-auto-speak-' + conversationId, enabled ? 'true' : 'false');
+        } catch {
+            // storage unavailable
+        }
+    }
+
+    function updateAutoSpeakButton() {
+        if (!autoSpeakButton) return;
+        if (!currentConversation) {
+            autoSpeakButton.hidden = true;
+            return;
+        }
+        autoSpeakButton.hidden = false;
+        const enabled = getAutoSpeakState(currentConversation.id);
+        autoSpeakButton.setAttribute('aria-pressed', String(enabled));
+        autoSpeakButton.textContent = enabled ? 'Auto-speak: On' : 'Auto-speak: Off';
+    }
 
     // ── Rendering helpers ──────────────────────────────────────────────────
 
@@ -505,6 +584,7 @@ if (typeof document !== 'undefined') {
             chatSubtitle.textContent = 'Select a conversation to begin';
             messageInput.disabled = true;
             sendButton.disabled = true;
+            updateAutoSpeakButton();
             return;
         }
         const char = characters.find(c => c.id === currentConversation.characterId);
@@ -512,6 +592,7 @@ if (typeof document !== 'undefined') {
         chatSubtitle.textContent = char ? char.name : '';
         messageInput.disabled = false;
         sendButton.disabled = false;
+        updateAutoSpeakButton();
     }
 
     function scrollMessages() {
@@ -710,6 +791,7 @@ if (typeof document !== 'undefined') {
     }
 
     async function selectConversation(id) {
+        selectionEpoch++;
         playback.stop();
         try {
             renderState(messagesEl, 'loading', 'Loading…');
@@ -748,6 +830,9 @@ if (typeof document !== 'undefined') {
     async function sendMessage() {
         const text = messageInput.value.trim();
         if (!text || isSending || !currentConversation) return;
+
+        const sendConversationId = currentConversation.id;
+        const sendEpoch = selectionEpoch;
 
         isSending = true;
         sendButton.disabled = true;
@@ -791,6 +876,7 @@ if (typeof document !== 'undefined') {
             const reader = response.body.getReader();
             let processedCount = 0;
             let streamDone = false;
+            let hadStreamError = false;
 
             function processNewRecords() {
                 for (let i = processedCount; i < parser.records.length; i++) {
@@ -800,6 +886,7 @@ if (typeof document !== 'undefined') {
                         if (lastBubble) lastBubble.textContent = assistantMsg.content;
                         scrollMessages();
                     } else if (record.type === 'error') {
+                        hadStreamError = true;
                         assistantMsg.content += '\n' + (record.error || 'Stream error');
                         if (lastBubble) lastBubble.textContent = assistantMsg.content;
                         scrollMessages();
@@ -820,6 +907,27 @@ if (typeof document !== 'undefined') {
 
             parser.flush();
             processNewRecords();
+
+            // Auto-speak: play completed reply if enabled and conversation unchanged
+            if (
+                shouldAutoSpeak({
+                    sendConversationId,
+                    currentConversationId: currentConversation ? currentConversation.id : '',
+                    sendEpoch,
+                    selectionEpoch,
+                    streamDone,
+                    hadStreamError,
+                    autoSpeakEnabled: getAutoSpeakState(sendConversationId),
+                    hasContent: !!assistantMsg.content,
+                })
+            ) {
+                const char = characters.find(c => c.id === currentConversation.characterId);
+                const voice = char ? char.ttsVoice : '';
+                if (voice) {
+                    playback.play(assistantMsg.content, voice).catch(() => {});
+                    updatePlaybackButtons();
+                }
+            }
         } catch {
             assistantMsg.content = 'Connection error';
             if (lastBubble) lastBubble.textContent = assistantMsg.content;
@@ -855,6 +963,19 @@ if (typeof document !== 'undefined') {
             handleCharacterFormSubmit();
         }
     });
+
+    if (autoSpeakButton) {
+        autoSpeakButton.addEventListener('click', () => {
+            if (!currentConversation) return;
+            const newState = !getAutoSpeakState(currentConversation.id);
+            setAutoSpeakState(currentConversation.id, newState);
+            if (!newState) {
+                playback.stop();
+                updatePlaybackButtons();
+            }
+            updateAutoSpeakButton();
+        });
+    }
 
     // ── Initial load ───────────────────────────────────────────────────────
 

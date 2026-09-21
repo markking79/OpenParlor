@@ -583,6 +583,32 @@ button {
 }
 
 
+/* Auto-speak toggle */
+
+.auto-speak-btn {
+    border: 1px solid #34363b;
+    background: #202226;
+    color: #9b9fa7;
+    border-radius: 7px;
+    padding: 6px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.auto-speak-btn:hover {
+    background: #292b30;
+    color: #ececec;
+}
+
+.auto-speak-btn[aria-pressed="true"] {
+    background: #2a3a2a;
+    border-color: #4a7a4a;
+    color: #8fce8f;
+}
+
+
 /* Playback controls */
 
 .message-actions {
