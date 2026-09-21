@@ -1,134 +1,80 @@
 #!/usr/bin/env bash
-# OpenParlor's local, bounded implementation supervisor. Codex owns the
-# specification and acceptance decision; this launcher removes routine relay.
-set -uo pipefail
+# Runs one bounded local Qwen/Aider implementation pass. Codex remains the
+# supervisor: it writes the task card, reviews the diff, validates, commits,
+# and pushes. The worker never performs those actions.
+set -euo pipefail
 
 REPO="${OPENPARLOR_REPO:-$PWD}"
+MODE="${1:---resume}"
+CHECK_ONLY="${2:-}"
 TMP="${OPENPARLOR_SUPERVISOR_TMP:-/tmp/openparlor-supervisor}"
 AIDER_BIN="${AIDER_BIN:-/home/mark/.local/bin/aider}"
 QWEN_BASE="${OPENPARLOR_QWEN_BASE:-http://127.0.0.1:8080/v1}"
 QWEN_KEY="${OPENPARLOR_QWEN_KEY:-local}"
 QWEN_MODEL="${OPENPARLOR_QWEN_MODEL:-openai/local}"
-MAX_CORRECTIONS="${OPENPARLOR_MAX_CORRECTIONS:-3}"
-MODE="${1:---resume}"
-CHECK_ONLY="${2:-}"
 WORKER_PID_FILE="$TMP/worker.pid"
 WORKER_PGID_FILE="$TMP/worker.pgid"
-SERVER_PID_FILE="$TMP/server.pid"
-SERVER_PGID_FILE="$TMP/server.pgid"
-mkdir -p "$TMP"
 
-banner() { printf '\n==================================================\nOPENPARLOR — %s\n==================================================\n' "$1"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
-run() { echo "+ $*"; "$@"; }
 [[ "$MODE" == '--resume' || "$MODE" == '--auto' ]] || die 'usage: openparlor-codex [--resume|--auto] [--check-only]'
-[[ -d "$REPO/.git" ]] || die "not an OpenParlor checkout: $REPO (run from the checkout or set OPENPARLOR_REPO)"
+[[ -d "$REPO/.git" ]] || die "not an OpenParlor checkout: $REPO"
+[[ -x "$AIDER_BIN" ]] || die "Aider unavailable at $AIDER_BIN"
+mkdir -p "$TMP"
 cd "$REPO"
 
 clear_stale_worker() {
-    if [[ -f "$WORKER_PID_FILE" ]] && ! kill -0 "$(<"$WORKER_PID_FILE")" 2>/dev/null; then rm -f "$WORKER_PID_FILE" "$WORKER_PGID_FILE"; fi
+    if [[ -f "$WORKER_PID_FILE" ]] && ! kill -0 "$(<"$WORKER_PID_FILE")" 2>/dev/null; then
+        rm -f "$WORKER_PID_FILE" "$WORKER_PGID_FILE"
+    fi
 }
-owned_worker_active() { clear_stale_worker; [[ -f "$WORKER_PID_FILE" ]] && kill -0 "$(<"$WORKER_PID_FILE")" 2>/dev/null; }
-if owned_worker_active; then die "launcher-owned worker is active (PID $(<"$WORKER_PID_FILE"), PGID $(<"$WORKER_PGID_FILE" 2>/dev/null || true))"; fi
+clear_stale_worker
+if [[ -f "$WORKER_PID_FILE" ]] && kill -0 "$(<"$WORKER_PID_FILE")" 2>/dev/null; then
+    die "launcher-owned worker is active (PID $(<"$WORKER_PID_FILE"), PGID $(<"$WORKER_PGID_FILE" 2>/dev/null || true))"
+fi
 
-mapfile -t files < <(sed -n '/## Allowed files/,/##/p' .agent/current-task.md | grep -oE '`[^`]+`' | tr -d '`' | grep -E '^(src|public|tests)/' || true)
-TASK_ID="$(sed -n '1{s/^# *\(TASK-[0-9][0-9]*\).*/\1/p;}' .agent/current-task.md)"
-[[ -n "$TASK_ID" && ${#files[@]} -gt 0 ]] || die 'current task card needs a task id and parseable allowlist'
-allowed=(.agent/current-task.md "${files[@]}")
-is_allowed() { local file; for file in "${allowed[@]}"; do [[ "$1" == "$file" ]] && return 0; done; return 1; }
-validate_scope() {
-    local status file bad=0
-    while IFS= read -r status; do
-        file="${status:3}"; file="${file##* -> }"
-        if ! is_allowed "$file" && [[ "$file" != '.agent/openparlor-codex' && "$file" != '.agent/CODEX_SUPERVISOR.md' && "$file" != '.agent/WORKER_RULES.md' && "$file" != '.agent/BROWSER_TEST_INFRASTRUCTURE.md' ]]; then echo "Unexpected dirty file: $file"; bad=1; fi
-    done < <(git status --porcelain --untracked-files=all)
-    return "$bad"
-}
+mapfile -t files < <(sed -n '/^## \(Exact \)\?[Aa]llowlist/,/^## /p' .agent/current-task.md | sed -n 's/^- `\([^`]*\)`.*/\1/p' | sed 's/ (new)$//' | grep -E '^(src|public|tests)/' || true)
+TASK_ID="$(sed -n '1{s/^# *\(TASK-[A-Z0-9-]*\).*/\1/p;}' .agent/current-task.md)"
+[[ -n "$TASK_ID" && ${#files[@]} -gt 0 ]] || die 'current task card needs a task ID and parseable production/test allowlist'
 
-banner "TASK — $TASK_ID"
-echo "$(head -1 .agent/current-task.md)"
-printf 'allowed files: %s\n' "${files[*]}"
-validate_scope || die 'repository state is unsafe; preserving all work without changes'
+printf 'OPENPARLOR — %s\n' "$TASK_ID"
+printf 'allowed worker files: %s\n' "${files[*]}"
 if [[ "$CHECK_ONLY" == '--check-only' ]]; then
     [[ "$MODE" == '--resume' ]] || die '--check-only is only supported with --resume'
-    banner 'RESUME VALIDATION ONLY'; echo "Repository: $REPO"; echo "Current task: $TASK_ID"; echo 'Worker launch: DISABLED'; echo 'Server launch: DISABLED'; echo 'Files modified: none'; echo 'Resume state: VALID'; exit 0
+    echo 'Worker launch: DISABLED'
+    exit 0
 fi
 [[ -z "$CHECK_ONLY" ]] || die 'use --resume --check-only'
 
 cleanup_worker() {
     local pid pgid
     [[ -f "$WORKER_PID_FILE" ]] || return 0
-    pid="$(<"$WORKER_PID_FILE")"; pgid="$(<"$WORKER_PGID_FILE" 2>/dev/null || true)"
-    if kill -0 "$pid" 2>/dev/null; then echo "Stopping launcher-owned worker PID $pid PGID $pgid"; kill -TERM -- "-$pgid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true; fi
+    pid="$(<"$WORKER_PID_FILE")"
+    pgid="$(<"$WORKER_PGID_FILE" 2>/dev/null || true)"
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -TERM -- "-$pgid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    fi
     rm -f "$WORKER_PID_FILE" "$WORKER_PGID_FILE"
 }
-cleanup_server() {
-    local pid pgid
-    [[ -f "$SERVER_PID_FILE" ]] || return 0
-    pid="$(<"$SERVER_PID_FILE")"; pgid="$(<"$SERVER_PGID_FILE" 2>/dev/null || true)"
-    if kill -0 "$pid" 2>/dev/null; then echo "Stopping launcher-owned server PID $pid PGID $pgid"; kill -TERM -- "-$pgid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true; fi
-    rm -f "$SERVER_PID_FILE" "$SERVER_PGID_FILE"
-}
-trap 'cleanup_worker; cleanup_server' EXIT INT TERM
-run_worker() {
-    local purpose="$1" prompt="$2" pid pgid status
-    banner "$purpose"
-    [[ -x "$AIDER_BIN" ]] || { echo "Aider unavailable at $AIDER_BIN"; return 1; }
-    setsid env OPENAI_API_BASE="$QWEN_BASE" OPENAI_API_KEY="$QWEN_KEY" timeout --signal=INT --kill-after=30s 15m "$AIDER_BIN" "${files[@]}" --model "$QWEN_MODEL" --edit-format diff --map-tokens 0 --no-auto-commits --no-show-model-warnings --no-gitignore --yes --message "$prompt" &
-    pid=$!; pgid="$(ps -o pgid= -p "$pid" | tr -d ' ')"; printf '%s\n' "$pid" > "$WORKER_PID_FILE"; printf '%s\n' "$pgid" > "$WORKER_PGID_FILE"; echo "worker PID: $pid PGID: $pgid"
-    while kill -0 "$pid" 2>/dev/null; do sleep 20; kill -0 "$pid" 2>/dev/null && echo "worker active: PID $pid PGID $pgid"; done
-    status=0; wait "$pid" || status=$?
-    if pgrep -g "$pgid" >/dev/null 2>&1; then echo "worker process group $pgid did not exit; preserving work"; return 1; fi
-    rm -f "$WORKER_PID_FILE" "$WORKER_PGID_FILE"; echo "worker result: exit $status"; return "$status"
-}
-verify() {
-    local changed js tests status=0
-    banner "VERIFICATION — $TASK_ID"
-    run git diff --check || status=1
-    changed="$(git diff --name-only; git ls-files --others --exclude-standard)"; js="$(printf '%s\n' "$changed" | grep -E '^(src|public)/.*\.js$' || true)"; tests="$(printf '%s\n' "$changed" | grep '^tests/openparlor/.*\.test\.js$' || true)"
-    [[ -z "$js" ]] || run npm run lint -- --no-cache $js || status=1
-    [[ -z "$tests" ]] || run node --test $tests || status=1
-    return "$status"
-}
-runtime_test() {
-    banner "RUNTIME TEST — $TASK_ID"
-    if ! curl --silent --show-error --max-time 3 --output /dev/null http://127.0.0.1:8000/csrf-token; then
-        echo 'Runtime server is not running; starting a launcher-owned development server.'
-        setsid npm start >"$TMP/server.log" 2>&1 &
-        local server_pid=$! server_pgid
-        server_pgid="$(ps -o pgid= -p "$server_pid" | tr -d ' ')"; printf '%s\n' "$server_pid" > "$SERVER_PID_FILE"; printf '%s\n' "$server_pgid" > "$SERVER_PGID_FILE"; echo "server PID: $server_pid PGID: $server_pgid"
-        local attempt
-        for attempt in $(seq 1 30); do curl --silent --max-time 1 --output /dev/null http://127.0.0.1:8000/csrf-token && break; sleep 1; done
-        curl --silent --show-error --max-time 3 --output /dev/null http://127.0.0.1:8000/csrf-token || { sed -n '1,160p' "$TMP/server.log"; return 1; }
-    fi
-    local jar="$TMP/runtime-cookies.txt" token_json="$TMP/runtime-token.json" token response
-    curl --silent --show-error --max-time 5 --cookie-jar "$jar" --output "$token_json" http://127.0.0.1:8000/csrf-token || return 1
-    token="$(node -e "const fs=require('fs'); process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1], 'utf8')).token)" "$token_json")" || return 1
-    response="$(curl --silent --show-error --max-time 20 --cookie "$jar" --request POST http://127.0.0.1:8000/api/openparlor/chat --header 'Content-Type: application/json' --header "X-CSRF-Token: $token" --data '{\"messages\":[{\"role\":\"user\",\"content\":\"OpenParlor runtime probe\"}],\"stream\":true}')" || return 1
-    echo "runtime response: ${response:0:300}"; [[ "$response" == *'"type":"done"'* || "$response" == *'"error"'* ]]
-}
-browser_test() {
-    banner "BROWSER TEST — $TASK_ID"
-    local spec="tests/openparlor/${TASK_ID,,}.e2e.js"
-    [[ -f "$spec" ]] || { echo "No task-scoped browser spec ($spec); browser test deferred."; return 0; }
-    [[ -x tests/node_modules/.bin/playwright ]] || { echo 'Playwright dependencies are absent; browser test deferred. Run npm ci --prefix tests to enable it.'; return 0; }
-    find tests/node_modules/.cache/ms-playwright -maxdepth 1 -type d -name 'chromium-*' -print -quit 2>/dev/null | grep -q . || { echo 'Playwright Chromium is unavailable on this host; see .agent/BROWSER_TEST_INFRASTRUCTURE.md.'; return 0; }
-    run tests/node_modules/.bin/playwright test --config tests/playwright.config.js "$spec"
-}
+trap cleanup_worker EXIT INT TERM
 
-task_dirty=0
-for file in "${files[@]}"; do git diff --quiet -- "$file" || task_dirty=1; [[ -e "$file" ]] || task_dirty=1; done
-if [[ "$task_dirty" == 0 ]]; then run_worker 'QWEN IMPLEMENTATION — pass 0' "Read .agent/current-task.md and relevant source. Implement the complete task only in allowlisted files. Do not commit, push, reset, edit .agent files, or change unrelated files." || true; fi
-correction=0
-while ! verify || ! runtime_test || ! browser_test; do
-    ((correction+=1)); (( correction <= MAX_CORRECTIONS )) || die "acceptance still fails after $MAX_CORRECTIONS bounded correction passes; all task work is preserved"
-    run_worker "CORRECTION $correction — $TASK_ID" "Read .agent/current-task.md, the existing diff, and the failing verification output above. Make the smallest correction in allowlisted files only. Do not commit, push, reset, or edit supervisor/task files." || echo 'Worker exited non-zero; verification will decide whether its preserved changes are acceptable.'
+prompt="You are the implementation worker for $TASK_ID. Read .agent/current-task.md and the existing diff. Implement only the current task and edit ONLY these files: ${files[*]}. Preserve all unrelated dirty work. Do not edit .agent files, commit, push, stage, reset, clean, or discard work. Inspect relevant source first; run focused tests if possible. At completion report changed files, checks run, and concerns."
+setsid env OPENAI_API_BASE="$QWEN_BASE" OPENAI_API_KEY="$QWEN_KEY" timeout --signal=INT --kill-after=30s 15m "$AIDER_BIN" "${files[@]}" --model "$QWEN_MODEL" --edit-format diff --map-tokens 0 --no-auto-commits --no-show-model-warnings --no-gitignore --yes --message "$prompt" &
+pid=$!
+pgid="$(ps -o pgid= -p "$pid" | tr -d ' ')"
+printf '%s\n' "$pid" > "$WORKER_PID_FILE"
+printf '%s\n' "$pgid" > "$WORKER_PGID_FILE"
+echo "worker PID: $pid PGID: $pgid"
+
+status=0
+while kill -0 "$pid" 2>/dev/null; do
+    sleep 20
+    kill -0 "$pid" 2>/dev/null && echo "Qwen worker active: PID $pid PGID $pgid"
 done
-banner "CODEX REVIEW — $TASK_ID"
-validate_scope || die 'scope changed during implementation; preserving work without staging'
-git diff --check || die 'diff check failed after verification'; git diff --stat
-banner "COMMIT — $TASK_ID"
-git add -- "${allowed[@]}"; git diff --cached --check || die 'staged diff check failed; preserving work'
-git commit -m "${TASK_ID} $(head -1 .agent/current-task.md | sed 's/^# [^—]*— //')"
-echo "commit SHA: $(git rev-parse --short HEAD)"; echo 'Push remains manual.'
-if [[ "$MODE" == '--auto' ]]; then banner 'NEXT TASK'; echo 'Auto task selection requires a machine-readable ready task card. No next card was synthesized from the narrative plan; stopping safely.'; fi
+wait "$pid" || status=$?
+if pgrep -g "$pgid" >/dev/null 2>&1; then
+    die "launcher-owned worker group $pgid did not exit; preserving work"
+fi
+rm -f "$WORKER_PID_FILE" "$WORKER_PGID_FILE"
+trap - EXIT INT TERM
+echo "worker exit: $status (Codex must review and validate preserved work)"
+exit "$status"
