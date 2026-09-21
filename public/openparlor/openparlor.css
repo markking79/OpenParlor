@@ -137,6 +137,69 @@ button {
     margin-top: 4px;
 }
 
+.conversation-list {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.new-chat-area {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.character-select {
+    width: 100%;
+    border: 1px solid #34363b;
+    background: #202226;
+    color: #eeeeee;
+    border-radius: 9px;
+    padding: 9px 12px;
+    font-size: 13px;
+    outline: none;
+}
+
+.character-select:focus {
+    border-color: #555860;
+}
+
+.character-select:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.new-chat:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.character-list {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.avatar-img {
+    width: 100%;
+    height: 100%;
+    border-radius: 50%;
+    object-fit: cover;
+}
+
+.state-loading,
+.state-empty,
+.state-error {
+    padding: 16px 10px;
+    font-size: 13px;
+    color: #81858d;
+    text-align: center;
+}
+
+.state-error {
+    color: #f0a0a0;
+}
+
 
 /* Main chat */
 

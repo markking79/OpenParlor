@@ -2,6 +2,14 @@
 
 ## Current state
 
+TASK-DATA-003 accepted: the OpenParlor browser UI now loads stored characters
+and conversations, creates a one-on-one chat from the selected character,
+loads persisted messages, and associates streamed chat requests with the active
+conversation. Focused pure-helper tests: 27 passed. Authenticated Playwright
+acceptance remains deferred until a developer-local storage-state file exists.
+
+## Current state
+
 TASK-CHAR-002 accepted: authenticated character list/get/create/update/delete/
 clone APIs are mounted at `/api/openparlor/characters`. The focused test suite
 has 32 passing tests and validates input, safe browser-relative avatars, and

@@ -1,28 +1,32 @@
-# TASK-CHAR-002 — Character CRUD APIs
+# TASK-DATA-003 — Conversation list UI
 
 ## Goal
 
-Expose the accepted character schema through a focused authenticated API. Keep
-the existing uncommitted broad data router out of scope; this task gets its own
-route module and does not expose provider configuration.
+Replace the static demo conversation screen with an authenticated UI backed by
+the accepted character and conversation APIs. Keep server-owned provider
+configuration and the uncommitted broad data router out of scope.
 
 ## Acceptance criteria
 
-- Authenticated endpoints list, get, create, update, delete, and clone only
-  the current user's characters.
-- Input is validated, IDs cannot be path traversal, and unknown/provider
-  configuration fields are rejected rather than persisted.
-- Avatar values are safe browser-relative paths and no filesystem paths are
-  returned or accepted.
-- Focused tests cover lifecycle, validation, and cross-user isolation.
+- The sidebar lists stored recent conversations with title, last activity, and
+  the selected character's name/avatar; no demo conversation content remains.
+- Selecting a conversation loads its persisted messages and uses its ID for
+  subsequent streamed chat requests.
+- New conversation lets the user select one of their stored characters and
+  creates a conversation through the authenticated API.
+- The UI handles empty/loading/error states without exposing filesystem paths
+  or provider configuration.
+- Add focused browser-independent tests for pure UI helpers when practical;
+  keep the existing authenticated Playwright acceptance as a recorded runtime
+  follow-up if its storage state is unavailable.
 
 ## Exact allowlist
 
-- `src/openparlor/persistence.js`
-- `src/openparlor/character-router.js` (new)
-- `src/server-startup.js`
-- `tests/openparlor/character-router.test.js` (new)
+- `public/openparlor/index.html`
+- `public/openparlor/openparlor.js`
+- `public/openparlor/openparlor.css`
+- `tests/openparlor/openparlor-ui.test.js` (new)
 
-Do not edit `src/openparlor/router.js`, public files, package files, or other
+Do not edit OpenParlor server routes, `src/openparlor/router.js`, package files, or other
 `.agent` control files. Do not stage, reset, clean, discard, or modify
 unrelated existing work.
