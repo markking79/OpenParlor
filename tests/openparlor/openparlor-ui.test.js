@@ -761,6 +761,22 @@ describe('shouldAutoSpeak', () => {
     test('returns false when both epoch and conversation changed', () => {
         assert.equal(shouldAutoSpeak({ ...base, currentConversationId: 'conv-2', selectionEpoch: 3 }), false);
     });
+
+    test('returns false when recording is active', () => {
+        assert.equal(shouldAutoSpeak({ ...base, recordingActive: true }), false);
+    });
+
+    test('returns true when recording is not active', () => {
+        assert.equal(shouldAutoSpeak({ ...base, recordingActive: false }), true);
+    });
+
+    test('defaults recordingActive to false when omitted', () => {
+        assert.equal(shouldAutoSpeak(base), true);
+    });
+
+    test('returns false when recording is active even if all other conditions are met', () => {
+        assert.equal(shouldAutoSpeak({ ...base, recordingActive: true }), false);
+    });
 });
 
 // ─── normalizeAutoSpeakState ────────────────────────────────────────────────

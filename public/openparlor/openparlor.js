@@ -83,6 +83,7 @@ export function shouldAutoSendTranscription({ voiceModeEnabled, transcriptionSuc
  *   hadStreamError: boolean,
  *   autoSpeakEnabled: boolean,
  *   hasContent: boolean,
+ *   recordingActive?: boolean,
  * }} params
  * @returns {boolean}
  */
@@ -95,6 +96,7 @@ export function shouldAutoSpeak({
     hadStreamError,
     autoSpeakEnabled,
     hasContent,
+    recordingActive = false,
 }) {
     return (
         sendConversationId !== '' &&
@@ -103,7 +105,8 @@ export function shouldAutoSpeak({
         streamDone &&
         !hadStreamError &&
         autoSpeakEnabled &&
-        hasContent
+        hasContent &&
+        !recordingActive
     );
 }
 
@@ -676,6 +679,7 @@ if (typeof document !== 'undefined') {
     let ttsVoices = { voices: [], available: false };
     const playback = createPlaybackController();
     let selectionEpoch = 0;
+    let recordingInterruptionPending = false;
     const isDev = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
     const voiceTurnTimer = createVoiceTurnTimer();
 
@@ -1337,6 +1341,7 @@ if (typeof document !== 'undefined') {
                     hadStreamError,
                     autoSpeakEnabled: getAutoSpeakState(sendConversationId) || getVoiceModeState(sendConversationId),
                     hasContent: !!assistantMsg.content,
+                    recordingActive: recorder.state === 'recording' || recordingInterruptionPending,
                 })
             ) {
                 const char = characters.find(c => c.id === currentConversation.characterId);
@@ -1504,8 +1509,15 @@ if (typeof document !== 'undefined') {
 
     if (recordButton) {
         recordButton.addEventListener('click', async () => {
-            await recorder.start();
-            updateRecorderUI();
+            recordingInterruptionPending = true;
+            playback.stop();
+            updatePlaybackButtons();
+            try {
+                await recorder.start();
+            } finally {
+                recordingInterruptionPending = false;
+                updateRecorderUI();
+            }
         });
     }
 
