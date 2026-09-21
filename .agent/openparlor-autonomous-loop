@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Durable outer loop for the OpenParlor Codex supervisor. A Codex turn ending
+# is deliberately not a workflow terminal condition.
+set -euo pipefail
+
+REPO="${OPENPARLOR_REPO:-$PWD}"
+STATUS_FILE="$REPO/.agent/openparlor-autonomous-status.json"
+SPEC="$REPO/.agent/CODEX_AUTONOMOUS.md"
+LOCK_DIR="${OPENPARLOR_SUPERVISOR_TMP:-/tmp/openparlor-supervisor}/autonomous.lock"
+
+[[ -d "$REPO/.git" ]] || { echo "not an OpenParlor checkout: $REPO" >&2; exit 2; }
+[[ -f "$SPEC" ]] || { echo "missing supervisor instructions: $SPEC" >&2; exit 2; }
+mkdir -p "$(dirname "$LOCK_DIR")"
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    echo "OpenParlor autonomous supervisor is already running" >&2
+    exit 1
+fi
+trap 'rmdir "$LOCK_DIR"' EXIT INT TERM
+
+cd "$REPO"
+while true; do
+    codex exec --sandbox danger-full-access -C "$REPO" "$(<"$SPEC")" || true
+
+    if grep -q '"state": "plan_complete"' "$STATUS_FILE" 2>/dev/null; then
+        echo 'OpenParlor autonomous workflow: plan complete'
+        exit 0
+    fi
+    if grep -q '"state": "blocked"' "$STATUS_FILE" 2>/dev/null; then
+        echo 'OpenParlor autonomous workflow: blocked; see status file' >&2
+        exit 3
+    fi
+
+    echo 'OpenParlor autonomous workflow: continuing with the next Codex pass'
+    sleep 2
+done
