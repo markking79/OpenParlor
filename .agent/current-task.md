@@ -1,26 +1,25 @@
-# TASK-CHAR-003 — Character UI
+# TASK-CHAR-004 — Prompt assembly
 
 ## Goal
 
-Complete the browser character-management experience using the accepted
-authenticated character API. Extend the real character list introduced by the
-conversation UI; do not use the uncommitted broad data router.
+Build the authoritative server-side character prompt from stored character and
+conversation data. The browser must continue to send only ordinary chat
+messages and conversation IDs.
 
 ## Acceptance criteria
 
-- List real characters with avatar/name and support create, edit, select, and
-  start chat using the authenticated character/conversation APIs.
-- Forms validate required character name locally and surface safe API errors.
-- Character content never controls provider configuration or filesystem paths.
-- Extend focused browser-independent UI tests for pure form/normalization
-  helpers; preserve the existing authenticated browser-test deferral.
+- Deterministically assemble global behavior, character persona/system prompt,
+  scenario, recent stored conversation history, and newest user content.
+- Do not trust a browser-supplied system prompt or character identity.
+- Bound history growth and preserve valid model roles.
+- Add focused tests for ordering, role conversion, ownership, and limits.
 
 ## Exact allowlist
 
-- `public/openparlor/index.html`
-- `public/openparlor/openparlor.js`
-- `public/openparlor/openparlor.css`
-- `tests/openparlor/openparlor-ui.test.js`
+- `src/openparlor/prompt-builder.js` (new)
+- `src/openparlor/chat-router.js`
+- `tests/openparlor/prompt-builder.test.js` (new)
+- `tests/openparlor/chat-router.test.js`
 
 Do not edit OpenParlor server routes, `src/openparlor/router.js`, package files, or other
 `.agent` control files. Do not stage, reset, clean, discard, or modify

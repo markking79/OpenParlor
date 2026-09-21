@@ -3,6 +3,7 @@ import express from 'express';
 import { loadOpenParlorConfig } from './config.js';
 import { createModelProvider, ModelProviderError } from './model-provider.js';
 import * as persistence from './persistence.js';
+import { buildPrompt } from './prompt-builder.js';
 
 /**
  * @typedef {Object} ChatMessage
@@ -98,6 +99,9 @@ export function createOpenParlorChatRouter({
             return response.status(400).json({ error: 'The request body must contain a non-empty "messages" array of objects with string "role" and string "content" fields' });
         }
 
+        // Never trust browser-supplied system prompts
+        const safeMessages = messages.filter(m => m.role !== 'system');
+
         const user = request.user;
         if (user === null || user === undefined || user.directories === null || user.directories === undefined) {
             return response.status(401).json({ error: 'Authentication is required' });
@@ -107,8 +111,9 @@ export function createOpenParlorChatRouter({
         const conversationId = typeof request.body.conversation_id === 'string' ? request.body.conversation_id : null;
         const handle = user.profile?.handle ?? 'unknown';
 
-        // Validate conversation and persist the user's message
+        // Validate conversation, build server-side prompt, and persist the user's message
         let participantId = null;
+        let modelMessages = safeMessages;
         if (conversationId) {
             const conversation = persistence.getConversation(user.directories, conversationId);
             if (!conversation) {
@@ -122,7 +127,16 @@ export function createOpenParlorChatRouter({
                 return response.status(400).json({ error: 'Conversation has no character participant' });
             }
             participantId = characterParticipant.id;
-            const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
+
+            const character = persistence.getCharacter(user.directories, characterParticipant.character_id);
+            if (!character) {
+                return response.status(400).json({ error: 'Character not found' });
+            }
+
+            const history = persistence.getMessages(user.directories, conversationId);
+            modelMessages = buildPrompt({ character, conversation, history, newMessages: safeMessages });
+
+            const lastUserMsg = [...safeMessages].reverse().find(m => m.role === 'user');
             if (lastUserMsg) {
                 persistence.appendMessage(user.directories, conversationId, participantId, lastUserMsg.content, 'user');
             }
@@ -133,7 +147,7 @@ export function createOpenParlorChatRouter({
             const provider = createProvider(config.model);
 
             if (!stream) {
-                const completion = await provider.chatCompletion(messages);
+                const completion = await provider.chatCompletion(modelMessages);
                 if (conversationId && participantId) {
                     const assistantContent = typeof completion?.choices?.[0]?.message?.content === 'string'
                         ? completion.choices[0].message.content
@@ -162,7 +176,7 @@ export function createOpenParlorChatRouter({
             };
 
             try {
-                const result = await provider.streamChatCompletion(messages, { signal: abortController.signal });
+                const result = await provider.streamChatCompletion(modelMessages, { signal: abortController.signal });
                 for await (const chunk of result) {
                     buffer += decoder.decode(chunk, { stream: true });
                     const lines = buffer.split('\n');

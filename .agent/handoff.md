@@ -2,6 +2,14 @@
 
 ## Current state
 
+TASK-CHAR-004 accepted: server-side prompt assembly now derives global
+behavior, character system prompt, character scenario, bounded persisted
+conversation history, and newest user content without trusting browser
+identity or system/assistant messages. Focused tests: 34 passed; changed-file
+lint passed with inherited test-plugin warnings only.
+
+## Current state
+
 TASK-CHAR-003 accepted: the browser now supports creating and editing stored
 characters, validates required names, displays safe avatar/name data, and lets
 the user start a chat with a selected character. Focused UI helpers: 47 passed.
