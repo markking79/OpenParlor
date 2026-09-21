@@ -2,6 +2,14 @@
 
 ## Current state
 
+TASK-CHAR-002 accepted: authenticated character list/get/create/update/delete/
+clone APIs are mounted at `/api/openparlor/characters`. The focused test suite
+has 32 passing tests and validates input, safe browser-relative avatars, and
+cross-user isolation. The broad uncommitted `src/openparlor/router.js` remains
+intentionally excluded.
+
+## Current state
+
 TASK-DATA-002 accepted: authenticated one-on-one conversation lifecycle and
 chat persistence are available at `/api/openparlor/conversations`. Focused
 tests: 54 passed; changed-source lint passed. The broad pre-existing

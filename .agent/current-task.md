@@ -1,26 +1,27 @@
-# TASK-CHAR-001 — Character schema
+# TASK-CHAR-002 — Character CRUD APIs
 
 ## Goal
 
-Audit the accepted persistence character entity against the execution plan and
-make the smallest compatible schema correction needed before a character API
-or the conversation-list UI can depend on it. The existing uncommitted broad
-data router is explicitly out of scope.
+Expose the accepted character schema through a focused authenticated API. Keep
+the existing uncommitted broad data router out of scope; this task gets its own
+route module and does not expose provider configuration.
 
 ## Acceptance criteria
 
-- A character has the plan's minimum identity, persona, prompt, example,
-  tagging, avatar, TTS, ownership, and timestamp fields.
-- Existing stored character records remain readable through normalization or
-  compatible defaults.
-- Character writes preserve immutable identity/ownership/creation fields and
-  continue to use the existing crash-safe persistence boundary.
-- Focused persistence tests cover schema defaults and update invariants.
+- Authenticated endpoints list, get, create, update, delete, and clone only
+  the current user's characters.
+- Input is validated, IDs cannot be path traversal, and unknown/provider
+  configuration fields are rejected rather than persisted.
+- Avatar values are safe browser-relative paths and no filesystem paths are
+  returned or accepted.
+- Focused tests cover lifecycle, validation, and cross-user isolation.
 
 ## Exact allowlist
 
 - `src/openparlor/persistence.js`
-- `tests/openparlor/persistence.test.js`
+- `src/openparlor/character-router.js` (new)
+- `src/server-startup.js`
+- `tests/openparlor/character-router.test.js` (new)
 
 Do not edit `src/openparlor/router.js`, public files, package files, or other
 `.agent` control files. Do not stage, reset, clean, discard, or modify
