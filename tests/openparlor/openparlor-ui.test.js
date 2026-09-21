@@ -15,6 +15,7 @@ import {
     shouldAutoSpeak,
     selectSupportedMime,
     createRecorderController,
+    createTranscriptionController,
 } from '../../public/openparlor/openparlor.js';
 
 // ─── formatRelativeTime ─────────────────────────────────────────────────────
@@ -1091,5 +1092,44 @@ describe('createRecorderController', () => {
         const controller2 = createRecorderController(fixedDeps.deps);
         await controller2.start();
         assert.equal(controller2.state, 'recording');
+    });
+});
+
+describe('createTranscriptionController', () => {
+    test('posts exactly one audio Blob with CSRF and returns text without sending chat', async () => {
+        let request;
+        const controller = createTranscriptionController({
+            getCsrfToken: async () => 'csrf-token',
+            fetchFn: async (url, options) => {
+                request = { url, options };
+                return { ok: true, json: async () => ({ text: ' transcribed words ', language: 'en' }) };
+            },
+        });
+        const text = await controller.transcribe(new Blob(['recording'], { type: 'audio/webm' }));
+        assert.equal(text, 'transcribed words');
+        assert.equal(controller.state, 'ready');
+        assert.equal(request.url, '/api/openparlor/stt/transcribe');
+        assert.equal(request.options.method, 'POST');
+        assert.equal(request.options.headers['X-CSRF-Token'], 'csrf-token');
+        assert.equal(request.options.body.getAll('audio').length, 1);
+    });
+
+    test('reports a safe error and permits retry after a failed transcription', async () => {
+        let attempts = 0;
+        const controller = createTranscriptionController({
+            getCsrfToken: async () => 'csrf-token',
+            fetchFn: async () => {
+                attempts++;
+                return attempts === 1
+                    ? { ok: false, json: async () => ({ error: 'provider path /secret' }) }
+                    : { ok: true, json: async () => ({ text: 'retry worked' }) };
+            },
+        });
+        const blob = new Blob(['recording'], { type: 'audio/webm' });
+        assert.equal(await controller.transcribe(blob), null);
+        assert.equal(controller.state, 'error');
+        assert.equal(controller.error, 'Transcription failed. Please try again.');
+        assert.equal(await controller.transcribe(blob), 'retry worked');
+        assert.equal(controller.state, 'ready');
     });
 });

@@ -26,7 +26,7 @@ describe('OpenParlor configuration loading', () => {
     function disabledConfig() {
         return {
             model: { provider: 'openai-compatible', baseUrl: '', model: '' },
-            stt: { provider: '', baseUrl: '' },
+            stt: { provider: '', baseUrl: '', pythonExecutable: '', runnerPath: '', modelPath: '', modelCacheDir: '', maxAudioBytes: 0, timeoutMs: 0, language: '' },
             tts: { provider: '', baseUrl: '', voice: '' },
         };
     }
@@ -65,13 +65,13 @@ describe('OpenParlor configuration loading', () => {
         test('normalizes a valid configuration', async () => {
             writeConfig(JSON.stringify({
                 model: { provider: 'openai-compatible', baseUrl: 'https://model.example.invalid/v1', model: 'llama3' },
-                stt: { provider: 'whisper', baseUrl: 'https://stt.example.invalid/v1' },
+                stt: { provider: 'faster-whisper', baseUrl: '', pythonExecutable: '/usr/bin/python3', runnerPath: '/srv/runner.py', modelPath: '/srv/model', modelCacheDir: '/srv/cache', maxAudioBytes: 1024, timeoutMs: 5000, language: 'en' },
                 tts: { provider: 'kokoro', baseUrl: 'https://tts.example.invalid/v1', voice: 'af_heart' },
             }));
             const result = await loadOpenParlorConfig(directories);
             expect(result).toEqual({
                 model: { provider: 'openai-compatible', baseUrl: 'https://model.example.invalid/v1', model: 'llama3' },
-                stt: { provider: 'whisper', baseUrl: 'https://stt.example.invalid/v1' },
+                stt: { provider: 'faster-whisper', baseUrl: '', pythonExecutable: '/usr/bin/python3', runnerPath: '/srv/runner.py', modelPath: '/srv/model', modelCacheDir: '/srv/cache', maxAudioBytes: 1024, timeoutMs: 5000, language: 'en' },
                 tts: { provider: 'kokoro', baseUrl: 'https://tts.example.invalid/v1', voice: 'af_heart' },
             });
         });
@@ -105,7 +105,7 @@ describe('OpenParlor configuration loading', () => {
             const result = await loadOpenParlorConfig(directories);
             expect(result).toEqual({
                 model: { provider: 'openai-compatible', baseUrl: 'https://model.example.invalid/v1', model: '' },
-                stt: { provider: '', baseUrl: '' },
+                stt: { provider: '', baseUrl: '', pythonExecutable: '', runnerPath: '', modelPath: '', modelCacheDir: '', maxAudioBytes: 0, timeoutMs: 0, language: '' },
                 tts: { provider: '', baseUrl: '', voice: 'af_heart' },
             });
         });

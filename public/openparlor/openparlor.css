@@ -667,6 +667,25 @@ button {
     cursor: pointer;
 }
 
+.transcribe-btn {
+    border: 1px solid #3e5b76;
+    background: #202b35;
+    color: #b9ddf7;
+    border-radius: 6px;
+    padding: 4px 8px;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.transcribe-btn:hover:not(:disabled) {
+    background: #293a49;
+}
+
+.transcribe-btn:disabled {
+    opacity: 0.5;
+    cursor: wait;
+}
+
 .record-btn:hover:not(:disabled),
 .stop-record-btn:hover:not(:disabled),
 .cancel-record-btn:hover:not(:disabled) {
@@ -701,6 +720,12 @@ button {
 .recorder-error {
     font-size: 11px;
     color: #e06060;
+    margin-top: 4px;
+}
+
+.transcription-status {
+    font-size: 11px;
+    color: #9bcaeb;
     margin-top: 4px;
 }
 

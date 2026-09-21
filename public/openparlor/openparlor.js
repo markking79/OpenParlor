@@ -348,6 +348,11 @@ export function createRecorderController(deps = {}) {
         }
     }
 
+    function discard() {
+        blob = null;
+        if (state === 'stopped') setState('idle');
+    }
+
     return {
         get state() { return state; },
         get blob() { return blob; },
@@ -355,7 +360,51 @@ export function createRecorderController(deps = {}) {
         start,
         stop,
         cancel,
+        discard,
     };
+}
+
+/**
+ * Submits one recorded Blob to the server-owned STT endpoint. The controller
+ * deliberately has no send-chat dependency: successful text is returned for
+ * the composer to review and edit.
+ * @param {{ fetchFn?: typeof fetch, getCsrfToken?: () => Promise<string>, onStateChange?: (state: string) => void }} [deps]
+ */
+export function createTranscriptionController(deps = {}) {
+    const { fetchFn = fetch, getCsrfToken, onStateChange = null } = deps;
+    let state = 'idle';
+    let error = '';
+
+    function setState(next) {
+        state = next;
+        if (onStateChange) onStateChange(state);
+    }
+
+    async function transcribe(blob) {
+        if (!(blob instanceof Blob) || blob.size === 0 || state === 'busy') return null;
+        error = '';
+        setState('busy');
+        try {
+            const form = new FormData();
+            form.append('audio', blob, 'recording.webm');
+            const token = getCsrfToken ? await getCsrfToken() : '';
+            const response = await fetchFn('/api/openparlor/stt/transcribe', {
+                method: 'POST',
+                headers: token ? { 'X-CSRF-Token': token } : {},
+                body: form,
+            });
+            const result = await response.json().catch(() => null);
+            if (!response.ok || !result || typeof result.text !== 'string' || !result.text.trim()) throw new Error('failed');
+            setState('ready');
+            return result.text.trim();
+        } catch {
+            error = 'Transcription failed. Please try again.';
+            setState('error');
+            return null;
+        }
+    }
+
+    return { get state() { return state; }, get error() { return error; }, transcribe };
 }
 
 /**
@@ -1161,14 +1210,20 @@ if (typeof document !== 'undefined') {
     const recordButton = document.getElementById('recordButton');
     const stopRecordButton = document.getElementById('stopRecordButton');
     const cancelRecordButton = document.getElementById('cancelRecordButton');
+    const transcribeButton = document.getElementById('transcribeButton');
     const recordingIndicator = document.getElementById('recordingIndicator');
     const recorderError = document.getElementById('recorderError');
+    const transcriptionStatus = document.getElementById('transcriptionStatus');
 
     function updateRecorderUI() {
         const s = recorder.state;
         if (recordButton) {
             recordButton.hidden = (s === 'recording');
             recordButton.disabled = (s === 'recording');
+        }
+        if (transcribeButton) {
+            transcribeButton.hidden = (s !== 'stopped');
+            transcribeButton.disabled = transcription.state === 'busy';
         }
         if (stopRecordButton) {
             stopRecordButton.hidden = (s !== 'recording');
@@ -1191,6 +1246,27 @@ if (typeof document !== 'undefined') {
     }
 
     const recorder = createRecorderController({ onStateChange: updateRecorderUI });
+    const transcription = createTranscriptionController({
+        getCsrfToken,
+        onStateChange: () => {
+            updateRecorderUI();
+            updateTranscriptionStatus();
+        },
+    });
+
+    function updateTranscriptionStatus() {
+        if (!transcriptionStatus) return;
+        if (transcription.state === 'busy') {
+            transcriptionStatus.textContent = 'Transcribing…';
+            transcriptionStatus.hidden = false;
+        } else if (transcription.state === 'error') {
+            transcriptionStatus.textContent = transcription.error;
+            transcriptionStatus.hidden = false;
+        } else {
+            transcriptionStatus.textContent = '';
+            transcriptionStatus.hidden = true;
+        }
+    }
 
     if (typeof MediaRecorder === 'undefined' && recordButton) {
         recordButton.disabled = true;
@@ -1213,6 +1289,21 @@ if (typeof document !== 'undefined') {
     if (cancelRecordButton) {
         cancelRecordButton.addEventListener('click', () => {
             recorder.cancel();
+        });
+    }
+
+    if (transcribeButton) {
+        transcribeButton.addEventListener('click', async () => {
+            const blob = recorder.blob;
+            updateTranscriptionStatus();
+            const text = await transcription.transcribe(blob);
+            if (text) {
+                messageInput.value = text;
+                messageInput.focus();
+            }
+            recorder.discard();
+            updateRecorderUI();
+            updateTranscriptionStatus();
         });
     }
 
