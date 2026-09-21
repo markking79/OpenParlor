@@ -11,7 +11,12 @@ import { sync as writeFileAtomicSync } from 'write-file-atomic';
  * @property {string} personality
  * @property {string} scenario
  * @property {string} first_message
+ * @property {string} system_prompt
+ * @property {string} example_dialogue
+ * @property {string[]} tags
  * @property {string} [avatar_url] Relative URL (no filesystem paths)
+ * @property {string} tts_provider
+ * @property {string} tts_voice
  * @property {string} owner_id User handle
  * @property {string} created_at ISO 8601
  * @property {string} updated_at ISO 8601
@@ -180,6 +185,42 @@ function characterPath(directories, id) {
 }
 
 /**
+ * Returns a persisted character in the current schema without forcing a
+ * migration write for records created before optional fields were introduced.
+ * @param {unknown} value
+ * @returns {Character|null}
+ */
+function normalizeCharacter(value) {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+        return null;
+    }
+    const character = /** @type {Record<string, unknown>} */ (value);
+    if (typeof character.id !== 'string' || typeof character.owner_id !== 'string'
+        || typeof character.created_at !== 'string' || typeof character.updated_at !== 'string') {
+        return null;
+    }
+    const stringField = (name) => typeof character[name] === 'string' ? character[name] : '';
+    return {
+        ...character,
+        id: character.id,
+        name: stringField('name'),
+        description: stringField('description'),
+        personality: stringField('personality'),
+        scenario: stringField('scenario'),
+        first_message: stringField('first_message'),
+        system_prompt: stringField('system_prompt'),
+        example_dialogue: stringField('example_dialogue'),
+        tags: Array.isArray(character.tags) ? character.tags.filter(tag => typeof tag === 'string') : [],
+        ...(typeof character.avatar_url === 'string' ? { avatar_url: character.avatar_url } : {}),
+        tts_provider: stringField('tts_provider'),
+        tts_voice: stringField('tts_voice'),
+        owner_id: character.owner_id,
+        created_at: character.created_at,
+        updated_at: character.updated_at,
+    };
+}
+
+/**
  * Creates a new Character entity and persists it.
  * @param {import('../users.js').UserDirectoryList} directories
  * @param {string} owner_id
@@ -197,7 +238,12 @@ export function createCharacter(directories, owner_id, data) {
         personality: data.personality ?? '',
         scenario: data.scenario ?? '',
         first_message: data.first_message ?? '',
+        system_prompt: data.system_prompt ?? '',
+        example_dialogue: data.example_dialogue ?? '',
+        tags: Array.isArray(data.tags) ? data.tags.filter(tag => typeof tag === 'string') : [],
         ...(typeof data.avatar_url === 'string' ? { avatar_url: data.avatar_url } : {}),
+        tts_provider: data.tts_provider ?? '',
+        tts_voice: data.tts_voice ?? '',
         owner_id,
         created_at: now,
         updated_at: now,
@@ -212,7 +258,7 @@ export function createCharacter(directories, owner_id, data) {
  * @returns {Character|null}
  */
 export function getCharacter(directories, id) {
-    return safeReadJSON(characterPath(directories, id));
+    return normalizeCharacter(safeReadJSON(characterPath(directories, id)));
 }
 
 /**
@@ -225,7 +271,7 @@ export function listCharacters(directories, owner_id) {
     if (!fs.existsSync(dir)) return [];
     return fs.readdirSync(dir)
         .filter(f => f.endsWith('.json'))
-        .map(f => safeReadJSON(path.join(dir, f)))
+        .map(f => normalizeCharacter(safeReadJSON(path.join(dir, f))))
         .filter(c => c !== null && c.owner_id === owner_id);
 }
 
@@ -238,7 +284,16 @@ export function listCharacters(directories, owner_id) {
 export function updateCharacter(directories, id, updates) {
     const existing = getCharacter(directories, id);
     if (!existing) return null;
-    const updated = { ...existing, ...updates, id: existing.id, owner_id: existing.owner_id, created_at: existing.created_at, updated_at: nextUpdatedAt(existing.updated_at) };
+    const updated = normalizeCharacter({
+        ...existing,
+        ...updates,
+        tags: Array.isArray(updates.tags) ? updates.tags.filter(tag => typeof tag === 'string') : existing.tags,
+        id: existing.id,
+        owner_id: existing.owner_id,
+        created_at: existing.created_at,
+        updated_at: nextUpdatedAt(existing.updated_at),
+    });
+    if (!updated) return null;
     writeFileAtomicSync(characterPath(directories, id), JSON.stringify(updated, null, 2));
     return updated;
 }

@@ -106,10 +106,23 @@ describe('OpenParlor persistence', () => {
 
     describe('round trips', () => {
         it('character: create → get → update → get → delete → get null', () => {
-            const created = createCharacter(dirs, 'alice', { name: 'Test', description: 'D' });
+            const created = createCharacter(dirs, 'alice', {
+                name: 'Test',
+                description: 'D',
+                system_prompt: 'Stay kind.',
+                example_dialogue: 'User: Hello',
+                tags: ['friendly', 42],
+                tts_provider: 'kokoro',
+                tts_voice: 'af_heart',
+            });
             assert.ok(created.id);
             assert.equal(created.name, 'Test');
             assert.equal(created.owner_id, 'alice');
+            assert.equal(created.system_prompt, 'Stay kind.');
+            assert.equal(created.example_dialogue, 'User: Hello');
+            assert.deepEqual(created.tags, ['friendly']);
+            assert.equal(created.tts_provider, 'kokoro');
+            assert.equal(created.tts_voice, 'af_heart');
 
             const fetched = getCharacter(dirs, created.id);
             assert.deepEqual(fetched, created);
@@ -120,9 +133,35 @@ describe('OpenParlor persistence', () => {
             assert.equal(updateCharacter(dirs, created.id, { owner_id: 'bob' }).owner_id, 'alice');
             assert.equal(updated.created_at, created.created_at);
             assert.notEqual(updated.updated_at, created.updated_at);
+            assert.deepEqual(updateCharacter(dirs, created.id, { tags: ['updated', 1] }).tags, ['updated']);
 
             assert.equal(deleteCharacter(dirs, created.id), true);
             assert.equal(getCharacter(dirs, created.id), null);
+        });
+
+        it('normalizes legacy character records without rewriting them', () => {
+            const legacyId = 'legacy-character';
+            const legacy = {
+                id: legacyId,
+                name: 'Legacy',
+                description: '',
+                personality: '',
+                scenario: '',
+                first_message: '',
+                owner_id: 'alice',
+                created_at: '2026-01-01T00:00:00.000Z',
+                updated_at: '2026-01-01T00:00:00.000Z',
+            };
+            const characterPath = path.join(getOpenParlorRoot(dirs), 'characters', `${legacyId}.json`);
+            fs.writeFileSync(characterPath, JSON.stringify(legacy));
+
+            const loaded = getCharacter(dirs, legacyId);
+            assert.deepEqual(loaded.tags, []);
+            assert.equal(loaded.system_prompt, '');
+            assert.equal(loaded.example_dialogue, '');
+            assert.equal(loaded.tts_provider, '');
+            assert.equal(loaded.tts_voice, '');
+            assert.deepEqual(JSON.parse(fs.readFileSync(characterPath, 'utf8')), legacy);
         });
 
         it('conversation: create → get → update → delete → get null', () => {
