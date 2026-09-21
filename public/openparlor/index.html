@@ -64,6 +64,13 @@
 
             <footer class="composer">
                 <div class="composer-box">
+                    <div class="recorder-controls">
+                        <button id="recordButton" class="record-btn" title="Record message" aria-label="Record message">🎤</button>
+                        <button id="stopRecordButton" class="stop-record-btn" title="Stop recording" aria-label="Stop recording" hidden>■</button>
+                        <button id="cancelRecordButton" class="cancel-record-btn" title="Cancel recording" aria-label="Cancel recording" hidden>✕</button>
+                        <span id="recordingIndicator" class="recording-indicator" aria-label="Recording" hidden></span>
+                    </div>
+                    <span id="recorderError" class="recorder-error" role="status" aria-live="polite" hidden></span>
                     <textarea
                         id="messageInput"
                         rows="1"

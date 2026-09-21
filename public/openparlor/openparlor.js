@@ -180,6 +180,185 @@ export function normalizeModelStatus(raw) {
 }
 
 /**
+ * Selects the first MIME type from candidates that the given
+ * isTypeSupported predicate accepts. Returns '' if none are supported.
+ * @param {string[]} candidates
+ * @param {(mime: string) => boolean} isTypeSupported
+ * @returns {string}
+ */
+export function selectSupportedMime(candidates, isTypeSupported) {
+    for (const mime of candidates) {
+        if (isTypeSupported(mime)) return mime;
+    }
+    return '';
+}
+
+/**
+ * Creates a MediaRecorder controller for browser microphone recording.
+ * All external dependencies are injectable for deterministic testing.
+ * @param {{
+ *   getUserMedia?: (constraints: object) => Promise<MediaStream>,
+ *   MediaRecorderCtor?: { new (stream: MediaStream, options?: object): any, isTypeSupported: (mime: string) => boolean },
+ *   maxDurationMs?: number,
+ *   maxSizeBytes?: number,
+ *   mimeCandidates?: string[],
+ *   onStateChange?: (state: string) => void,
+ * }} [deps]
+ * @returns {{
+ *   state: string,
+ *   blob: Blob | null,
+ *   error: string | null,
+ *   start: () => Promise<void>,
+ *   stop: () => void,
+ *   cancel: () => void,
+ * }}
+ */
+export function createRecorderController(deps = {}) {
+    const {
+        getUserMedia = (constraints) => navigator.mediaDevices.getUserMedia(constraints),
+        MediaRecorderCtor = (typeof MediaRecorder !== 'undefined') ? MediaRecorder : null,
+        maxDurationMs = 60000,
+        maxSizeBytes = 5 * 1024 * 1024,
+        mimeCandidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4'],
+        onStateChange = null,
+    } = deps;
+
+    let state = 'idle';
+    let recorder = null;
+    let stream = null;
+    let chunks = [];
+    let blob = null;
+    let error = null;
+    let durationTimer = null;
+    let startTime = 0;
+    let totalSize = 0;
+    let _cancelled = false;
+    let _selectedMime = '';
+
+    function setState(newState) {
+        state = newState;
+        if (onStateChange) onStateChange(state);
+    }
+
+    function cleanup() {
+        if (durationTimer) {
+            clearInterval(durationTimer);
+            durationTimer = null;
+        }
+        if (stream) {
+            for (const track of stream.getTracks()) {
+                track.stop();
+            }
+            stream = null;
+        }
+        recorder = null;
+        chunks = [];
+        totalSize = 0;
+    }
+
+    async function start() {
+        if (state === 'recording') return;
+
+        if (!MediaRecorderCtor) {
+            setState('error');
+            error = 'MediaRecorder not supported';
+            return;
+        }
+
+        _selectedMime = selectSupportedMime(mimeCandidates, (m) => MediaRecorderCtor.isTypeSupported(m));
+
+        try {
+            stream = await getUserMedia({ audio: true });
+        } catch (e) {
+            setState('error');
+            error = (e && e.name === 'NotAllowedError') ? 'Permission denied' : 'Microphone unavailable';
+            return;
+        }
+
+        try {
+            const options = _selectedMime ? { mimeType: _selectedMime } : {};
+            recorder = new MediaRecorderCtor(stream, options);
+        } catch (e) {
+            cleanup();
+            setState('error');
+            error = 'Failed to create recorder';
+            return;
+        }
+
+        chunks = [];
+        totalSize = 0;
+        blob = null;
+        error = null;
+        _cancelled = false;
+
+        recorder.ondataavailable = (event) => {
+            if (event.data && event.data.size > 0) {
+                totalSize += event.data.size;
+                if (totalSize > maxSizeBytes) {
+                    if (recorder && recorder.state === 'recording') {
+                        recorder.stop();
+                    }
+                    return;
+                }
+                chunks.push(event.data);
+            }
+        };
+
+        recorder.onstop = () => {
+            if (_cancelled) {
+                _cancelled = false;
+                blob = null;
+                chunks = [];
+                totalSize = 0;
+                setState('idle');
+            } else if (state === 'recording') {
+                blob = new Blob(chunks, { type: _selectedMime || 'audio/webm' });
+                setState('stopped');
+            }
+            cleanup();
+        };
+
+        setState('recording');
+        startTime = Date.now();
+        recorder.start(250);
+
+        durationTimer = setInterval(() => {
+            if (Date.now() - startTime >= maxDurationMs) {
+                if (recorder && recorder.state === 'recording') {
+                    recorder.stop();
+                }
+            }
+        }, 100);
+        // Node's test runner must not stay alive solely for this browser timer.
+        if (typeof durationTimer.unref === 'function') durationTimer.unref();
+    }
+
+    function stop() {
+        if (state !== 'recording') return;
+        if (recorder && recorder.state === 'recording') {
+            recorder.stop();
+        }
+    }
+
+    function cancel() {
+        if (state !== 'recording') return;
+        _cancelled = true;
+        if (recorder && recorder.state === 'recording') {
+            recorder.stop();
+        }
+    }
+
+    return {
+        get state() { return state; },
+        get blob() { return blob; },
+        get error() { return error; },
+        start,
+        stop,
+        cancel,
+    };
+}
+
+/**
  * Creates a playback controller that manages audio synthesis and playback
  * for a single message at a time. All external dependencies are injectable
  * for deterministic testing.
@@ -974,6 +1153,66 @@ if (typeof document !== 'undefined') {
                 updatePlaybackButtons();
             }
             updateAutoSpeakButton();
+        });
+    }
+
+    // ── Recorder controls ──────────────────────────────────────────────────
+
+    const recordButton = document.getElementById('recordButton');
+    const stopRecordButton = document.getElementById('stopRecordButton');
+    const cancelRecordButton = document.getElementById('cancelRecordButton');
+    const recordingIndicator = document.getElementById('recordingIndicator');
+    const recorderError = document.getElementById('recorderError');
+
+    function updateRecorderUI() {
+        const s = recorder.state;
+        if (recordButton) {
+            recordButton.hidden = (s === 'recording');
+            recordButton.disabled = (s === 'recording');
+        }
+        if (stopRecordButton) {
+            stopRecordButton.hidden = (s !== 'recording');
+        }
+        if (cancelRecordButton) {
+            cancelRecordButton.hidden = (s !== 'recording');
+        }
+        if (recordingIndicator) {
+            recordingIndicator.hidden = (s !== 'recording');
+        }
+        if (recorderError) {
+            if (s === 'error' && recorder.error) {
+                recorderError.textContent = recorder.error;
+                recorderError.hidden = false;
+            } else {
+                recorderError.hidden = true;
+                recorderError.textContent = '';
+            }
+        }
+    }
+
+    const recorder = createRecorderController({ onStateChange: updateRecorderUI });
+
+    if (typeof MediaRecorder === 'undefined' && recordButton) {
+        recordButton.disabled = true;
+        recordButton.title = 'Recording not supported in this browser';
+    }
+
+    if (recordButton) {
+        recordButton.addEventListener('click', async () => {
+            await recorder.start();
+            updateRecorderUI();
+        });
+    }
+
+    if (stopRecordButton) {
+        stopRecordButton.addEventListener('click', () => {
+            recorder.stop();
+        });
+    }
+
+    if (cancelRecordButton) {
+        cancelRecordButton.addEventListener('click', () => {
+            recorder.cancel();
         });
     }
 

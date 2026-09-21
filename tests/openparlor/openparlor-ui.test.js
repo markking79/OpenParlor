@@ -13,6 +13,8 @@ import {
     normalizeAutoSpeakState,
     createPlaybackController,
     shouldAutoSpeak,
+    selectSupportedMime,
+    createRecorderController,
 } from '../../public/openparlor/openparlor.js';
 
 // ─── formatRelativeTime ─────────────────────────────────────────────────────
@@ -794,5 +796,300 @@ describe('normalizeAutoSpeakState', () => {
 
     test('returns false for number', () => {
         assert.equal(normalizeAutoSpeakState(1), false);
+    });
+});
+
+// ─── selectSupportedMime ────────────────────────────────────────────────────
+
+describe('selectSupportedMime', () => {
+    test('returns first supported MIME from candidates', () => {
+        const supported = new Set(['audio/webm', 'audio/mp4']);
+        const result = selectSupportedMime(
+            ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'],
+            (m) => supported.has(m),
+        );
+        assert.equal(result, 'audio/webm');
+    });
+
+    test('returns empty string when no candidates are supported', () => {
+        const result = selectSupportedMime(
+            ['audio/webm;codecs=opus', 'audio/webm'],
+            () => false,
+        );
+        assert.equal(result, '');
+    });
+
+    test('returns empty string for empty candidates array', () => {
+        const result = selectSupportedMime([], () => true);
+        assert.equal(result, '');
+    });
+
+    test('returns first candidate if it is supported', () => {
+        const result = selectSupportedMime(
+            ['audio/webm;codecs=opus', 'audio/webm'],
+            (m) => m === 'audio/webm;codecs=opus',
+        );
+        assert.equal(result, 'audio/webm;codecs=opus');
+    });
+});
+
+// ─── createRecorderController ───────────────────────────────────────────────
+
+describe('createRecorderController', () => {
+    function makeMockStream() {
+        const tracks = [{ stop() { this._stopped = true; } }];
+        return { getTracks: () => tracks, _tracks: tracks };
+    }
+
+    function makeMockMediaRecorder({ supportedTypes = ['audio/webm;codecs=opus', 'audio/webm'] } = {}) {
+        const instances = [];
+        class MockMediaRecorder {
+            constructor(stream, options) {
+                this.stream = stream;
+                this.options = options || {};
+                this.state = 'inactive';
+                this.ondataavailable = null;
+                this.onstop = null;
+                instances.push(this);
+            }
+            static isTypeSupported(mime) {
+                return supportedTypes.includes(mime);
+            }
+            start(timeslice) {
+                this.state = 'recording';
+                this._timeslice = timeslice;
+            }
+            stop() {
+                if (this.state === 'recording') {
+                    this.state = 'inactive';
+                    if (this.onstop) this.onstop();
+                }
+            }
+            emitData(chunk) {
+                if (this.ondataavailable) {
+                    this.ondataavailable({ data: chunk });
+                }
+            }
+        }
+        return { MockMediaRecorder, instances };
+    }
+
+    function makeDeps({ supportedTypes, getUserMediaError, maxDurationMs, maxSizeBytes } = {}) {
+        const { MockMediaRecorder, instances } = makeMockMediaRecorder({ supportedTypes });
+        const stream = makeMockStream();
+
+        const deps = {
+            getUserMedia: async () => {
+                if (getUserMediaError) throw getUserMediaError;
+                return stream;
+            },
+            MediaRecorderCtor: MockMediaRecorder,
+            maxDurationMs: maxDurationMs || 60000,
+            maxSizeBytes: maxSizeBytes || 5 * 1024 * 1024,
+        };
+
+        return { deps, instances, stream };
+    }
+
+    test('initial state is idle', () => {
+        const { deps } = makeDeps();
+        const controller = createRecorderController(deps);
+        assert.equal(controller.state, 'idle');
+        assert.equal(controller.blob, null);
+        assert.equal(controller.error, null);
+    });
+
+    test('start transitions to recording state', async () => {
+        const { deps, instances } = makeDeps();
+        const controller = createRecorderController(deps);
+        await controller.start();
+        assert.equal(controller.state, 'recording');
+        assert.equal(instances.length, 1);
+        assert.equal(instances[0].state, 'recording');
+    });
+
+    test('start selects supported MIME type', async () => {
+        const { deps, instances } = makeDeps({ supportedTypes: ['audio/webm'] });
+        const controller = createRecorderController(deps);
+        await controller.start();
+        assert.equal(instances[0].options.mimeType, 'audio/webm');
+    });
+
+    test('start uses no mimeType option when no type is supported', async () => {
+        const { deps, instances } = makeDeps({ supportedTypes: [] });
+        const controller = createRecorderController(deps);
+        await controller.start();
+        assert.equal(instances[0].options.mimeType, undefined);
+    });
+
+    test('stop transitions to stopped and produces a blob', async () => {
+        const { deps, instances } = makeDeps();
+        const controller = createRecorderController(deps);
+        await controller.start();
+
+        // Simulate data chunks
+        instances[0].emitData(new Blob(['chunk1']));
+        instances[0].emitData(new Blob(['chunk2']));
+
+        controller.stop();
+        assert.equal(controller.state, 'stopped');
+        assert.ok(controller.blob instanceof Blob);
+        assert.equal(controller.blob.size, 12); // 'chunk1' + 'chunk2'
+    });
+
+    test('stop is safe to call when not recording', () => {
+        const { deps } = makeDeps();
+        const controller = createRecorderController(deps);
+        controller.stop();
+        assert.equal(controller.state, 'idle');
+    });
+
+    test('cancel transitions back to idle and discards blob', async () => {
+        const { deps, instances } = makeDeps();
+        const controller = createRecorderController(deps);
+        await controller.start();
+
+        instances[0].emitData(new Blob(['data']));
+
+        controller.cancel();
+        assert.equal(controller.state, 'idle');
+        assert.equal(controller.blob, null);
+    });
+
+    test('cancel is safe to call when not recording', () => {
+        const { deps } = makeDeps();
+        const controller = createRecorderController(deps);
+        controller.cancel();
+        assert.equal(controller.state, 'idle');
+    });
+
+    test('permission denied sets error state', async () => {
+        const err = new Error('Permission denied');
+        err.name = 'NotAllowedError';
+        const { deps } = makeDeps({ getUserMediaError: err });
+        const controller = createRecorderController(deps);
+        await controller.start();
+        assert.equal(controller.state, 'error');
+        assert.equal(controller.error, 'Permission denied');
+    });
+
+    test('microphone unavailable sets error state', async () => {
+        const err = new Error('No device');
+        err.name = 'NotFoundError';
+        const { deps } = makeDeps({ getUserMediaError: err });
+        const controller = createRecorderController(deps);
+        await controller.start();
+        assert.equal(controller.state, 'error');
+        assert.equal(controller.error, 'Microphone unavailable');
+    });
+
+    test('MediaRecorder not supported sets error state', async () => {
+        const { deps } = makeDeps();
+        const controller = createRecorderController({ ...deps, MediaRecorderCtor: null });
+        await controller.start();
+        assert.equal(controller.state, 'error');
+        assert.equal(controller.error, 'MediaRecorder not supported');
+    });
+
+    test('maximum duration stops recording and produces blob', async () => {
+        const { deps, instances } = makeDeps({ maxDurationMs: 50 });
+        const states = [];
+        const controller = createRecorderController({ ...deps, onStateChange: (s) => states.push(s) });
+        await controller.start();
+
+        instances[0].emitData(new Blob(['audio-data']));
+
+        // Wait for the duration timer to fire
+        await new Promise(r => setTimeout(r, 150));
+
+        assert.equal(controller.state, 'stopped');
+        assert.ok(controller.blob instanceof Blob);
+        assert.ok(states.includes('recording'));
+        assert.ok(states.includes('stopped'));
+    });
+
+    test('maximum size stops recording and produces blob', async () => {
+        const { deps, instances } = makeDeps({ maxSizeBytes: 10 });
+        const controller = createRecorderController(deps);
+        await controller.start();
+
+        // Emit a chunk that exceeds the size limit
+        instances[0].emitData(new Blob(['this-is-a-long-chunk-over-10-bytes']));
+
+        assert.equal(controller.state, 'stopped');
+        assert.ok(controller.blob instanceof Blob);
+    });
+
+    test('chunks within size limit are retained', async () => {
+        const { deps, instances } = makeDeps({ maxSizeBytes: 100 });
+        const controller = createRecorderController(deps);
+        await controller.start();
+
+        instances[0].emitData(new Blob(['small']));
+        instances[0].emitData(new Blob(['data']));
+
+        controller.stop();
+        assert.equal(controller.blob.size, 9); // 'small' + 'data'
+    });
+
+    test('stream tracks are stopped on cleanup after stop', async () => {
+        const { deps, stream } = makeDeps();
+        const controller = createRecorderController(deps);
+        await controller.start();
+        controller.stop();
+        assert.equal(stream._tracks[0]._stopped, true);
+    });
+
+    test('stream tracks are stopped on cleanup after cancel', async () => {
+        const { deps, stream } = makeDeps();
+        const controller = createRecorderController(deps);
+        await controller.start();
+        controller.cancel();
+        assert.equal(stream._tracks[0]._stopped, true);
+    });
+
+    test('onStateChange callback is invoked on transitions', async () => {
+        const { deps } = makeDeps();
+        const states = [];
+        const controller = createRecorderController({ ...deps, onStateChange: (s) => states.push(s) });
+        await controller.start();
+        controller.stop();
+        assert.deepEqual(states, ['recording', 'stopped']);
+    });
+
+    test('start is idempotent while recording', async () => {
+        const { deps, instances } = makeDeps();
+        const controller = createRecorderController(deps);
+        await controller.start();
+        await controller.start(); // Should be a no-op
+        assert.equal(instances.length, 1);
+        assert.equal(controller.state, 'recording');
+    });
+
+    test('can start again after stopped', async () => {
+        const { deps, instances } = makeDeps();
+        const controller = createRecorderController(deps);
+        await controller.start();
+        controller.stop();
+        assert.equal(controller.state, 'stopped');
+
+        await controller.start();
+        assert.equal(controller.state, 'recording');
+        assert.equal(instances.length, 2);
+    });
+
+    test('can start again after error', async () => {
+        const err = new Error('denied');
+        err.name = 'NotAllowedError';
+        const { deps } = makeDeps({ getUserMediaError: err });
+        const controller = createRecorderController(deps);
+        await controller.start();
+        assert.equal(controller.state, 'error');
+
+        // Now fix the error and try again
+        const fixedDeps = makeDeps();
+        const controller2 = createRecorderController(fixedDeps.deps);
+        await controller2.start();
+        assert.equal(controller2.state, 'recording');
     });
 });

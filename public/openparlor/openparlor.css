@@ -645,6 +645,71 @@ button {
 }
 
 
+/* Recorder controls */
+
+.recorder-controls {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+}
+
+.record-btn,
+.stop-record-btn,
+.cancel-record-btn {
+    border: 1px solid #34363b;
+    background: #202226;
+    color: #9b9fa7;
+    border-radius: 6px;
+    padding: 4px 8px;
+    font-size: 13px;
+    line-height: 1.3;
+    cursor: pointer;
+}
+
+.record-btn:hover:not(:disabled),
+.stop-record-btn:hover:not(:disabled),
+.cancel-record-btn:hover:not(:disabled) {
+    background: #292b30;
+    color: #ececec;
+}
+
+.record-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.stop-record-btn {
+    color: #e06060;
+    border-color: #5a3030;
+}
+
+.stop-record-btn:hover:not(:disabled) {
+    background: #3a2020;
+    color: #f0a0a0;
+}
+
+.recording-indicator {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #e06060;
+    animation: recording-pulse 1.2s ease-in-out infinite;
+}
+
+.recorder-error {
+    font-size: 11px;
+    color: #e06060;
+    margin-top: 4px;
+}
+
+@keyframes recording-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+}
+
+
 /* Smaller screens */
 
 @media (max-width: 900px) {
