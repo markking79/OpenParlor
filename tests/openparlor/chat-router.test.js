@@ -719,3 +719,226 @@ test('chat with non-existent conversation returns 404', async () => {
         tmp.cleanup();
     }
 });
+
+// ─── Memory extraction integration tests ─────────────────────────────────────
+
+test('non-stream chat with conversation_id triggers memory extraction after response', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'Alice', scenario: 'Tower' });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'Test');
+        const mock = mockProvider(() => completion);
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        let extractionParams;
+        let extractionDone;
+        const extractionPromise = new Promise(resolve => { extractionDone = resolve; });
+        const mockExtraction = async (params) => {
+            extractionParams = params;
+            extractionDone();
+            return [];
+        };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+            runMemoryExtraction: mockExtraction,
+        }, user, async baseUrl => {
+            const result = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'I was born in 1990' }],
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+            // Wait for extraction to be called
+            await extractionPromise;
+        });
+
+        assert.ok(extractionParams, 'extraction should have been called');
+        assert.equal(extractionParams.owner_id, 'alice');
+        assert.equal(extractionParams.character.id, char.id);
+        assert.equal(extractionParams.conversation.id, conv.id);
+        assert.equal(extractionParams.source_message_id.length > 0, true);
+        assert.deepEqual(extractionParams.known_by_character_ids, [char.id]);
+        assert.equal(extractionParams.messages.length, 2);
+        assert.equal(extractionParams.messages[0].role, 'user');
+        assert.equal(extractionParams.messages[0].content, 'I was born in 1990');
+        assert.equal(extractionParams.messages[1].role, 'character');
+        assert.equal(extractionParams.messages[1].content, 'hi there');
+        assert.ok(extractionParams.provider, 'provider should be passed');
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('stream chat with conversation_id triggers memory extraction after response', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'Alice' });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'Test');
+        const chunks = [sseDelta('hello '), sseDelta('world'), 'data: [DONE]\n\n'];
+        const mock = mockStreamProvider(chunks);
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        let extractionParams;
+        let extractionDone;
+        const extractionPromise = new Promise(resolve => { extractionDone = resolve; });
+        const mockExtraction = async (params) => {
+            extractionParams = params;
+            extractionDone();
+            return [];
+        };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+            runMemoryExtraction: mockExtraction,
+        }, user, async baseUrl => {
+            const result = await postChatStream(baseUrl, {
+                messages: [{ role: 'user', content: 'hi' }],
+                stream: true,
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+            await extractionPromise;
+        });
+
+        assert.ok(extractionParams, 'extraction should have been called');
+        assert.equal(extractionParams.owner_id, 'alice');
+        assert.equal(extractionParams.character.id, char.id);
+        assert.equal(extractionParams.conversation.id, conv.id);
+        assert.equal(extractionParams.messages[1].content, 'hello world');
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('memory extraction failure does not affect the delivered response', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'Alice' });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'Test');
+        const mock = mockProvider(() => completion);
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        const mockExtraction = async () => {
+            throw new Error('extraction model crashed');
+        };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+            runMemoryExtraction: mockExtraction,
+        }, user, async baseUrl => {
+            const result = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'hello' }],
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+            assert.deepEqual(result.body, { ...completion, conversation_id: conv.id });
+        });
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('memory extraction is NOT triggered without conversation_id', async () => {
+    const mock = mockProvider(() => completion);
+    let extractionCalled = false;
+    const mockExtraction = async () => {
+        extractionCalled = true;
+        return [];
+    };
+
+    await withChatServer({
+        loadConfig: async () => configuredConfig,
+        createProvider: () => mock.provider,
+        runMemoryExtraction: mockExtraction,
+    }, { profile: { handle: 'alice' }, directories }, async baseUrl => {
+        const result = await postChat(baseUrl, { messages: [{ role: 'user', content: 'hello' }] });
+        assert.equal(result.status, 200);
+    });
+    // Give a tick for any async extraction to fire
+    await new Promise(r => setImmediate(r));
+    assert.equal(extractionCalled, false);
+});
+
+test('memory extraction is NOT triggered on provider error', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'Alice' });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'Test');
+        const mock = mockProvider(() => {
+            throw new ModelProviderError('upstream failed', { status: 503 });
+        });
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        let extractionCalled = false;
+        const mockExtraction = async () => {
+            extractionCalled = true;
+            return [];
+        };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+            runMemoryExtraction: mockExtraction,
+        }, user, async baseUrl => {
+            const result = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'hello' }],
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 503);
+        });
+        await new Promise(r => setImmediate(r));
+        assert.equal(extractionCalled, false);
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('memory extraction is NOT triggered on stream error', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'Alice' });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'Test');
+        const chunks = [sseDelta('partial')];
+        const mock = mockStreamProvider(chunks, {
+            error: new ModelProviderError('upstream failed', { status: 503 }),
+        });
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        let extractionCalled = false;
+        const mockExtraction = async () => {
+            extractionCalled = true;
+            return [];
+        };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+            runMemoryExtraction: mockExtraction,
+        }, user, async baseUrl => {
+            const result = await postChatStream(baseUrl, {
+                messages: [{ role: 'user', content: 'hi' }],
+                stream: true,
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+            assert.equal(result.records[1].type, 'error');
+        });
+        await new Promise(r => setImmediate(r));
+        assert.equal(extractionCalled, false);
+    } finally {
+        tmp.cleanup();
+    }
+});

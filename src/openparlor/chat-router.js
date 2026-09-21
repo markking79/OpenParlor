@@ -4,6 +4,7 @@ import { loadOpenParlorConfig } from './config.js';
 import { createModelProvider, ModelProviderError } from './model-provider.js';
 import * as persistence from './persistence.js';
 import { buildPrompt } from './prompt-builder.js';
+import { extractAndPersistMemories } from './memory-extractor.js';
 
 /**
  * @typedef {Object} ChatMessage
@@ -90,6 +91,7 @@ function extractSseDelta(line) {
 export function createOpenParlorChatRouter({
     loadConfig = loadOpenParlorConfig,
     createProvider = createModelProvider,
+    runMemoryExtraction = extractAndPersistMemories,
 } = {}) {
     const router = express.Router();
 
@@ -114,8 +116,10 @@ export function createOpenParlorChatRouter({
         // Validate conversation, build server-side prompt, and persist the user's message
         let participantId = null;
         let modelMessages = safeMessages;
+        let conversation = null;
+        let character = null;
         if (conversationId) {
-            const conversation = persistence.getConversation(user.directories, conversationId);
+            conversation = persistence.getConversation(user.directories, conversationId);
             if (!conversation) {
                 return response.status(404).json({ error: 'Conversation not found' });
             }
@@ -128,7 +132,7 @@ export function createOpenParlorChatRouter({
             }
             participantId = characterParticipant.id;
 
-            const character = persistence.getCharacter(user.directories, characterParticipant.character_id);
+            character = persistence.getCharacter(user.directories, characterParticipant.character_id);
             if (!character) {
                 return response.status(400).json({ error: 'Character not found' });
             }
@@ -148,13 +152,38 @@ export function createOpenParlorChatRouter({
 
             if (!stream) {
                 const completion = await provider.chatCompletion(modelMessages);
+                let assistantMessageId = null;
+                let assistantContent = null;
                 if (conversationId && participantId) {
-                    const assistantContent = typeof completion?.choices?.[0]?.message?.content === 'string'
+                    assistantContent = typeof completion?.choices?.[0]?.message?.content === 'string'
                         ? completion.choices[0].message.content
                         : JSON.stringify(completion);
-                    persistence.appendMessage(user.directories, conversationId, participantId, assistantContent, 'character');
+                    const assistantMsg = persistence.appendMessage(user.directories, conversationId, participantId, assistantContent, 'character');
+                    assistantMessageId = assistantMsg.id;
                 }
-                return response.json(conversationId ? { ...completion, conversation_id: conversationId } : completion);
+                response.json(conversationId ? { ...completion, conversation_id: conversationId } : completion);
+                if (conversationId && participantId && assistantMessageId && character) {
+                    const knownBy = conversation.participants
+                        .map(p => p.character_id)
+                        .filter((id, idx, arr) => arr.indexOf(id) === idx);
+                    const extractionMessages = [
+                        ...safeMessages.filter(m => m.role === 'user').map(m => ({ role: 'user', content: m.content })),
+                        { role: 'character', content: assistantContent },
+                    ];
+                    runMemoryExtraction({
+                        directories: user.directories,
+                        owner_id: handle,
+                        character,
+                        conversation,
+                        messages: extractionMessages,
+                        source_message_id: assistantMessageId,
+                        known_by_character_ids: knownBy,
+                        provider,
+                    }).catch(err => {
+                        console.error('OpenParlor: memory extraction failed', err);
+                    });
+                }
+                return;
             }
 
             response.writeHead(200, {
@@ -166,6 +195,7 @@ export function createOpenParlorChatRouter({
             const decoder = new TextDecoder('utf-8', { stream: true });
             let buffer = '';
             let assistantText = '';
+            let assistantMessageId = null;
             const abortController = new AbortController();
             const abortStream = () => abortController.abort();
             request.once('aborted', abortStream);
@@ -199,7 +229,8 @@ export function createOpenParlorChatRouter({
                 }
                 if (conversationId && participantId && assistantText) {
                     try {
-                        persistence.appendMessage(user.directories, conversationId, participantId, assistantText, 'character');
+                        const assistantMsg = persistence.appendMessage(user.directories, conversationId, participantId, assistantText, 'character');
+                        assistantMessageId = assistantMsg.id;
                     } catch (persistErr) {
                         console.error('OpenParlor: failed to persist assistant message', persistErr);
                     }
@@ -216,6 +247,27 @@ export function createOpenParlorChatRouter({
                 response.off('close', abortStream);
             }
             response.end();
+            if (conversationId && participantId && assistantMessageId && character) {
+                const knownBy = conversation.participants
+                    .map(p => p.character_id)
+                    .filter((id, idx, arr) => arr.indexOf(id) === idx);
+                const extractionMessages = [
+                    ...safeMessages.filter(m => m.role === 'user').map(m => ({ role: 'user', content: m.content })),
+                    { role: 'character', content: assistantText },
+                ];
+                runMemoryExtraction({
+                    directories: user.directories,
+                    owner_id: handle,
+                    character,
+                    conversation,
+                    messages: extractionMessages,
+                    source_message_id: assistantMessageId,
+                    known_by_character_ids: knownBy,
+                    provider,
+                }).catch(err => {
+                    console.error('OpenParlor: memory extraction failed', err);
+                });
+            }
         } catch (error) {
             if (error instanceof ModelProviderError) {
                 const status = typeof error.status === 'number' ? error.status : 503;
