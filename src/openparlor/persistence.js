@@ -56,10 +56,17 @@ import { sync as writeFileAtomicSync } from 'write-file-atomic';
 /**
  * @typedef {object} Memory
  * @property {string} id UUID v4
- * @property {string} character_id FK → Character
+ * @property {string} character_id FK → Character (primary character)
  * @property {string|null} conversation_id FK → Conversation (nullable)
  * @property {string} content
+ * @property {'fact'|'preference'|'event'|'relationship'|'other'} type
  * @property {number} importance 0–1
+ * @property {number} confidence 0–1
+ * @property {boolean} active
+ * @property {string|null} superseded_by FK → Memory (nullable)
+ * @property {string|null} source_conversation_id FK → Conversation (nullable)
+ * @property {string|null} source_message_id FK → Message (nullable)
+ * @property {string[]} known_by_character_ids
  * @property {string} owner_id User handle
  * @property {string} created_at ISO 8601
  * @property {string} updated_at ISO 8601
@@ -83,6 +90,7 @@ import { sync as writeFileAtomicSync } from 'write-file-atomic';
  */
 
 const CURRENT_SCHEMA_VERSION = 1;
+const MEMORY_TYPES = new Set(['fact', 'preference', 'event', 'relationship', 'other']);
 
 /**
  * Returns the OpenParlor data root for a given user.
@@ -513,6 +521,47 @@ function memoryPath(directories, id) {
 }
 
 /**
+ * Normalizes a raw memory record, providing safe defaults for fields that may
+ * be missing in legacy records. Returns null if the record is structurally invalid.
+ * @param {unknown} value
+ * @returns {Memory|null}
+ */
+function normalizeMemory(value) {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+        return null;
+    }
+    const mem = /** @type {Record<string, unknown>} */ (value);
+    if (typeof mem.id !== 'string' || typeof mem.owner_id !== 'string'
+        || typeof mem.created_at !== 'string' || typeof mem.updated_at !== 'string') {
+        return null;
+    }
+    const clamp01 = (v) => {
+        const n = typeof v === 'number' && Number.isFinite(v) ? v : 0.5;
+        return Math.max(0, Math.min(1, n));
+    };
+    return {
+        ...mem,
+        id: mem.id,
+        character_id: typeof mem.character_id === 'string' ? mem.character_id : '',
+        conversation_id: typeof mem.conversation_id === 'string' ? mem.conversation_id : null,
+        content: typeof mem.content === 'string' ? mem.content : '',
+        type: typeof mem.type === 'string' && MEMORY_TYPES.has(mem.type) ? mem.type : 'other',
+        importance: clamp01(mem.importance),
+        confidence: clamp01(mem.confidence),
+        active: typeof mem.active === 'boolean' ? mem.active : true,
+        superseded_by: typeof mem.superseded_by === 'string' ? mem.superseded_by : null,
+        source_conversation_id: typeof mem.source_conversation_id === 'string' ? mem.source_conversation_id : null,
+        source_message_id: typeof mem.source_message_id === 'string' ? mem.source_message_id : null,
+        known_by_character_ids: Array.isArray(mem.known_by_character_ids)
+            ? mem.known_by_character_ids.filter(id => typeof id === 'string')
+            : (typeof mem.character_id === 'string' && mem.character_id ? [mem.character_id] : []),
+        owner_id: mem.owner_id,
+        created_at: mem.created_at,
+        updated_at: mem.updated_at,
+    };
+}
+
+/**
  * @param {import('../users.js').UserDirectoryList} directories
  * @param {string} owner_id
  * @param {Partial<Memory>} data
@@ -521,17 +570,24 @@ function memoryPath(directories, id) {
 export function createMemory(directories, owner_id, data) {
     ensureOpenParlorDirs(directories);
     const now = new Date().toISOString();
-    /** @type {Memory} */
-    const memory = {
+    const memory = normalizeMemory({
         id: crypto.randomUUID(),
         character_id: data.character_id ?? '',
         conversation_id: data.conversation_id ?? null,
         content: data.content ?? '',
+        type: data.type ?? 'other',
         importance: data.importance ?? 0.5,
+        confidence: data.confidence ?? 0.5,
+        active: data.active ?? true,
+        superseded_by: data.superseded_by ?? null,
+        source_conversation_id: data.source_conversation_id ?? null,
+        source_message_id: data.source_message_id ?? null,
+        known_by_character_ids: data.known_by_character_ids ?? [],
         owner_id,
         created_at: now,
         updated_at: now,
-    };
+    });
+    if (!memory) throw new Error('Failed to normalize memory');
     writeFileAtomicSync(memoryPath(directories, memory.id), JSON.stringify(memory, null, 2));
     return memory;
 }
@@ -542,10 +598,13 @@ export function createMemory(directories, owner_id, data) {
  * @returns {Memory|null}
  */
 export function getMemory(directories, id) {
-    return safeReadJSON(memoryPath(directories, id));
+    return normalizeMemory(safeReadJSON(memoryPath(directories, id)));
 }
 
 /**
+ * Lists memories visible to a given character, preserving ownership isolation.
+ * Uses knowledge visibility (known_by_character_ids) rather than a global
+ * shared memory. Returns results in deterministic order (created_at desc, id asc).
  * @param {import('../users.js').UserDirectoryList} directories
  * @param {string} owner_id
  * @param {string} [character_id]
@@ -556,11 +615,17 @@ export function listMemories(directories, owner_id, character_id) {
     if (!fs.existsSync(dir)) return [];
     let memories = fs.readdirSync(dir)
         .filter(f => f.endsWith('.json'))
-        .map(f => safeReadJSON(path.join(dir, f)))
+        .map(f => normalizeMemory(safeReadJSON(path.join(dir, f))))
         .filter(m => m !== null && m.owner_id === owner_id);
     if (character_id) {
-        memories = memories.filter(m => m.character_id === character_id);
+        memories = memories.filter(m => m.known_by_character_ids.includes(character_id));
     }
+    memories.sort((a, b) => {
+        const ta = new Date(a.created_at).getTime();
+        const tb = new Date(b.created_at).getTime();
+        if (tb !== ta) return tb - ta;
+        return a.id.localeCompare(b.id);
+    });
     return memories;
 }
 
@@ -573,7 +638,15 @@ export function listMemories(directories, owner_id, character_id) {
 export function updateMemory(directories, id, updates) {
     const existing = getMemory(directories, id);
     if (!existing) return null;
-    const updated = { ...existing, ...updates, id: existing.id, owner_id: existing.owner_id, created_at: existing.created_at, updated_at: nextUpdatedAt(existing.updated_at) };
+    const updated = normalizeMemory({
+        ...existing,
+        ...updates,
+        id: existing.id,
+        owner_id: existing.owner_id,
+        created_at: existing.created_at,
+        updated_at: nextUpdatedAt(existing.updated_at),
+    });
+    if (!updated) return null;
     writeFileAtomicSync(memoryPath(directories, id), JSON.stringify(updated, null, 2));
     return updated;
 }
