@@ -1,24 +1,32 @@
-# TASK-TTS-001 — Discover exact Kokoro API
+# TASK-TTS-002 — TTS provider abstraction
 
 ## Goal
 
-Record the exact existing local Kokoro interface and its current availability
-so the next provider adapter can target it without guessing or exposing it to
-the browser.
+Implement a server-side text-to-speech provider abstraction and its verified
+Kokoro adapter. The browser remains unable to access or configure Kokoro.
 
 ## Acceptance criteria
 
-- Inspect the installed service, startup method, listening ports, and stable
-  API routes without downloading a replacement audio stack.
-- Record request/response format, voices endpoint, health/model probe, and
-  whether streaming is supported in a secret-free local developer document.
-- If the service is not running, record that clearly rather than guessing or
-  changing system services.
+- Provide `listVoices()`, `synthesize(text, options)`, and `health()` through
+  a factory selected by server-side TTS configuration.
+- Kokoro must use the verified `/v1/audio/voices`, `/v1/audio/speech`, and
+  `/v1/models` interface. Validate safe inputs and return controlled errors.
+- Follow the repository's ESM modules and Node test conventions. The local
+  Kokoro service needs no API key; support an optional server-side key without
+  requiring one or sending an empty authorization header.
+- Treat the verified `http://127.0.0.1:8880/v1` as the configured base URL;
+  normalize trailing slashes and avoid duplicating `/v1`. Add a deterministic
+  test for this and leave no lint errors.
+- Do not expose a provider base URL, API key, or raw upstream error body.
+- Add focused deterministic tests for requests, responses, validation, and
+  failure handling.
 
 ## Exact allowlist
 
-- `.agent/LOCAL_RUNTIME_DISCOVERY.md` (new)
+- `src/openparlor/tts-provider.js` (new)
+- `src/openparlor/providers/tts/kokoro.js` (new)
+- `tests/openparlor/tts-provider.test.js` (new)
 
-Do not start, stop, or reconfigure existing services. Do not edit application
-code, package files, or unrelated `.agent` control files. Do not stage, reset,
-clean, discard, or modify unrelated existing work.
+Do not edit routes, UI, configuration, package files, or other `.agent`
+control files. Do not stage, reset, clean, discard, or modify unrelated
+existing work.

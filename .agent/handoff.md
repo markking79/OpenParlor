@@ -2,6 +2,13 @@
 
 ## Current state
 
+TASK-TTS-002 accepted: server-only TTS factory and Kokoro adapter support
+voice listing, synthesis, and health checks with optional authentication,
+safe errors, and `/v1` URL normalization. Focused tests: 20 passed; real
+local adapter probe found 68 voices, four models, and synthesized WAV audio.
+
+## Current state
+
 TASK-TTS-001 accepted: the existing Kokoro-FastAPI service is running locally
 on port 8880. Its verified OpenAI-compatible base URL, models, voice listing,
 and WAV synthesis request/response format are recorded in
