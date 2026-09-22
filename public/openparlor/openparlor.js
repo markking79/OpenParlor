@@ -601,7 +601,7 @@ export function createRecorderController(deps = {}) {
  * @param {{ fetchFn?: typeof fetch, getCsrfToken?: () => Promise<string>, onStateChange?: (state: string) => void }} [deps]
  */
 export function createTranscriptionController(deps = {}) {
-    const { fetchFn = fetch, getCsrfToken, onStateChange = null } = deps;
+    const { fetchFn = fetch, getCsrfToken, onStateChange = null, maxSizeBytes = 5 * 1024 * 1024 } = deps;
     let state = 'idle';
     let error = '';
 
@@ -612,6 +612,11 @@ export function createTranscriptionController(deps = {}) {
 
     async function transcribe(blob) {
         if (!(blob instanceof Blob) || blob.size === 0 || state === 'busy') return null;
+        if (blob.size > maxSizeBytes) {
+            error = 'Recording too large. Please try again.';
+            setState('error');
+            return null;
+        }
         error = '';
         setState('busy');
         try {

@@ -1384,6 +1384,42 @@ describe('createTranscriptionController', () => {
         const p2 = await controller.transcribe(blob);
         assert.equal(p2, null);
     });
+
+    it('should reject blobs exceeding maxSizeBytes without calling fetch', async () => {
+        let fetchCalled = false;
+        const largeBlob = new Blob(['a'.repeat(1024)]);
+        const controller = createTranscriptionController({
+            fetchFn: async () => {
+                fetchCalled = true;
+                return { ok: true, json: async () => ({ text: 'x' }) };
+            },
+            maxSizeBytes: 512,
+        });
+        const result = await controller.transcribe(largeBlob);
+        assert.equal(result, null);
+        assert.equal(fetchCalled, false);
+        assert.equal(controller.state, 'error');
+        assert.ok(controller.error.includes('too large'));
+    });
+
+    it('should accept blobs at exactly maxSizeBytes', async () => {
+        const exactBlob = new Blob(['a'.repeat(512)]);
+        const controller = createTranscriptionController({
+            fetchFn: async () => ({ ok: true, json: async () => ({ text: 'ok' }) }),
+            maxSizeBytes: 512,
+        });
+        const result = await controller.transcribe(exactBlob);
+        assert.equal(result, 'ok');
+    });
+
+    it('should use 5MB default max size', async () => {
+        const justUnder = new Blob(['a'.repeat(5 * 1024 * 1024)]);
+        const controller = createTranscriptionController({
+            fetchFn: async () => ({ ok: true, json: async () => ({ text: 'ok' }) }),
+        });
+        const result = await controller.transcribe(justUnder);
+        assert.equal(result, 'ok');
+    });
 });
 
 describe('createPlaybackController', () => {
