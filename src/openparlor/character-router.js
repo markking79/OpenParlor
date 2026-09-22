@@ -14,6 +14,8 @@ const CHARACTER_FIELDS = new Set([
     'example_dialogue',
     'tags',
     'tts_voice',
+    'temperature',
+    'max_tokens',
 ]);
 const MAX_TEXT_LENGTH = 20_000;
 
@@ -63,6 +65,20 @@ function validateCharacterBody(body, isCreate) {
                 return { error: '"tags" must be an array of up to 50 non-empty strings' };
             }
             value.tags = field.map(tag => tag.trim());
+            continue;
+        }
+        if (key === 'temperature') {
+            if (typeof field !== 'number' || !Number.isFinite(field) || field < 0 || field > 2) {
+                return { error: '"temperature" must be a number between 0 and 2' };
+            }
+            value.temperature = field;
+            continue;
+        }
+        if (key === 'max_tokens') {
+            if (typeof field !== 'number' || !Number.isInteger(field) || field < 1 || field > 8192) {
+                return { error: '"max_tokens" must be a positive integer up to 8192' };
+            }
+            value.max_tokens = field;
             continue;
         }
         if (typeof field !== 'string' || field.length > MAX_TEXT_LENGTH) {

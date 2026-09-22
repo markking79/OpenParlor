@@ -26,6 +26,8 @@ function createMockPersistence() {
                 ...(typeof data.avatar_url === 'string' ? { avatar_url: data.avatar_url } : {}),
                 tts_provider: data.tts_provider ?? '',
                 tts_voice: data.tts_voice ?? '',
+                ...(typeof data.temperature === 'number' ? { temperature: data.temperature } : {}),
+                ...(typeof data.max_tokens === 'number' ? { max_tokens: data.max_tokens } : {}),
                 owner_id,
                 created_at: now,
                 updated_at: now,
@@ -477,6 +479,177 @@ describe('OpenParlor Character Router', () => {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ name: 'X', tts_voice: 42 }),
+            });
+            assert.equal(res.status, 400);
+        });
+
+        it('accepts valid temperature', async () => {
+            const res = await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'X', temperature: 0.7 }),
+            });
+            assert.equal(res.status, 201);
+            const body = await res.json();
+            assert.equal(body.temperature, 0.7);
+        });
+
+        it('accepts boundary temperature values 0 and 2', async () => {
+            const res0 = await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'X', temperature: 0 }),
+            });
+            assert.equal(res0.status, 201);
+            const res2 = await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'Y', temperature: 2 }),
+            });
+            assert.equal(res2.status, 201);
+        });
+
+        it('rejects temperature below 0', async () => {
+            const res = await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'X', temperature: -0.1 }),
+            });
+            assert.equal(res.status, 400);
+            const body = await res.json();
+            assert.match(body.error, /temperature/);
+        });
+
+        it('rejects temperature above 2', async () => {
+            const res = await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'X', temperature: 2.5 }),
+            });
+            assert.equal(res.status, 400);
+            const body = await res.json();
+            assert.match(body.error, /temperature/);
+        });
+
+        it('rejects temperature that is not a number', async () => {
+            const res = await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'X', temperature: 'hot' }),
+            });
+            assert.equal(res.status, 400);
+        });
+
+        it('accepts valid max_tokens', async () => {
+            const res = await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'X', max_tokens: 2048 }),
+            });
+            assert.equal(res.status, 201);
+            const body = await res.json();
+            assert.equal(body.max_tokens, 2048);
+        });
+
+        it('accepts boundary max_tokens values 1 and 8192', async () => {
+            const res1 = await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'X', max_tokens: 1 }),
+            });
+            assert.equal(res1.status, 201);
+            const resMax = await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'Y', max_tokens: 8192 }),
+            });
+            assert.equal(resMax.status, 201);
+        });
+
+        it('rejects max_tokens of 0', async () => {
+            const res = await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'X', max_tokens: 0 }),
+            });
+            assert.equal(res.status, 400);
+            const body = await res.json();
+            assert.match(body.error, /max_tokens/);
+        });
+
+        it('rejects max_tokens above 8192', async () => {
+            const res = await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'X', max_tokens: 99999 }),
+            });
+            assert.equal(res.status, 400);
+            const body = await res.json();
+            assert.match(body.error, /max_tokens/);
+        });
+
+        it('rejects max_tokens that is not an integer', async () => {
+            const res = await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'X', max_tokens: 1.5 }),
+            });
+            assert.equal(res.status, 400);
+        });
+
+        it('rejects max_tokens that is not a number', async () => {
+            const res = await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'X', max_tokens: 'long' }),
+            });
+            assert.equal(res.status, 400);
+        });
+
+        it('updates temperature and max_tokens on existing character', async () => {
+            const created = await (await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'X' }),
+            })).json();
+
+            const res = await fetch(`${baseUrl}/api/openparlor/characters/${created.id}`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ temperature: 1.2, max_tokens: 1024 }),
+            });
+            assert.equal(res.status, 200);
+            const body = await res.json();
+            assert.equal(body.temperature, 1.2);
+            assert.equal(body.max_tokens, 1024);
+        });
+
+        it('rejects invalid temperature on update', async () => {
+            const created = await (await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'X' }),
+            })).json();
+
+            const res = await fetch(`${baseUrl}/api/openparlor/characters/${created.id}`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ temperature: 99 }),
+            });
+            assert.equal(res.status, 400);
+        });
+
+        it('rejects invalid max_tokens on update', async () => {
+            const created = await (await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'X' }),
+            })).json();
+
+            const res = await fetch(`${baseUrl}/api/openparlor/characters/${created.id}`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ max_tokens: -5 }),
             });
             assert.equal(res.status, 400);
         });

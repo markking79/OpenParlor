@@ -86,8 +86,26 @@ function extractSseDelta(line) {
 }
 
 /**
+ * Extracts server-stored generation options from a character record.
+ * Only returns an object when at least one valid option is present.
+ * @param {object|null} character
+ * @returns {{ temperature?: number, max_tokens?: number } | undefined}
+ */
+function getGenerationOptions(character) {
+    if (!character) return undefined;
+    const options = {};
+    if (typeof character.temperature === 'number' && Number.isFinite(character.temperature)) {
+        options.temperature = character.temperature;
+    }
+    if (typeof character.max_tokens === 'number' && Number.isFinite(character.max_tokens)) {
+        options.max_tokens = character.max_tokens;
+    }
+    return Object.keys(options).length > 0 ? options : undefined;
+}
+
+/**
  * Creates the OpenParlor chat router.
- * @param {{ loadConfig?: (directories: object) => Promise<object>, createProvider?: (modelConfig: object) => { chatCompletion: (messages: ChatMessage[]) => Promise<unknown> } }} [dependencies] Injectable dependencies for tests; the production defaults use the OpenParlor configuration loader and model provider factory
+ * @param {{ loadConfig?: (directories: object) => Promise<object>, createProvider?: (modelConfig: object) => { chatCompletion: (messages: ChatMessage[], options?: object) => Promise<unknown>, streamChatCompletion?: (messages: ChatMessage[], options?: object) => AsyncIterable<Uint8Array> } }} [dependencies] Injectable dependencies for tests; the production defaults use the OpenParlor configuration loader and model provider factory
  * @returns {import('express').Router} The chat router
  */
 export function createOpenParlorChatRouter({
@@ -168,7 +186,8 @@ export function createOpenParlorChatRouter({
 
                 if (speakerContexts.length === 1) {
                     const { participant, character, prompt } = speakerContexts[0];
-                    const completion = await provider.chatCompletion(prompt);
+                    const genOptions = getGenerationOptions(character);
+                    const completion = await provider.chatCompletion(prompt, genOptions);
                     const assistantContent = typeof completion?.choices?.[0]?.message?.content === 'string'
                         ? completion.choices[0].message.content
                         : JSON.stringify(completion);
@@ -200,7 +219,8 @@ export function createOpenParlorChatRouter({
                 const responses = [];
                 for (const { participant, character, prompt } of speakerContexts) {
                     try {
-                        const completion = await provider.chatCompletion(prompt);
+                        const genOptions = getGenerationOptions(character);
+                        const completion = await provider.chatCompletion(prompt, genOptions);
                         const content = typeof completion?.choices?.[0]?.message?.content === 'string'
                             ? completion.choices[0].message.content
                             : JSON.stringify(completion);
@@ -269,7 +289,9 @@ export function createOpenParlorChatRouter({
                     let speakerMessageId = null;
 
                     try {
-                        const result = await provider.streamChatCompletion(prompt, { signal: abortController.signal });
+                        const genOptions = getGenerationOptions(character);
+                        const streamOpts = { signal: abortController.signal, ...(genOptions || {}) };
+                        const result = await provider.streamChatCompletion(prompt, streamOpts);
                         for await (const chunk of result) {
                             buffer += decoder.decode(chunk, { stream: true });
                             const lines = buffer.split('\n');

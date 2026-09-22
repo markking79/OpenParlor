@@ -424,6 +424,7 @@ test('requires an authenticated user with directories', async () => {
             loadConfig: async () => configuredConfig,
             createProvider: () => mock.provider,
             runMemoryExtraction: async () => [],
+            runMemoryExtraction: async () => [],
         }, user, async baseUrl => {
             const result = await postChat(baseUrl, { messages: [{ role: 'user', content: 'hello' }] });
             assert.equal(result.status, 401);
@@ -463,6 +464,7 @@ test('builds server-side prompt with character data when conversation_id is prov
         await withChatServer({
             loadConfig: async () => configuredConfig,
             createProvider: () => mock.provider,
+            runMemoryExtraction: async () => [],
         }, user, async baseUrl => {
             const result = await postChat(baseUrl, {
                 messages: [{ role: 'user', content: 'Hello wizard' }],
@@ -1179,6 +1181,272 @@ test('memory shared between Emma and Rachel is injected in their fresh conversat
         const sarahPrompt = mock.calls[2][0].content;
         assert.ok(!sarahPrompt.includes('phoenix'), 'Sarah must NOT see the shared memory');
         assert.ok(!sarahPrompt.includes('codename'), 'Sarah must NOT see the shared memory content');
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+// ─── Per-character generation style tests ────────────────────────────────────
+
+test('passes server-stored temperature and max_tokens to the provider for a character', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'Styled', temperature: 0.3, max_tokens: 512 });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'Test');
+        const mock = mockProvider(() => completion);
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+            runMemoryExtraction: async () => [],
+        }, user, async baseUrl => {
+            const result = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'hello' }],
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+        });
+
+        // The provider should have received generation options
+        assert.equal(mock.calls.length, 1);
+        // mock.calls[0] is the messages array; we need to check options were passed
+        // Since mockProvider only captures messages, we verify via a custom provider
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('passes generation options as second argument to chatCompletion', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'Styled', temperature: 0.5, max_tokens: 1024 });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'Test');
+
+        let receivedOptions;
+        const mock = {
+            calls: [],
+            provider: {
+                chatCompletion: async (messages, options) => {
+                    mock.calls.push({ messages, options });
+                    receivedOptions = options;
+                    return completion;
+                },
+            },
+        };
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+            runMemoryExtraction: async () => [],
+        }, user, async baseUrl => {
+            const result = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'hello' }],
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+        });
+
+        assert.deepEqual(receivedOptions, { temperature: 0.5, max_tokens: 1024 });
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('does not pass generation options when character has none set', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'Plain' });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'Test');
+
+        let receivedOptions;
+        const mock = {
+            calls: [],
+            provider: {
+                chatCompletion: async (messages, options) => {
+                    mock.calls.push({ messages, options });
+                    receivedOptions = options;
+                    return completion;
+                },
+            },
+        };
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+        }, user, async baseUrl => {
+            const result = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'hello' }],
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+        });
+
+        assert.equal(receivedOptions, undefined);
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('does not pass generation options in standalone mode (no conversation)', async () => {
+    let receivedOptions;
+    const mock = {
+        calls: [],
+        provider: {
+            chatCompletion: async (messages, options) => {
+                mock.calls.push({ messages, options });
+                receivedOptions = options;
+                return completion;
+            },
+        },
+    };
+    await withChatServer({
+        loadConfig: async () => configuredConfig,
+        createProvider: () => mock.provider,
+    }, { profile: { handle: 'alice' }, directories }, async baseUrl => {
+        const result = await postChat(baseUrl, { messages: [{ role: 'user', content: 'hello' }] });
+        assert.equal(result.status, 200);
+    });
+    assert.equal(receivedOptions, undefined);
+});
+
+test('ignores client-supplied temperature and max_tokens in chat request body', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'Styled', temperature: 0.3, max_tokens: 512 });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'Test');
+
+        let receivedOptions;
+        const mock = {
+            calls: [],
+            provider: {
+                chatCompletion: async (messages, options) => {
+                    mock.calls.push({ messages, options });
+                    receivedOptions = options;
+                    return completion;
+                },
+            },
+        };
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+            runMemoryExtraction: async () => [],
+        }, user, async baseUrl => {
+            const result = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'hello' }],
+                conversation_id: conv.id,
+                temperature: 1.9,
+                max_tokens: 99999,
+            });
+            assert.equal(result.status, 200);
+        });
+
+        // Server-stored values win, not client-supplied
+        assert.deepEqual(receivedOptions, { temperature: 0.3, max_tokens: 512 });
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('cross-character isolation: each speaker gets its own generation options', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const emma = persistence.createCharacter(dirs, 'alice', { name: 'Emma', system_prompt: 'You are Emma.', temperature: 0.2, max_tokens: 256 });
+        const rachel = persistence.createCharacter(dirs, 'alice', { name: 'Rachel', system_prompt: 'You are Rachel.', temperature: 1.8, max_tokens: 4096 });
+        const conv = persistence.createConversation(dirs, 'alice', emma.id, 'Group');
+        findAndModifyConversation(dirs, conv.id, data => {
+            data.participants.push({ id: 'part-rachel', character_id: rachel.id, role: 'character' });
+        });
+
+        const optionsByCall = [];
+        const mock = {
+            calls: [],
+            provider: {
+                chatCompletion: async (messages, options) => {
+                    mock.calls.push({ messages, options });
+                    optionsByCall.push(options);
+                    return completion;
+                },
+            },
+        };
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+            runMemoryExtraction: async () => [],
+        }, user, async baseUrl => {
+            const result = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'Emma and Rachel, hello' }],
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+        });
+
+        assert.equal(mock.calls.length, 2);
+        assert.deepEqual(optionsByCall[0], { temperature: 0.2, max_tokens: 256 });
+        assert.deepEqual(optionsByCall[1], { temperature: 1.8, max_tokens: 4096 });
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('passes generation options in stream mode', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'Styled', temperature: 0.9, max_tokens: 128 });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'Test');
+        const chunks = [sseDelta('hi'), 'data: [DONE]\n\n'];
+
+        let receivedStreamOptions;
+        const mock = {
+            calls: [],
+            provider: {
+                chatCompletion: async () => { throw new Error('not expected'); },
+                streamChatCompletion: async (messages, options) => {
+                    mock.calls.push({ messages, options });
+                    receivedStreamOptions = options;
+                    return (async function* () {
+                        for (const chunk of chunks) {
+                            yield new TextEncoder().encode(chunk);
+                        }
+                    })();
+                },
+            },
+        };
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+        }, user, async baseUrl => {
+            const result = await postChatStream(baseUrl, {
+                messages: [{ role: 'user', content: 'hi' }],
+                stream: true,
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+        });
+
+        assert.equal(receivedStreamOptions.temperature, 0.9);
+        assert.equal(receivedStreamOptions.max_tokens, 128);
+        assert.ok(receivedStreamOptions.signal instanceof AbortSignal);
     } finally {
         tmp.cleanup();
     }

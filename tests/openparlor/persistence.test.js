@@ -330,6 +330,66 @@ describe('OpenParlor persistence', () => {
         });
     });
 
+    // ─── Character generation style fields ─────────────────────────────────
+
+    describe('character generation style fields', () => {
+        it('stores and retrieves temperature and max_tokens', () => {
+            const created = createCharacter(dirs, 'alice', {
+                name: 'Styled',
+                temperature: 0.7,
+                max_tokens: 2048,
+            });
+            assert.equal(created.temperature, 0.7);
+            assert.equal(created.max_tokens, 2048);
+
+            const fetched = getCharacter(dirs, created.id);
+            assert.equal(fetched.temperature, 0.7);
+            assert.equal(fetched.max_tokens, 2048);
+        });
+
+        it('omits generation style fields when not provided', () => {
+            const created = createCharacter(dirs, 'alice', { name: 'Plain' });
+            assert.equal('temperature' in created, false);
+            assert.equal('max_tokens' in created, false);
+
+            const fetched = getCharacter(dirs, created.id);
+            assert.equal('temperature' in fetched, false);
+            assert.equal('max_tokens' in fetched, false);
+        });
+
+        it('updates temperature and max_tokens on existing character', () => {
+            const created = createCharacter(dirs, 'alice', { name: 'C' });
+            const updated = updateCharacter(dirs, created.id, { temperature: 1.5, max_tokens: 4096 });
+            assert.equal(updated.temperature, 1.5);
+            assert.equal(updated.max_tokens, 4096);
+
+            const fetched = getCharacter(dirs, created.id);
+            assert.equal(fetched.temperature, 1.5);
+            assert.equal(fetched.max_tokens, 4096);
+        });
+
+        it('normalizes legacy character without generation fields', () => {
+            const legacyId = 'legacy-gen-style';
+            const legacy = {
+                id: legacyId,
+                name: 'Legacy',
+                description: '',
+                personality: '',
+                scenario: '',
+                first_message: '',
+                owner_id: 'alice',
+                created_at: '2026-01-01T00:00:00.000Z',
+                updated_at: '2026-01-01T00:00:00.000Z',
+            };
+            const characterPath = path.join(getOpenParlorRoot(dirs), 'characters', `${legacyId}.json`);
+            fs.writeFileSync(characterPath, JSON.stringify(legacy));
+
+            const loaded = getCharacter(dirs, legacyId);
+            assert.equal('temperature' in loaded, false);
+            assert.equal('max_tokens' in loaded, false);
+        });
+    });
+
     // ─── Memory schema defaults ────────────────────────────────────────────
 
     describe('memory schema defaults', () => {

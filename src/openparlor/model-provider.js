@@ -8,6 +8,12 @@ export class ModelProviderError extends Error {
     }
 }
 
+/**
+ * Creates a model provider from the given configuration.
+ * @param {object} modelConfig Server-stored model configuration
+ * @param {object} [options] Additional provider options
+ * @returns {{ chatCompletion: (messages: object[], options?: object) => Promise<unknown>, streamChatCompletion?: (messages: object[], options?: object) => AsyncIterable<Uint8Array> }}
+ */
 export function createModelProvider(modelConfig, options = {}) {
     if (!modelConfig || typeof modelConfig.provider !== 'string' || !modelConfig.provider) {
         throw new ModelProviderError('Model provider is not configured');
