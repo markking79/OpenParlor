@@ -1,11 +1,11 @@
 # Browser Test Infrastructure Follow-up
 
 TASK-SUPERVISOR-BROWSER-001: enable the existing TASK-004 Playwright acceptance
-spec on the local Ubuntu 26.04 development host. Playwright 1.56 installs its
-Node package successfully, but its bundled Chromium installer currently reports
-that Ubuntu 26.04 x64 is unsupported. Keep the lightweight spec and production
-authentication/CSRF unchanged. Supply a compatible headless Chromium (or
-upgrade Playwright after compatibility review), then run with:
+spec on the local Ubuntu 26.04 development host. Playwright 1.63 supports this
+host and its Chromium binary is installed in Playwright's normal shared cache.
+The supervisor checks `playwright install --list`, rather than assuming a
+repository-local cache location. Keep the lightweight spec and production
+authentication/CSRF unchanged. To run the authenticated acceptance test:
 
 ```bash
 OPENPARLOR_BROWSER_ACCEPTANCE=1 \

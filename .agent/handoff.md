@@ -2,6 +2,120 @@
 
 ## Current state
 
+TASK-MEM-002 accepted and pushed (`02e5c5cd2`): completed character turns now
+launch server-side, non-blocking durable-memory extraction after the response
+has finished. Candidates require bounded JSON, reject trivial dialogue and
+instructions, deduplicate against active memories visible to the character,
+and retain conversation/message provenance plus only the characters present.
+Extraction errors are contained and never change the delivered chat result.
+Focused validation: 52 Node tests passed; changed-source lint passed; test lint
+has only inherited warning-level Playwright rules. Local llama.cpp health probe
+passed. No browser or provider-configuration surface was added.
+
+## Current state
+
+TASK-MEM-001 accepted and pushed (`66e0106cd`): the persistence boundary now
+stores character-centric memories with type, bounded importance/confidence,
+active/supersession state, provenance, and character knowledge visibility.
+Legacy records normalize without a migration write and remain visible to their
+original character; list operations are owner-isolated and deterministic.
+Focused persistence tests: 35 passed; changed source/test lint and diff check
+passed. No browser or provider surface was added.
+
+## Current state
+
+TASK-AUDIO-002 accepted and pushed (`64be0cea9`): development-only local
+voice-turn timing now measures recording end→STT completion, send→first model
+token, first model token→completed stream, completed stream→TTS audio ready,
+and the full recorded turn when those boundaries exist. Console diagnostics
+contain duration labels only—never transcript, generated text, voice, endpoint,
+configuration, or credentials—and incomplete/cancelled/error/chat-switch paths
+clear timing safely. Focused UI helpers: 145 passed; changed-source lint passed;
+test lint contains only inherited warning-level Playwright rules. Local llama.cpp
+and Kokoro health probes passed. Authenticated browser acceptance remains
+deferred because `ST_AUTH_STORAGE_STATE` is not configured.
+
+## Current state
+
+TASK-AUDIO-001 accepted and pushed (`9699a581a`): the conversation header now
+has an accessible per-conversation Voice control, off by default and stored
+locally by conversation ID. Voice mode sends a successful transcript through
+the existing CSRF-protected chat flow once and uses the existing completion-only
+server-proxied playback only when the character has an assigned voice. Disabled
+mode keeps the existing transcript-for-review behavior; existing playback
+guards handle failed streams and conversation changes. Focused UI helpers: 132
+passed; changed-source lint passed; test lint contains only inherited
+warning-level Playwright rules. Authenticated browser acceptance remains
+deferred because `ST_AUTH_STORAGE_STATE` is not configured.
+
+## Current state
+
+TASK-STT-005 accepted without a production change: a real local WAV passed
+through the authenticated OpenParlor STT router using only the default user's
+server-side config, produced “OpenParler Transcription Verification,” and that
+text then reached local llama.cpp through the authenticated chat router. The
+completed NDJSON stream contained 1,259 generated characters and a `done`
+record. UI helper coverage confirms successful transcription returns text for
+the composer and does not itself call the send flow. Focused regression: 173
+Node tests passed; changed-source lint passed; test lint had only the inherited
+warning-level Playwright rules. Browser verification remains deferred because
+`ST_AUTH_STORAGE_STATE` is not configured. No implementation file changed, so
+there is intentionally no task commit.
+
+## Current state
+
+TASK-STT-004 accepted: authenticated OpenParlor multipart transcription now
+accepts one bounded recorded-audio upload under global CSRF protection, derives
+the faster-whisper adapter configuration only from the authenticated user's
+server-side config, and returns only safe transcript text/language or safe
+errors. The composer now transcribes a stopped Blob through OpenParlor, shows
+busy/safe failure state, inserts successful text for review without sending,
+and always releases the retained recording. Focused validation: 123 Node
+tests, 9 config tests, task JS lint with zero errors, and real local provider
+health all passed. Authenticated browser acceptance is deferred because
+`ST_AUTH_STORAGE_STATE` is not configured; Playwright Chromium is installed.
+
+## Current state
+
+TASK-STT-003 accepted: the browser composer now has local-only MediaRecorder
+controls with MIME negotiation, record/stop/cancel state, permission and
+unavailable feedback, bounded in-memory chunks, duration/size cutoffs, and
+track cleanup. It deliberately retains a ready Blob only; it does not upload,
+transcribe, auto-send, or expose provider configuration. Focused helpers: 117
+passed in 213 ms; changed-source lint passed; test lint has only inherited
+warning-level Playwright rules. Authenticated browser acceptance is deferred:
+no `ST_AUTH_STORAGE_STATE` is configured locally.
+
+## Current state
+
+TASK-STT-002 accepted and pushed (`41b36ef86`): a server-only local
+`faster-whisper` provider now invokes the installed managed Python engine with
+argument-array spawning, a bounded stdin JSON protocol, offline-only cached
+model loading, input/time limits, and safe error mapping. Focused tests: 26
+passed; changed-source lint passed; test lint has only inherited
+`playwright/expect-expect` warnings. A real Node adapter health check and WAV
+transcription through cached `large-v3-turbo` succeeded.
+
+## Current state
+
+TASK-TTS-006 accepted and pushed (`9801a5319`): authenticated server-side
+speech cleanup now strips complete model reasoning blocks, fenced code, image
+URLs, and inline-code markers only immediately before synthesis. Browser
+message content is unchanged; cleanup-only input returns a safe 400 without
+calling the provider. Focused tests: 71 passed; changed-file lint passed.
+
+## Current state
+
+TASK-TTS-005 accepted and pushed (`568cf5949`): OpenParlor now has a
+per-conversation, reload-safe Auto-speak control. Only successful, completed
+new assistant replies are synthesized with the assigned character voice.
+Explicit Stop, disabling Auto-speak, and selecting a conversation stop or
+supersede playback; concurrent synthesis cannot race into overlapping audio.
+Focused UI helpers: 93 passed; changed-source lint passed; test lint emits
+only inherited warning-level Playwright rules.
+
+## Current state
+
 TASK-TTS-004 accepted: OpenParlor now proxies authenticated server-side audio
 synthesis and renders accessible assistant-message play, stop, and replay
 controls. Browser playback uses a Blob URL and enforces one active audio item,

@@ -4,6 +4,12 @@
 
 Codex owns task selection/cards, architecture, semantic review, acceptance, commits, and pushes. Qwen/Aider is one local implementation worker at a time. Every implementation or repair is a fresh, bounded Aider session; it may never commit or push.
 
+Codex must supervise each worker in the foreground: after launch it waits for
+the tracked PID/PGID to exit, collects the result, reviews the diff, and runs
+validation before any task/status response or outer-loop handoff. It must never
+leave a worker running and describe it as continued background work. A worker
+exit triggers immediate review and the next task action, not a workflow stop.
+
 On a verification failure Codex diagnoses the result and launches a focused fresh correction pass, up to three by default. Aider summarization/session failure alone is not a task failure: preserve its edits and let verification decide. Never reset, clean, discard, or overwrite task work automatically. Stop only for an unsafe repository state, a genuine human credential/decision blocker, or exhausted bounded corrections.
 
 Validation includes `git diff --check`, changed OpenParlor JavaScript lint, focused tests, secret/config leakage review, a local authenticated runtime probe when the server is available, and a task-scoped Playwright browser check when infrastructure/spec exists. Developer-local OpenParlor config under `data/` may be created for runtime testing but is never staged or committed. Do not weaken authentication or CSRF for tests.

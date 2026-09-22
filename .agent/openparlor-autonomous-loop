@@ -25,6 +25,10 @@ while true; do
         echo 'OpenParlor autonomous workflow: plan complete'
         exit 0
     fi
+    if grep -q '"state": "paused"' "$STATUS_FILE" 2>/dev/null; then
+        echo 'OpenParlor autonomous workflow: paused; resume with --auto'
+        exit 0
+    fi
     if grep -q '"state": "blocked"' "$STATUS_FILE" 2>/dev/null; then
         echo 'OpenParlor autonomous workflow: blocked; see status file' >&2
         exit 3

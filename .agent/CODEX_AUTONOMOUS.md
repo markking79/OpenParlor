@@ -24,6 +24,21 @@ Never use a final response to announce a task boundary. Continue work in the
 same pass when possible; otherwise leave `state: "running"` for the outer
 loop. Do not set `blocked` for ordinary test, lint, worker, or runtime issues.
 
+## Foreground worker supervision
+
+Never end a Codex pass while a launcher-owned Qwen/Aider worker is running.
+After starting a worker, remain in the same pass, monitor its tracked PID and
+PGID, collect its exit result, inspect the resulting diff, and either validate
+and accept it or start the bounded correction path. A worker launch is progress
+only, never a result that may be reported to the user as ongoing background
+work. If a worker unexpectedly exits, immediately continue with review and
+validation; do not claim that implementation is still running.
+
+Before any response or pass handoff, verify the tracked worker has exited and
+that the current task has a concrete next action. The only permitted outcomes
+are continued foreground work, an outer-loop continuation with no worker
+running, `plan_complete`, or a genuine human-only `blocked` state.
+
 ## Authority and roles
 
 - You select the next dependency-safe task, create its precise task card and
