@@ -27,6 +27,7 @@ import {
     createNdjsonParser,
     normalizeCharacter,
     sanitizeCharacterInput,
+    resolveBrowserUrl,
 } from '../../public/openparlor/openparlor.js';
 
 describe('normalizeMemory', () => {
@@ -2032,6 +2033,86 @@ describe('server-side provider ownership', () => {
         const result = normalizeDeferredPrerequisite(raw);
         assert.equal(result.deferred, false);
         assert.equal(result.label, '');
+    });
+});
+
+describe('resolveBrowserUrl', () => {
+    it('should resolve a localhost URL as local with guidance', () => {
+        const result = resolveBrowserUrl({ origin: 'http://localhost:3000' });
+        assert.equal(result.url, 'http://localhost:3000/openparlor');
+        assert.equal(result.isLocal, true);
+        assert.equal(result.guidance, 'Open http://localhost:3000/openparlor in your browser');
+    });
+
+    it('should resolve a 127.0.0.1 URL as local', () => {
+        const result = resolveBrowserUrl({ origin: 'http://127.0.0.1:8080' });
+        assert.equal(result.url, 'http://127.0.0.1:8080/openparlor');
+        assert.equal(result.isLocal, true);
+        assert.equal(result.guidance, 'Open http://127.0.0.1:8080/openparlor in your browser');
+    });
+
+    it('should resolve a remote URL as non-local with connect guidance', () => {
+        const result = resolveBrowserUrl({ origin: 'https://parlor.example.com' });
+        assert.equal(result.url, 'https://parlor.example.com/openparlor');
+        assert.equal(result.isLocal, false);
+        assert.equal(result.guidance, 'Connect to https://parlor.example.com/openparlor');
+    });
+
+    it('should strip embedded credentials from the origin', () => {
+        const result = resolveBrowserUrl({ origin: 'http://user:pass@localhost:3000' });
+        assert.equal(result.url, 'http://localhost:3000/openparlor');
+        assert.ok(!result.url.includes('user'));
+        assert.ok(!result.url.includes('pass'));
+    });
+
+    it('should not leak credentials in guidance', () => {
+        const result = resolveBrowserUrl({ origin: 'http://admin:secret@localhost:3000' });
+        assert.ok(!result.guidance.includes('admin'));
+        assert.ok(!result.guidance.includes('secret'));
+    });
+
+    it('should return empty URL and fallback guidance for missing origin', () => {
+        const result = resolveBrowserUrl();
+        assert.equal(result.url, '');
+        assert.equal(result.isLocal, false);
+        assert.equal(result.guidance, 'No origin configured');
+    });
+
+    it('should return empty URL for non-string origin', () => {
+        const result = resolveBrowserUrl({ origin: 42 });
+        assert.equal(result.url, '');
+        assert.equal(result.isLocal, false);
+        assert.equal(result.guidance, 'No origin configured');
+    });
+
+    it('should use custom pathname when provided', () => {
+        const result = resolveBrowserUrl({ origin: 'http://localhost:3000', pathname: '/custom' });
+        assert.equal(result.url, 'http://localhost:3000/custom');
+    });
+
+    it('should handle origin with trailing slash', () => {
+        const result = resolveBrowserUrl({ origin: 'http://localhost:3000/' });
+        assert.equal(result.url, 'http://localhost:3000/openparlor');
+        assert.equal(result.isLocal, true);
+    });
+
+    it('should not include filesystem paths in the resolved URL', () => {
+        const result = resolveBrowserUrl({ origin: 'http://localhost:3000', pathname: '/openparlor' });
+        assert.ok(!result.url.includes('/home/'));
+        assert.ok(!result.url.includes('/var/'));
+        assert.ok(!result.url.includes('/etc/'));
+    });
+
+    it('should not treat non-http schemes as local', () => {
+        const result = resolveBrowserUrl({ origin: 'ftp://localhost:21' });
+        assert.equal(result.isLocal, false);
+    });
+
+    it('should handle empty string origin', () => {
+        const result = resolveBrowserUrl({ origin: '' });
+        assert.equal(result.url, '');
+        assert.equal(result.isLocal, false);
+        assert.equal(result.guidance, 'No origin configured');
     });
 });
 

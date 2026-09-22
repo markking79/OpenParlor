@@ -368,6 +368,36 @@ export function normalizeAudioReadiness(healthStatus) {
 }
 
 /**
+ * Resolves the local OpenParlor browser URL and connection guidance
+ * for the developer runtime. Returns a safe, explicit URL string
+ * suitable for display or harness navigation. Strips any embedded
+ * credentials and never includes internal filesystem paths.
+ * @param {{ origin?: string, pathname?: string }} [params]
+ * @returns {{ url: string, isLocal: boolean, guidance: string }}
+ */
+export function resolveBrowserUrl(params = {}) {
+    const origin = typeof params.origin === 'string' && params.origin ? params.origin : '';
+    const pathname = typeof params.pathname === 'string' && params.pathname ? params.pathname : '/openparlor';
+
+    if (!origin) {
+        return { url: '', isLocal: false, guidance: 'No origin configured' };
+    }
+
+    // Strip embedded credentials (user:pass@) and trailing slashes
+    const safeOrigin = origin.replace(/\/\/[^@/]+@/, '//').replace(/\/+$/, '');
+
+    // Determine if this is a local development URL
+    const isLocal = /(?:^https?:\/\/)(?:localhost|127\.0\.0\.1)(?::\d+)?\/?$/.test(safeOrigin);
+
+    const url = safeOrigin + pathname;
+    const guidance = isLocal
+        ? 'Open ' + url + ' in your browser'
+        : 'Connect to ' + url;
+
+    return { url, isLocal, guidance };
+}
+
+/**
  * Combines already-normalized local-stack status into a single readiness
  * report for the browser harness. Reuses existing services without
  * downloading or launching duplicate AI stacks. Read-only: no CSRF or
