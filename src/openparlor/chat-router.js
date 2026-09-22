@@ -175,6 +175,7 @@ export function createOpenParlorChatRouter({
                     const assistantMsg = persistence.appendMessage(user.directories, conversationId, participant.id, assistantContent, 'character');
                     response.json({ ...completion, conversation_id: conversationId });
                     const knownBy = conversation.participants
+                        .filter(p => p.role === 'character')
                         .map(p => p.character_id)
                         .filter((id, idx, arr) => arr.indexOf(id) === idx);
                     const extractionMessages = [
@@ -211,6 +212,7 @@ export function createOpenParlorChatRouter({
                 }
                 response.json({ conversation_id: conversationId, responses });
                 const knownBy = conversation.participants
+                    .filter(p => p.role === 'character')
                     .map(p => p.character_id)
                     .filter((id, idx, arr) => arr.indexOf(id) === idx);
                 for (const { character } of speakerContexts) {
@@ -325,6 +327,7 @@ export function createOpenParlorChatRouter({
             response.end();
             for (const { character, content, messageId } of extractionResults) {
                 const knownBy = conversation.participants
+                    .filter(p => p.role === 'character')
                     .map(p => p.character_id)
                     .filter((id, idx, arr) => arr.indexOf(id) === idx);
                 const extractionMessages = [

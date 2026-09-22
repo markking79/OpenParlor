@@ -948,6 +948,101 @@ test('memory extraction is NOT triggered on provider error', async () => {
     }
 });
 
+test('group conversation extraction records all character participants as known_by and excludes absent characters', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const emma = persistence.createCharacter(dirs, 'alice', { name: 'Emma', system_prompt: 'You are Emma.' });
+        const rachel = persistence.createCharacter(dirs, 'alice', { name: 'Rachel', system_prompt: 'You are Rachel.' });
+        const sarah = persistence.createCharacter(dirs, 'alice', { name: 'Sarah', system_prompt: 'You are Sarah.' });
+        const conv = persistence.createConversation(dirs, 'alice', emma.id, 'Group');
+        findAndModifyConversation(dirs, conv.id, data => {
+            data.participants.push({ id: 'part-rachel', character_id: rachel.id, role: 'character' });
+        });
+        const mock = mockProvider(() => completion);
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        let extractionParams;
+        let extractionDone;
+        const extractionPromise = new Promise(resolve => { extractionDone = resolve; });
+        const mockExtraction = async (params) => {
+            extractionParams = params;
+            extractionDone();
+            return [];
+        };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+            runMemoryExtraction: mockExtraction,
+        }, user, async baseUrl => {
+            const result = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'Emma, what do you think?' }],
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+            await extractionPromise;
+        });
+
+        assert.ok(extractionParams, 'extraction should have been called');
+        // Both Emma and Rachel are in the conversation → both should be in known_by
+        assert.ok(extractionParams.known_by_character_ids.includes(emma.id), 'Emma should be in known_by');
+        assert.ok(extractionParams.known_by_character_ids.includes(rachel.id), 'Rachel should be in known_by');
+        // Sarah is NOT in the conversation → must not be in known_by
+        assert.ok(!extractionParams.known_by_character_ids.includes(sarah.id), 'Sarah must NOT be in known_by');
+        // No undefined/null entries
+        for (const id of extractionParams.known_by_character_ids) {
+            assert.equal(typeof id, 'string');
+        }
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('one-on-one conversation extraction only includes the single character as known_by (privacy regression)', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const alice = persistence.createCharacter(dirs, 'alice', { name: 'Alice', system_prompt: 'You are Alice.' });
+        const bob = persistence.createCharacter(dirs, 'alice', { name: 'Bob', system_prompt: 'You are Bob.' });
+        const conv = persistence.createConversation(dirs, 'alice', alice.id, 'Solo');
+        const mock = mockProvider(() => completion);
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        let extractionParams;
+        let extractionDone;
+        const extractionPromise = new Promise(resolve => { extractionDone = resolve; });
+        const mockExtraction = async (params) => {
+            extractionParams = params;
+            extractionDone();
+            return [];
+        };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+            runMemoryExtraction: mockExtraction,
+        }, user, async baseUrl => {
+            const result = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'hello' }],
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+            await extractionPromise;
+        });
+
+        assert.ok(extractionParams, 'extraction should have been called');
+        // Only Alice is in this conversation
+        assert.deepEqual(extractionParams.known_by_character_ids, [alice.id]);
+        // Bob exists but is not in this conversation
+        assert.ok(!extractionParams.known_by_character_ids.includes(bob.id));
+    } finally {
+        tmp.cleanup();
+    }
+});
+
 test('retrieves and injects memories into the prompt when conversation_id is provided', async () => {
     const tmp = makeTempDirs();
     try {
