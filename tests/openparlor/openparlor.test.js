@@ -1500,3 +1500,194 @@ describe('createPlaybackController', () => {
         assert.equal(controller.isPlaying, false);
     });
 });
+
+describe('server-side provider ownership', () => {
+    it('should not expose provider configuration through model status', () => {
+        const raw = {
+            provider: 'openai',
+            model: 'gpt-4',
+            endpointLabel: 'OpenAI',
+            models: ['gpt-4', 'gpt-4-turbo'],
+            connected: true,
+            api_key: 'sk-proj-abc123',
+            base_url: 'https://api.openai.com/v1',
+            organization: 'org-xyz',
+            max_tokens: 4096,
+            temperature: 0.7,
+        };
+        const result = normalizeModelStatus(raw);
+        assert.deepEqual(Object.keys(result).sort(), ['connected', 'endpointLabel', 'model', 'models', 'provider']);
+        assert.equal(result.api_key, undefined);
+        assert.equal(result.base_url, undefined);
+        assert.equal(result.organization, undefined);
+        assert.equal(result.max_tokens, undefined);
+        assert.equal(result.temperature, undefined);
+    });
+
+    it('should not expose provider configuration through health status', () => {
+        const raw = {
+            model: {
+                available: true,
+                label: 'llama3',
+                endpoint: 'http://localhost:11434',
+                api_key: 'ollama-secret',
+                model_path: '/opt/models/llama3.gguf',
+                context_length: 4096,
+            },
+            tts: {
+                available: true,
+                label: 'Piper',
+                model_path: '/opt/tts/piper/en_US-lessac-medium.onnx',
+                voice_dir: '/var/tts/voices',
+            },
+            stt: {
+                available: true,
+                label: 'Whisper',
+                model_path: '/opt/stt/whisper/base.pt',
+                device: 'cuda:0',
+            },
+        };
+        const result = normalizeHealthStatus(raw);
+        assert.deepEqual(Object.keys(result.model).sort(), ['available', 'label']);
+        assert.deepEqual(Object.keys(result.tts).sort(), ['available', 'label']);
+        assert.deepEqual(Object.keys(result.stt).sort(), ['available', 'label']);
+    });
+
+    it('should not expose provider configuration through settings', () => {
+        const raw = {
+            model: {
+                provider: 'anthropic',
+                model: 'claude-3-opus',
+                connected: true,
+                api_key: 'sk-ant-abc123',
+                base_url: 'https://api.anthropic.com',
+                max_tokens: 8192,
+                system_prompt: 'You are helpful.',
+            },
+            speech: {
+                voicesAvailable: true,
+                voiceModeEnabled: false,
+                tts_endpoint: 'http://tts-internal:5000',
+                stt_endpoint: 'http://stt-internal:5001',
+                whisper_model: 'large-v3',
+            },
+            character: {
+                defaultCharacterId: 'char-1',
+                count: 5,
+                storage_path: '/var/lib/openparlor/characters',
+            },
+        };
+        const result = normalizeSettings(raw);
+        assert.deepEqual(Object.keys(result.model).sort(), ['connected', 'model', 'provider']);
+        assert.deepEqual(Object.keys(result.speech).sort(), ['voiceModeEnabled', 'voicesAvailable']);
+        assert.deepEqual(Object.keys(result.character).sort(), ['count', 'defaultCharacterId']);
+    });
+
+    it('should sanitize TTS synthesis errors containing provider URLs', async () => {
+        const controller = createPlaybackController({
+            fetchFn: async () => ({
+                ok: false,
+                json: async () => ({ error: 'Connection refused at http://tts-internal:5000/synthesize' }),
+            }),
+            createObjectURL: () => 'blob:test',
+            revokeObjectURL: () => {},
+            audioFactory: () => ({ src: '', play: async () => {}, pause: () => {}, addEventListener: () => {} }),
+        });
+
+        await assert.rejects(
+            () => controller.play('Hello', 'voice-a'),
+            (err) => {
+                assert.ok(!err.message.includes('http'));
+                assert.ok(!err.message.includes('tts-internal'));
+                return true;
+            }
+        );
+    });
+
+    it('should sanitize TTS synthesis errors containing filesystem paths', async () => {
+        const controller = createPlaybackController({
+            fetchFn: async () => ({
+                ok: false,
+                json: async () => ({ error: 'Model not found at /opt/tts/models/piper/en_US-lessac-medium.onnx' }),
+            }),
+            createObjectURL: () => 'blob:test',
+            revokeObjectURL: () => {},
+            audioFactory: () => ({ src: '', play: async () => {}, pause: () => {}, addEventListener: () => {} }),
+        });
+
+        await assert.rejects(
+            () => controller.play('Hello', 'voice-a'),
+            (err) => {
+                assert.ok(!err.message.includes('/opt/'));
+                assert.ok(!err.message.includes('.onnx'));
+                return true;
+            }
+        );
+    });
+
+    it('should sanitize TTS synthesis errors containing credentials', async () => {
+        const controller = createPlaybackController({
+            fetchFn: async () => ({
+                ok: false,
+                json: async () => ({ error: 'Unauthorized: api_key=sk-tts-secret-456' }),
+            }),
+            createObjectURL: () => 'blob:test',
+            revokeObjectURL: () => {},
+            audioFactory: () => ({ src: '', play: async () => {}, pause: () => {}, addEventListener: () => {} }),
+        });
+
+        await assert.rejects(
+            () => controller.play('Hello', 'voice-a'),
+            (err) => {
+                assert.ok(!err.message.includes('sk-tts-secret-456'));
+                assert.ok(!err.message.includes('api_key'));
+                return true;
+            }
+        );
+    });
+
+    it('should send CSRF token with transcription requests when provider is available', async () => {
+        const blob = new Blob(['audio']);
+        const fetchCalls = [];
+        const controller = createTranscriptionController({
+            fetchFn: async (url, opts) => {
+                fetchCalls.push({ url, opts });
+                return { ok: true, json: async () => ({ text: 'ok' }) };
+            },
+            getCsrfToken: async () => 'csrf-abc',
+        });
+        await controller.transcribe(blob);
+        assert.equal(fetchCalls[0].opts.headers['X-CSRF-Token'], 'csrf-abc');
+    });
+
+    it('should omit CSRF header when no token provider is configured', async () => {
+        const blob = new Blob(['audio']);
+        const fetchCalls = [];
+        const controller = createTranscriptionController({
+            fetchFn: async (url, opts) => {
+                fetchCalls.push({ url, opts });
+                return { ok: true, json: async () => ({ text: 'ok' }) };
+            },
+        });
+        await controller.transcribe(blob);
+        assert.equal(fetchCalls[0].opts.headers['X-CSRF-Token'], undefined);
+    });
+
+    it('should report missing developer storage state as deferred without leaking paths', () => {
+        const raw = {
+            satisfied: false,
+            label: 'Developer storage state not found at /home/dev/.openparlor/storage-state.json',
+        };
+        const result = normalizeDeferredPrerequisite(raw);
+        assert.equal(result.deferred, true);
+        assert.ok(!result.label.includes('/home/dev'));
+        assert.ok(!result.label.includes('storage-state.json'));
+    });
+
+    it('should report satisfied developer storage state as non-deferred', () => {
+        const raw = { satisfied: true, label: 'Storage state found' };
+        const result = normalizeDeferredPrerequisite(raw);
+        assert.equal(result.deferred, false);
+        assert.equal(result.label, '');
+    });
+});
