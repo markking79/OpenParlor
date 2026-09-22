@@ -16,6 +16,7 @@ const CHARACTER_FIELDS = new Set([
     'tts_voice',
     'temperature',
     'max_tokens',
+    'time_aware',
 ]);
 const MAX_TEXT_LENGTH = 20_000;
 
@@ -79,6 +80,13 @@ function validateCharacterBody(body, isCreate) {
                 return { error: '"max_tokens" must be a positive integer up to 8192' };
             }
             value.max_tokens = field;
+            continue;
+        }
+        if (key === 'time_aware') {
+            if (typeof field !== 'boolean') {
+                return { error: '"time_aware" must be a boolean' };
+            }
+            value.time_aware = field;
             continue;
         }
         if (typeof field !== 'string' || field.length > MAX_TEXT_LENGTH) {

@@ -19,6 +19,7 @@ import { sync as writeFileAtomicSync } from 'write-file-atomic';
  * @property {string} tts_voice
  * @property {number} [temperature] Generation temperature 0–2
  * @property {number} [max_tokens] Maximum response tokens 1–8192
+ * @property {boolean} [time_aware] Whether to include server-derived time context in prompts
  * @property {string} owner_id User handle
  * @property {string} created_at ISO 8601
  * @property {string} updated_at ISO 8601
@@ -226,6 +227,7 @@ function normalizeCharacter(value) {
         tts_voice: stringField('tts_voice'),
         ...(typeof character.temperature === 'number' && Number.isFinite(character.temperature) ? { temperature: character.temperature } : {}),
         ...(typeof character.max_tokens === 'number' && Number.isFinite(character.max_tokens) ? { max_tokens: character.max_tokens } : {}),
+        ...(typeof character.time_aware === 'boolean' ? { time_aware: character.time_aware } : {}),
         owner_id: character.owner_id,
         created_at: character.created_at,
         updated_at: character.updated_at,
@@ -258,6 +260,7 @@ export function createCharacter(directories, owner_id, data) {
         tts_voice: data.tts_voice ?? '',
         ...(typeof data.temperature === 'number' && Number.isFinite(data.temperature) ? { temperature: data.temperature } : {}),
         ...(typeof data.max_tokens === 'number' && Number.isFinite(data.max_tokens) ? { max_tokens: data.max_tokens } : {}),
+        ...(typeof data.time_aware === 'boolean' ? { time_aware: data.time_aware } : {}),
         owner_id,
         created_at: now,
         updated_at: now,

@@ -21,9 +21,10 @@ function participantsRule(names) {
  * @param {Array<{role: string, content: string}>} params.history - Stored messages (roles: 'user' | 'character')
  * @param {Array<{role: string, content: string}>} params.newMessages - New messages from the request (only 'user' role is used)
  * @param {string[]} [params.memories] Pre-formatted memory lines to inject into the system prompt
+ * @param {string} [params.currentTime] Server-derived ISO 8601 timestamp; only used when character.time_aware is true
  * @returns {Array<{role: string, content: string}>} Assembled model messages
  */
-export function buildPrompt({ character, conversation, history, newMessages, memories }) {
+export function buildPrompt({ character, conversation, history, newMessages, memories, currentTime }) {
     const messages = [];
 
     // System prompt: global behavior + identity + persona + scenario + participants
@@ -39,6 +40,9 @@ export function buildPrompt({ character, conversation, history, newMessages, mem
     }
     if (conversation && Array.isArray(conversation.participants) && conversation.participants.length > 0) {
         systemParts.push(participantsRule(conversation.participants));
+    }
+    if (character && character.time_aware === true && typeof currentTime === 'string' && currentTime) {
+        systemParts.push(`Current server time: ${currentTime}`);
     }
     if (Array.isArray(memories) && memories.length > 0) {
         systemParts.push([

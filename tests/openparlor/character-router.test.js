@@ -28,6 +28,7 @@ function createMockPersistence() {
                 tts_voice: data.tts_voice ?? '',
                 ...(typeof data.temperature === 'number' ? { temperature: data.temperature } : {}),
                 ...(typeof data.max_tokens === 'number' ? { max_tokens: data.max_tokens } : {}),
+                ...(typeof data.time_aware === 'boolean' ? { time_aware: data.time_aware } : {}),
                 owner_id,
                 created_at: now,
                 updated_at: now,
@@ -650,6 +651,80 @@ describe('OpenParlor Character Router', () => {
                 method: 'PATCH',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ max_tokens: -5 }),
+            });
+            assert.equal(res.status, 400);
+        });
+
+        it('accepts valid time_aware boolean', async () => {
+            const res = await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'X', time_aware: true }),
+            });
+            assert.equal(res.status, 201);
+            const body = await res.json();
+            assert.equal(body.time_aware, true);
+        });
+
+        it('accepts time_aware: false', async () => {
+            const res = await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'X', time_aware: false }),
+            });
+            assert.equal(res.status, 201);
+            const body = await res.json();
+            assert.equal(body.time_aware, false);
+        });
+
+        it('rejects time_aware that is not a boolean', async () => {
+            const res = await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'X', time_aware: 'yes' }),
+            });
+            assert.equal(res.status, 400);
+            const body = await res.json();
+            assert.match(body.error, /time_aware/);
+        });
+
+        it('rejects time_aware that is a number', async () => {
+            const res = await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'X', time_aware: 1 }),
+            });
+            assert.equal(res.status, 400);
+        });
+
+        it('updates time_aware on existing character', async () => {
+            const created = await (await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'X' }),
+            })).json();
+
+            const res = await fetch(`${baseUrl}/api/openparlor/characters/${created.id}`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ time_aware: true }),
+            });
+            assert.equal(res.status, 200);
+            const body = await res.json();
+            assert.equal(body.time_aware, true);
+        });
+
+        it('rejects invalid time_aware on update', async () => {
+            const created = await (await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'X' }),
+            })).json();
+
+            const res = await fetch(`${baseUrl}/api/openparlor/characters/${created.id}`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ time_aware: 'not-a-bool' }),
             });
             assert.equal(res.status, 400);
         });

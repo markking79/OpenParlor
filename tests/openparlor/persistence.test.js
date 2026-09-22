@@ -390,6 +390,63 @@ describe('OpenParlor persistence', () => {
         });
     });
 
+    // ─── Character time_aware field ────────────────────────────────────────
+
+    describe('character time_aware field', () => {
+        it('stores and retrieves time_aware: true', () => {
+            const created = createCharacter(dirs, 'alice', { name: 'C', time_aware: true });
+            assert.equal(created.time_aware, true);
+
+            const fetched = getCharacter(dirs, created.id);
+            assert.equal(fetched.time_aware, true);
+        });
+
+        it('stores and retrieves time_aware: false', () => {
+            const created = createCharacter(dirs, 'alice', { name: 'C', time_aware: false });
+            assert.equal(created.time_aware, false);
+
+            const fetched = getCharacter(dirs, created.id);
+            assert.equal(fetched.time_aware, false);
+        });
+
+        it('omits time_aware when not provided', () => {
+            const created = createCharacter(dirs, 'alice', { name: 'C' });
+            assert.equal('time_aware' in created, false);
+
+            const fetched = getCharacter(dirs, created.id);
+            assert.equal('time_aware' in fetched, false);
+        });
+
+        it('updates time_aware on existing character', () => {
+            const created = createCharacter(dirs, 'alice', { name: 'C' });
+            const updated = updateCharacter(dirs, created.id, { time_aware: true });
+            assert.equal(updated.time_aware, true);
+
+            const fetched = getCharacter(dirs, created.id);
+            assert.equal(fetched.time_aware, true);
+        });
+
+        it('normalizes legacy character without time_aware', () => {
+            const legacyId = 'legacy-time-aware';
+            const legacy = {
+                id: legacyId,
+                name: 'Legacy',
+                description: '',
+                personality: '',
+                scenario: '',
+                first_message: '',
+                owner_id: 'alice',
+                created_at: '2026-01-01T00:00:00.000Z',
+                updated_at: '2026-01-01T00:00:00.000Z',
+            };
+            const characterPath = path.join(getOpenParlorRoot(dirs), 'characters', `${legacyId}.json`);
+            fs.writeFileSync(characterPath, JSON.stringify(legacy));
+
+            const loaded = getCharacter(dirs, legacyId);
+            assert.equal('time_aware' in loaded, false);
+        });
+    });
+
     // ─── Memory schema defaults ────────────────────────────────────────────
 
     describe('memory schema defaults', () => {

@@ -285,6 +285,85 @@ test('group prompt construction with multiple participants and history', () => {
     assert.equal(result[3].content, 'Bob agrees with you.');
 });
 
+test('time_aware character with server currentTime injects time context', () => {
+    const character = { name: 'Alice', system_prompt: 'You are Alice.', time_aware: true };
+    const conversation = {};
+    const history = [];
+    const newMessages = [{ role: 'user', content: 'hi' }];
+    const currentTime = '2026-09-22T14:30:00.000Z';
+
+    const result = buildPrompt({ character, conversation, history, newMessages, currentTime });
+
+    assert.equal(result[0].role, 'system');
+    assert.ok(result[0].content.includes('Current server time: 2026-09-22T14:30:00.000Z'));
+});
+
+test('time_aware disabled leaves prompt unchanged', () => {
+    const character = { name: 'Alice', system_prompt: 'You are Alice.', time_aware: false };
+    const conversation = {};
+    const history = [];
+    const newMessages = [{ role: 'user', content: 'hi' }];
+    const currentTime = '2026-09-22T14:30:00.000Z';
+
+    const result = buildPrompt({ character, conversation, history, newMessages, currentTime });
+
+    assert.equal(result[0].role, 'system');
+    assert.ok(!result[0].content.includes('Current server time'));
+});
+
+test('time_aware missing (undefined) leaves prompt unchanged even with currentTime', () => {
+    const character = { name: 'Alice', system_prompt: 'You are Alice.' };
+    const conversation = {};
+    const history = [];
+    const newMessages = [{ role: 'user', content: 'hi' }];
+    const currentTime = '2026-09-22T14:30:00.000Z';
+
+    const result = buildPrompt({ character, conversation, history, newMessages, currentTime });
+
+    assert.equal(result[0].role, 'system');
+    assert.ok(!result[0].content.includes('Current server time'));
+});
+
+test('time_aware true but no currentTime provided leaves prompt unchanged', () => {
+    const character = { name: 'Alice', system_prompt: 'You are Alice.', time_aware: true };
+    const conversation = {};
+    const history = [];
+    const newMessages = [{ role: 'user', content: 'hi' }];
+
+    const result = buildPrompt({ character, conversation, history, newMessages });
+
+    assert.equal(result[0].role, 'system');
+    assert.ok(!result[0].content.includes('Current server time'));
+});
+
+test('deterministic injected clock produces exact time string in prompt', () => {
+    const character = { name: 'Bob', system_prompt: 'persona', scenario: 'Scene', time_aware: true };
+    const conversation = {};
+    const history = [];
+    const newMessages = [];
+    const fixedTime = '2025-01-15T08:00:00.000Z';
+
+    const result = buildPrompt({ character, conversation, history, newMessages, currentTime: fixedTime });
+
+    const sys = result[0].content;
+    assert.ok(sys.includes('Current server time: 2025-01-15T08:00:00.000Z'));
+    // Verify it appears exactly once
+    assert.equal(sys.split('Current server time:').length - 1, 1);
+});
+
+test('browser payload cannot inject currentTime (not a valid character field)', () => {
+    // Simulates what happens if a browser tries to pass currentTime as part of character data
+    const character = { name: 'Alice', system_prompt: 'You are Alice.', time_aware: true, currentTime: '2020-01-01T00:00:00.000Z' };
+    const conversation = {};
+    const history = [];
+    const newMessages = [];
+
+    // The buildPrompt function only reads currentTime from its own params, not from character
+    const result = buildPrompt({ character, conversation, history, newMessages });
+
+    assert.ok(!result[0].content.includes('Current server time'));
+});
+
 test('single-character prompt remains compatible without participants field', () => {
     const character = { name: 'Bob', system_prompt: 'You are Bob.', scenario: 'Library' };
     const conversation = { title: 'Chat with Bob' };
