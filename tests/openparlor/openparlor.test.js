@@ -9,6 +9,7 @@ import {
     createGroupPlaybackQueue,
     normalizeSettings,
     normalizeHealthStatus,
+    normalizeServiceError,
 } from '../../public/openparlor/openparlor.js';
 
 describe('normalizeMemory', () => {
@@ -492,6 +493,119 @@ describe('normalizeHealthStatus', () => {
         assert.equal(result.model.label, '');
         assert.equal(result.tts.label, '');
         assert.equal(result.stt.label, '');
+    });
+});
+
+describe('normalizeServiceError', () => {
+    it('should return fallback for null input', () => {
+        assert.equal(normalizeServiceError(null), 'Service unavailable. Please try again.');
+    });
+
+    it('should return fallback for undefined input', () => {
+        assert.equal(normalizeServiceError(undefined), 'Service unavailable. Please try again.');
+    });
+
+    it('should return fallback for non-object, non-string input', () => {
+        assert.equal(normalizeServiceError(42), 'Service unavailable. Please try again.');
+        assert.equal(normalizeServiceError(true), 'Service unavailable. Please try again.');
+    });
+
+    it('should return fallback for object without error field', () => {
+        assert.equal(normalizeServiceError({}), 'Service unavailable. Please try again.');
+        assert.equal(normalizeServiceError({ message: 'something' }), 'Service unavailable. Please try again.');
+    });
+
+    it('should return fallback for object with non-string error', () => {
+        assert.equal(normalizeServiceError({ error: 42 }), 'Service unavailable. Please try again.');
+        assert.equal(normalizeServiceError({ error: null }), 'Service unavailable. Please try again.');
+    });
+
+    it('should pass through a safe error message', () => {
+        assert.equal(normalizeServiceError({ error: 'Model not found' }), 'Model not found');
+    });
+
+    it('should pass through a safe string input', () => {
+        assert.equal(normalizeServiceError('Connection timed out'), 'Connection timed out');
+    });
+
+    it('should return fallback when error contains a URL', () => {
+        assert.equal(
+            normalizeServiceError({ error: 'Connection refused at http://localhost:11434' }),
+            'Service unavailable. Please try again.'
+        );
+        assert.equal(
+            normalizeServiceError({ error: 'Failed to reach https://api.openai.com/v1' }),
+            'Service unavailable. Please try again.'
+        );
+    });
+
+    it('should return fallback when error contains a file URL', () => {
+        assert.equal(
+            normalizeServiceError({ error: 'Cannot load file:///opt/models/llama.gguf' }),
+            'Service unavailable. Please try again.'
+        );
+    });
+
+    it('should return fallback when error contains a filesystem path', () => {
+        assert.equal(
+            normalizeServiceError({ error: 'Failed to load model from /opt/models/llama-7b.gguf' }),
+            'Service unavailable. Please try again.'
+        );
+        assert.equal(
+            normalizeServiceError({ error: 'Permission denied: /etc/shadow' }),
+            'Service unavailable. Please try again.'
+        );
+    });
+
+    it('should return fallback when error contains credential patterns', () => {
+        assert.equal(
+            normalizeServiceError({ error: 'Invalid api_key: sk-abc123secret' }),
+            'Service unavailable. Please try again.'
+        );
+        assert.equal(
+            normalizeServiceError({ error: 'Authorization: Bearer eyJhbGciOi' }),
+            'Service unavailable. Please try again.'
+        );
+        assert.equal(
+            normalizeServiceError({ error: 'token=supersecret123' }),
+            'Service unavailable. Please try again.'
+        );
+    });
+
+    it('should use custom fallback when provided', () => {
+        assert.equal(
+            normalizeServiceError({ error: 'http://internal:8080/secret' }, 'TTS service unavailable'),
+            'TTS service unavailable'
+        );
+        assert.equal(
+            normalizeServiceError(null, 'Chat failed'),
+            'Chat failed'
+        );
+    });
+
+    it('should truncate overly long safe messages', () => {
+        const longMsg = 'A'.repeat(250);
+        const result = normalizeServiceError({ error: longMsg });
+        assert.equal(result.length, 200);
+        assert.ok(result.endsWith('...'));
+    });
+
+    it('should not truncate messages at or under 200 chars', () => {
+        const msg = 'B'.repeat(200);
+        assert.equal(normalizeServiceError({ error: msg }), msg);
+    });
+
+    it('should return fallback for empty or whitespace-only error strings', () => {
+        assert.equal(normalizeServiceError({ error: '' }), 'Service unavailable. Please try again.');
+        assert.equal(normalizeServiceError({ error: '   ' }), 'Service unavailable. Please try again.');
+        assert.equal(normalizeServiceError(''), 'Service unavailable. Please try again.');
+    });
+
+    it('should handle error with mixed safe and unsafe content by returning fallback', () => {
+        assert.equal(
+            normalizeServiceError({ error: 'Error at /var/log/app.log: connection to http://db:5432 failed' }),
+            'Service unavailable. Please try again.'
+        );
     });
 });
 

@@ -332,6 +332,38 @@ export function normalizeHealthStatus(raw) {
 }
 
 /**
+ * Normalizes a raw service error into a safe, user-facing message.
+ * If the error contains URLs, filesystem paths, or credential patterns,
+ * returns the fallback to prevent leaking sensitive information.
+ * @param {object|string|null|undefined} raw - The raw error from a service response.
+ * @param {string} [fallback] - Safe fallback message when no safe message can be derived.
+ * @returns {string} A safe, non-sensitive error message.
+ */
+export function normalizeServiceError(raw, fallback = 'Service unavailable. Please try again.') {
+    let message = '';
+
+    if (typeof raw === 'string') {
+        message = raw;
+    } else if (raw && typeof raw === 'object') {
+        message = typeof raw.error === 'string' ? raw.error : '';
+    }
+
+    if (!message) return fallback;
+
+    const hasUrl = /(?:https?|file):\/\//i.test(message);
+    const hasFilePath = /(?:^|[\s"'(])\/[\w.-]+(?:\/[\w.-]+)+/.test(message);
+    const hasCredential = /(?:api[_-]?key|token|secret|password|credential|authorization|bearer)\s*[:=]\s*\S+/i.test(message);
+
+    if (hasUrl || hasFilePath || hasCredential) {
+        return fallback;
+    }
+
+    const trimmed = message.trim();
+    if (!trimmed) return fallback;
+    return trimmed.length > 200 ? trimmed.slice(0, 197) + '...' : trimmed;
+}
+
+/**
  * Selects the first MIME type from candidates that the given
  * isTypeSupported predicate accepts. Returns '' if none are supported.
  * @param {string[]} candidates
@@ -749,7 +781,7 @@ export function createPlaybackController(deps = {}) {
         if (gen !== generation) return null;
         if (!res.ok) {
             const err = await res.json().catch(() => ({}));
-            throw new Error(err.error || 'Synthesis failed');
+            throw new Error(normalizeServiceError(err, 'Synthesis failed'));
         }
         const blob = await res.blob();
         if (gen !== generation) return null;
@@ -1317,7 +1349,7 @@ if (typeof document !== 'undefined') {
             });
             if (!res.ok) {
                 const err = await res.json().catch(() => ({}));
-                throw new Error(err.error || 'Failed to update participants');
+                throw new Error(normalizeServiceError(err, 'Failed to update participants'));
             }
             const updated = normalizeConversation(await res.json());
             currentConversation = updated;
@@ -1492,7 +1524,7 @@ if (typeof document !== 'undefined') {
         });
         if (!res.ok) {
             const err = await res.json().catch(() => ({}));
-            throw new Error(err.error || 'Failed to create conversation');
+            throw new Error(normalizeServiceError(err, 'Failed to create conversation'));
         }
         return normalizeConversation(await res.json());
     }
@@ -1509,7 +1541,7 @@ if (typeof document !== 'undefined') {
         });
         if (!res.ok) {
             const err = await res.json().catch(() => ({}));
-            throw new Error(err.error || 'Failed to create character');
+            throw new Error(normalizeServiceError(err, 'Failed to create character'));
         }
         return normalizeCharacter(await res.json());
     }
@@ -1526,7 +1558,7 @@ if (typeof document !== 'undefined') {
         });
         if (!res.ok) {
             const err = await res.json().catch(() => ({}));
-            throw new Error(err.error || 'Failed to update character');
+            throw new Error(normalizeServiceError(err, 'Failed to update character'));
         }
         return normalizeCharacter(await res.json());
     }
@@ -1575,7 +1607,7 @@ if (typeof document !== 'undefined') {
         });
         if (!res.ok) {
             const err = await res.json().catch(() => ({}));
-            throw new Error(err.error || 'Failed to update memory');
+            throw new Error(normalizeServiceError(err, 'Failed to update memory'));
         }
         return normalizeMemory(await res.json());
     }
@@ -1588,7 +1620,7 @@ if (typeof document !== 'undefined') {
         });
         if (!res.ok && res.status !== 204) {
             const err = await res.json().catch(() => ({}));
-            throw new Error(err.error || 'Failed to delete memory');
+            throw new Error(normalizeServiceError(err, 'Failed to delete memory'));
         }
     }
 
@@ -1601,7 +1633,7 @@ if (typeof document !== 'undefined') {
         });
         if (!res.ok) {
             const err = await res.json().catch(() => ({}));
-            throw new Error(err.error || 'Failed to pin memory');
+            throw new Error(normalizeServiceError(err, 'Failed to pin memory'));
         }
         return normalizeMemory(await res.json());
     }
@@ -1940,8 +1972,8 @@ if (typeof document !== 'undefined') {
             });
 
             if (!response.ok) {
-                const err = await response.json().catch(() => ({ error: 'Request failed' }));
-                currentAssistantMsg.content = err.error || 'Request failed';
+                const err = await response.json().catch(() => ({}));
+                currentAssistantMsg.content = normalizeServiceError(err, 'Request failed');
                 if (lastBubble) lastBubble.textContent = currentAssistantMsg.content;
                 scrollMessages();
                 if (isDev) voiceTurnTimer.log();
