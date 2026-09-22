@@ -13,7 +13,6 @@ import { csrfSync } from 'csrf-sync';
 import express from 'express';
 import compression from 'compression';
 import cookieSession from 'cookie-session';
-import multer from 'multer';
 import responseTime from 'response-time';
 import helmet from 'helmet';
 import bodyParser from 'body-parser';
@@ -47,6 +46,7 @@ import basicAuthMiddleware from './middleware/basicAuth.js';
 import getWhitelistMiddleware from './middleware/whitelist.js';
 import accessLoggerMiddleware, { getAccessLogPath, migrateAccessLog } from './middleware/accessLogWriter.js';
 import multerMonkeyPatch from './middleware/multerMonkeyPatch.js';
+import { createAvatarUploadMiddleware } from './middleware/avatarUpload.js';
 import initRequestProxy from './request-proxy.js';
 import initPrivateRequestFilter from './private-request-filter.js';
 import cacheBuster from './middleware/cacheBuster.js';
@@ -266,7 +266,7 @@ if (cliArgs.enableCorsProxy) {
 
 // File uploads
 const uploadsPath = path.join(cliArgs.dataRoot, UPLOADS_DIRECTORY);
-app.use(multer({ dest: uploadsPath, limits: { fieldSize: 500 * 1024 * 1024 } }).single('avatar'));
+app.use(createAvatarUploadMiddleware(uploadsPath));
 app.use(multerMonkeyPatch);
 
 app.get('/version', async function (_, response) {
