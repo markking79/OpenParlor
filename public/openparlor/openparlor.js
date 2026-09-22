@@ -332,6 +332,52 @@ export function normalizeHealthStatus(raw) {
 }
 
 /**
+ * Determines whether the text-chat path is ready to accept messages,
+ * based on already-normalized model status and health status.
+ * @param {{ provider: string, model: string, endpointLabel: string, models: string[], connected: boolean } | null} modelStatus
+ * @param {{ model: { available: boolean, label: string } | null, tts: { available: boolean, label: string } | null, stt: { available: boolean, label: string } | null } | null} healthStatus
+ * @returns {{ ready: boolean, reason: string }}
+ */
+export function normalizeChatReadiness(modelStatus, healthStatus) {
+    const model = (modelStatus && typeof modelStatus === 'object') ? modelStatus : null;
+    const health = (healthStatus && typeof healthStatus === 'object') ? healthStatus : null;
+
+    if (!model || model.connected !== true) {
+        return { ready: false, reason: 'Model not connected' };
+    }
+
+    if (health && health.model && health.model.available === false) {
+        return { ready: false, reason: 'Model service unavailable' };
+    }
+
+    return { ready: true, reason: '' };
+}
+
+/**
+ * Normalizes a raw prerequisite check result into a safe deferred/satisfied
+ * status. Used by the browser harness to report missing developer storage
+ * state as a deferred local prerequisite without leaking sensitive details.
+ * @param {object|null|undefined} raw
+ * @returns {{ deferred: boolean, label: string }}
+ */
+export function normalizeDeferredPrerequisite(raw) {
+    if (!raw || typeof raw !== 'object') {
+        return { deferred: true, label: 'Prerequisite not met' };
+    }
+    if (raw.satisfied === true) {
+        return { deferred: false, label: '' };
+    }
+    const label = typeof raw.label === 'string' ? raw.label : '';
+    const safeLabel = label
+        .replace(/https?:\/\/\S+/g, '[redacted]')
+        .replace(/file:\/\/\S+/g, '[redacted]')
+        .replace(/(?:^|[\s"'(])\/[\w.-]+(?:\/[\w.-]+)+/g, ' [redacted]')
+        .replace(/(?:api[_-]?key|token|secret|password|credential|authorization|bearer)\s*[:=]\s*\S+/gi, '[redacted]')
+        .trim();
+    return { deferred: true, label: !safeLabel || safeLabel === '[redacted]' ? 'Prerequisite not met' : safeLabel };
+}
+
+/**
  * Normalizes a raw service error into a safe, user-facing message.
  * If the error contains URLs, filesystem paths, or credential patterns,
  * returns the fallback to prevent leaking sensitive information.

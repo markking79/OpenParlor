@@ -12,6 +12,8 @@ import {
     normalizeServiceError,
     normalizeModelStatus,
     normalizeTtsVoices,
+    normalizeChatReadiness,
+    normalizeDeferredPrerequisite,
 } from '../../public/openparlor/openparlor.js';
 
 describe('normalizeMemory', () => {
@@ -495,6 +497,135 @@ describe('normalizeHealthStatus', () => {
         assert.equal(result.model.label, '');
         assert.equal(result.tts.label, '');
         assert.equal(result.stt.label, '');
+    });
+});
+
+describe('normalizeChatReadiness', () => {
+    it('should report ready when model is connected and health is available', () => {
+        const modelStatus = { provider: 'ollama', model: 'llama3', endpointLabel: 'Local', models: ['llama3'], connected: true };
+        const healthStatus = { model: { available: true, label: 'llama3' }, tts: { available: true, label: 'Piper' }, stt: { available: true, label: 'Whisper' } };
+        const result = normalizeChatReadiness(modelStatus, healthStatus);
+        assert.equal(result.ready, true);
+        assert.equal(result.reason, '');
+    });
+
+    it('should report not ready when model is not connected', () => {
+        const modelStatus = { provider: 'openai', model: 'gpt-4', endpointLabel: '', models: [], connected: false };
+        const healthStatus = { model: { available: false, label: '' }, tts: null, stt: null };
+        const result = normalizeChatReadiness(modelStatus, healthStatus);
+        assert.equal(result.ready, false);
+        assert.equal(result.reason, 'Model not connected');
+    });
+
+    it('should report not ready when model status is null', () => {
+        const result = normalizeChatReadiness(null, null);
+        assert.equal(result.ready, false);
+        assert.equal(result.reason, 'Model not connected');
+    });
+
+    it('should report not ready when model status is non-object', () => {
+        const result = normalizeChatReadiness('invalid', null);
+        assert.equal(result.ready, false);
+        assert.equal(result.reason, 'Model not connected');
+    });
+
+    it('should report not ready when health explicitly says model unavailable', () => {
+        const modelStatus = { provider: 'ollama', model: 'llama3', endpointLabel: 'Local', models: ['llama3'], connected: true };
+        const healthStatus = { model: { available: false, label: 'llama3' }, tts: null, stt: null };
+        const result = normalizeChatReadiness(modelStatus, healthStatus);
+        assert.equal(result.ready, false);
+        assert.equal(result.reason, 'Model service unavailable');
+    });
+
+    it('should report ready when health is null but model is connected', () => {
+        const modelStatus = { provider: 'ollama', model: 'llama3', endpointLabel: 'Local', models: ['llama3'], connected: true };
+        const result = normalizeChatReadiness(modelStatus, null);
+        assert.equal(result.ready, true);
+        assert.equal(result.reason, '');
+    });
+
+    it('should report ready when health model section is null but model is connected', () => {
+        const modelStatus = { provider: 'ollama', model: 'llama3', endpointLabel: 'Local', models: ['llama3'], connected: true };
+        const healthStatus = { model: null, tts: null, stt: null };
+        const result = normalizeChatReadiness(modelStatus, healthStatus);
+        assert.equal(result.ready, true);
+        assert.equal(result.reason, '');
+    });
+
+    it('should not leak endpoint URLs in reason', () => {
+        const modelStatus = { provider: 'openai', model: 'gpt-4', endpointLabel: 'https://api.openai.com/v1', models: [], connected: false };
+        const result = normalizeChatReadiness(modelStatus, null);
+        assert.equal(result.ready, false);
+        assert.ok(!result.reason.includes('http'));
+    });
+});
+
+describe('normalizeDeferredPrerequisite', () => {
+    it('should return deferred=false when satisfied is true', () => {
+        const result = normalizeDeferredPrerequisite({ satisfied: true, label: 'Storage state found' });
+        assert.equal(result.deferred, false);
+        assert.equal(result.label, '');
+    });
+
+    it('should return deferred=true with label when satisfied is false', () => {
+        const result = normalizeDeferredPrerequisite({ satisfied: false, label: 'Developer storage state not found' });
+        assert.equal(result.deferred, true);
+        assert.equal(result.label, 'Developer storage state not found');
+    });
+
+    it('should return deferred=true with fallback label for null input', () => {
+        const result = normalizeDeferredPrerequisite(null);
+        assert.equal(result.deferred, true);
+        assert.equal(result.label, 'Prerequisite not met');
+    });
+
+    it('should return deferred=true with fallback label for non-object input', () => {
+        assert.equal(normalizeDeferredPrerequisite('string').deferred, true);
+        assert.equal(normalizeDeferredPrerequisite(42).deferred, true);
+        assert.equal(normalizeDeferredPrerequisite(undefined).deferred, true);
+    });
+
+    it('should return deferred=true when satisfied is not explicitly true', () => {
+        assert.equal(normalizeDeferredPrerequisite({ satisfied: 'yes' }).deferred, true);
+        assert.equal(normalizeDeferredPrerequisite({ satisfied: 1 }).deferred, true);
+        assert.equal(normalizeDeferredPrerequisite({}).deferred, true);
+    });
+
+    it('should redact URLs from the label', () => {
+        const result = normalizeDeferredPrerequisite({ satisfied: false, label: 'Missing state at http://localhost:3000/session' });
+        assert.equal(result.deferred, true);
+        assert.ok(!result.label.includes('http'));
+        assert.ok(result.label.includes('[redacted]'));
+    });
+
+    it('should redact file URLs from the label', () => {
+        const result = normalizeDeferredPrerequisite({ satisfied: false, label: 'State file:///home/user/.state.json missing' });
+        assert.equal(result.deferred, true);
+        assert.ok(!result.label.includes('file://'));
+    });
+
+    it('should redact filesystem paths from the label', () => {
+        const result = normalizeDeferredPrerequisite({ satisfied: false, label: 'No state at /var/lib/app/session.json' });
+        assert.equal(result.deferred, true);
+        assert.ok(!result.label.includes('/var/lib'));
+    });
+
+    it('should redact credential patterns from the label', () => {
+        const result = normalizeDeferredPrerequisite({ satisfied: false, label: 'token=abc123secret not valid' });
+        assert.equal(result.deferred, true);
+        assert.ok(!result.label.includes('abc123secret'));
+    });
+
+    it('should use fallback label when label is empty after redaction', () => {
+        const result = normalizeDeferredPrerequisite({ satisfied: false, label: 'http://only-a-url.com' });
+        assert.equal(result.deferred, true);
+        assert.equal(result.label, 'Prerequisite not met');
+    });
+
+    it('should use fallback label when label is not a string', () => {
+        const result = normalizeDeferredPrerequisite({ satisfied: false, label: 42 });
+        assert.equal(result.deferred, true);
+        assert.equal(result.label, 'Prerequisite not met');
     });
 });
 
