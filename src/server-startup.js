@@ -56,6 +56,7 @@ import { router as openParlorConversationRouter } from './openparlor/conversatio
 import { router as openParlorModelStatusRouter } from './openparlor/model-status-router.js';
 import { router as openParlorTtsRouter } from './openparlor/tts-router.js';
 import { router as openParlorSttRouter } from './openparlor/stt-router.js';
+import { router as openParlorMemoryRouter } from './openparlor/router.js';
 import { router as volcengineRouter } from './endpoints/volcengine.js';
 
 /**
@@ -197,6 +198,7 @@ export function setupPrivateEndpoints(app) {
     app.use('/api/openparlor/conversations', openParlorConversationRouter);
     app.use('/api/openparlor/tts', openParlorTtsRouter);
     app.use('/api/openparlor/stt', openParlorSttRouter);
+    app.use('/api/openparlor', openParlorMemoryRouter);
 }
 
 /**

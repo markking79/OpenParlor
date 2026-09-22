@@ -186,6 +186,54 @@ export function sanitizeCharacterInput(data) {
     return { name, avatarUrl, ttsVoice };
 }
 
+export function normalizeMemory(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    return {
+        id: typeof raw.id === 'string' ? raw.id : String(raw.id || ''),
+        characterId: raw.character_id != null ? String(raw.character_id) : '',
+        content: typeof raw.content === 'string' ? raw.content : '',
+        type: typeof raw.type === 'string' ? raw.type : 'fact',
+        importance: typeof raw.importance === 'number' && Number.isFinite(raw.importance)
+            ? Math.max(0, Math.min(1, raw.importance)) : 0.5,
+        pinned: raw.pinned === true,
+        sourceConversationId: raw.source_conversation_id != null ? String(raw.source_conversation_id) : '',
+        sourceConversationTitle: typeof raw.source_conversation_title === 'string' ? raw.source_conversation_title : '',
+        createdAt: typeof raw.created_at === 'string' ? raw.created_at : '',
+        updatedAt: typeof raw.updated_at === 'string' ? raw.updated_at : '',
+    };
+}
+
+export function normalizeMemorySource(memory, conversations) {
+    if (!memory) return { label: '', available: false };
+    if (!memory.sourceConversationId) return { label: 'No source', available: false };
+    const conv = (conversations || []).find(c => c.id === memory.sourceConversationId);
+    if (!conv) return { label: 'Source unavailable', available: false };
+    return { label: conv.title || 'Untitled', available: true };
+}
+
+export function validateMemoryForm(data) {
+    const errors = [];
+    if (!data || typeof data !== 'object') {
+        return { valid: false, errors: ['Invalid form data'] };
+    }
+    const content = typeof data.content === 'string' ? data.content.trim() : '';
+    if (!content) {
+        errors.push('Content is required');
+    } else if (content.length > 2000) {
+        errors.push('Content must be 2000 characters or fewer');
+    }
+    const type = typeof data.type === 'string' ? data.type : '';
+    const allowedTypes = ['fact', 'preference', 'event', 'relationship', 'other'];
+    if (!allowedTypes.includes(type)) {
+        errors.push('Invalid type');
+    }
+    const importance = typeof data.importance === 'number' ? data.importance : NaN;
+    if (isNaN(importance) || importance < 0 || importance > 1) {
+        errors.push('Importance must be between 0 and 1');
+    }
+    return { valid: errors.length === 0, errors, content, type, importance };
+}
+
 export function normalizeModelStatus(raw) {
     if (!raw || typeof raw !== 'object') {
         return { provider: '', model: '', endpointLabel: '', models: [], connected: false };
@@ -1170,6 +1218,288 @@ if (typeof document !== 'undefined') {
         }
     }
 
+    // ── Memory panel ───────────────────────────────────────────────────────
+
+    const memoryPanel = document.getElementById('memoryPanel');
+    let memories = [];
+    let editingMemoryId = null;
+
+    async function fetchMemories(characterId) {
+        if (!characterId) {
+            memories = [];
+            return;
+        }
+        try {
+            const res = await fetch('/api/openparlor/memories?character_id=' + encodeURIComponent(characterId));
+            if (!res.ok) throw new Error('Failed to load memories');
+            const data = await res.json();
+            memories = (Array.isArray(data) ? data : []).map(normalizeMemory).filter(Boolean);
+            memories.sort((a, b) => {
+                if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+                return b.importance - a.importance;
+            });
+        } catch {
+            memories = [];
+        }
+    }
+
+    async function updateMemoryApi(id, body) {
+        const token = await getCsrfToken();
+        const res = await fetch('/api/openparlor/memories/' + encodeURIComponent(id), {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': token },
+            body: JSON.stringify(body),
+        });
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.error || 'Failed to update memory');
+        }
+        return normalizeMemory(await res.json());
+    }
+
+    async function deleteMemoryApi(id) {
+        const token = await getCsrfToken();
+        const res = await fetch('/api/openparlor/memories/' + encodeURIComponent(id), {
+            method: 'DELETE',
+            headers: { 'X-CSRF-Token': token },
+        });
+        if (!res.ok && res.status !== 204) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.error || 'Failed to delete memory');
+        }
+    }
+
+    async function pinMemoryApi(id, pinned) {
+        const token = await getCsrfToken();
+        const res = await fetch('/api/openparlor/memories/' + encodeURIComponent(id) + '/pin', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': token },
+            body: JSON.stringify({ pinned }),
+        });
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.error || 'Failed to pin memory');
+        }
+        return normalizeMemory(await res.json());
+    }
+
+    function renderMemoryPanel() {
+        if (!memoryPanel) return;
+        memoryPanel.innerHTML = '';
+
+        if (!currentConversation) {
+            const el = document.createElement('div');
+            el.className = 'state-empty';
+            el.textContent = 'Select a conversation to view memories.';
+            memoryPanel.appendChild(el);
+            return;
+        }
+
+        const charId = currentConversation.characterId;
+        if (!charId) {
+            const el = document.createElement('div');
+            el.className = 'state-empty';
+            el.textContent = 'No character selected.';
+            memoryPanel.appendChild(el);
+            return;
+        }
+
+        if (memories.length === 0) {
+            const el = document.createElement('div');
+            el.className = 'state-empty';
+            el.textContent = 'No memories yet.';
+            memoryPanel.appendChild(el);
+            return;
+        }
+
+        for (const mem of memories) {
+            const row = document.createElement('div');
+            row.className = 'memory-row' + (mem.pinned ? ' pinned' : '');
+            row.dataset.id = mem.id;
+
+            if (editingMemoryId === mem.id) {
+                renderMemoryEditForm(row, mem);
+            } else {
+                renderMemoryDisplay(row, mem);
+            }
+
+            memoryPanel.appendChild(row);
+        }
+    }
+
+    function renderMemoryDisplay(row, mem) {
+        const source = normalizeMemorySource(mem, conversations);
+
+        const contentEl = document.createElement('div');
+        contentEl.className = 'memory-content';
+        contentEl.textContent = mem.content.length > 120 ? mem.content.slice(0, 120) + '…' : mem.content;
+
+        const metaEl = document.createElement('div');
+        metaEl.className = 'memory-meta';
+
+        const typeBadge = document.createElement('span');
+        typeBadge.className = 'memory-type memory-type-' + mem.type;
+        typeBadge.textContent = mem.type;
+
+        const importanceEl = document.createElement('span');
+        importanceEl.className = 'memory-importance';
+        importanceEl.textContent = '★'.repeat(Math.round(mem.importance * 4) + 1);
+
+        metaEl.append(typeBadge, importanceEl);
+
+        const sourceEl = document.createElement('div');
+        sourceEl.className = 'memory-source';
+        sourceEl.textContent = source.label;
+        if (!source.available) {
+            sourceEl.classList.add('memory-source-unavailable');
+        }
+
+        const actionsEl = document.createElement('div');
+        actionsEl.className = 'memory-actions';
+
+        const pinBtn = document.createElement('button');
+        pinBtn.className = 'memory-action-btn pin-btn' + (mem.pinned ? ' active' : '');
+        pinBtn.title = mem.pinned ? 'Unpin' : 'Pin';
+        pinBtn.textContent = mem.pinned ? '📌' : '📍';
+        pinBtn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            try {
+                const updated = await pinMemoryApi(mem.id, !mem.pinned);
+                const idx = memories.findIndex(m => m.id === mem.id);
+                if (idx !== -1) memories[idx] = updated;
+                memories.sort((a, b) => {
+                    if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+                    return b.importance - a.importance;
+                });
+                renderMemoryPanel();
+            } catch { /* silent */ }
+        });
+
+        const editBtn = document.createElement('button');
+        editBtn.className = 'memory-action-btn edit-btn';
+        editBtn.title = 'Edit';
+        editBtn.textContent = '✎';
+        editBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            editingMemoryId = mem.id;
+            renderMemoryPanel();
+        });
+
+        const delBtn = document.createElement('button');
+        delBtn.className = 'memory-action-btn delete-btn';
+        delBtn.title = 'Delete';
+        delBtn.textContent = '✕';
+        delBtn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            try {
+                await deleteMemoryApi(mem.id);
+                memories = memories.filter(m => m.id !== mem.id);
+                renderMemoryPanel();
+            } catch { /* silent */ }
+        });
+
+        actionsEl.append(pinBtn, editBtn, delBtn);
+        row.append(contentEl, metaEl, sourceEl, actionsEl);
+    }
+
+    function renderMemoryEditForm(row, mem) {
+        const form = document.createElement('div');
+        form.className = 'memory-edit-form';
+
+        const textarea = document.createElement('textarea');
+        textarea.className = 'memory-edit-content';
+        textarea.rows = 3;
+        textarea.maxLength = 2000;
+        textarea.value = mem.content;
+        textarea.placeholder = 'Memory content…';
+
+        const typeSelect = document.createElement('select');
+        typeSelect.className = 'memory-edit-type';
+        for (const t of ['fact', 'preference', 'event', 'relationship', 'other']) {
+            const opt = document.createElement('option');
+            opt.value = t;
+            opt.textContent = t;
+            typeSelect.appendChild(opt);
+        }
+        typeSelect.value = mem.type;
+
+        const importanceInput = document.createElement('input');
+        importanceInput.type = 'range';
+        importanceInput.className = 'memory-edit-importance';
+        importanceInput.min = '0';
+        importanceInput.max = '1';
+        importanceInput.step = '0.05';
+        importanceInput.value = String(mem.importance);
+
+        const importanceLabel = document.createElement('span');
+        importanceLabel.className = 'memory-importance-value';
+        importanceLabel.textContent = String(mem.importance);
+        importanceInput.addEventListener('input', () => {
+            importanceLabel.textContent = importanceInput.value;
+        });
+
+        const errorEl = document.createElement('div');
+        errorEl.className = 'memory-edit-error';
+        errorEl.hidden = true;
+
+        const actions = document.createElement('div');
+        actions.className = 'memory-edit-actions';
+
+        const saveBtn = document.createElement('button');
+        saveBtn.className = 'memory-edit-save';
+        saveBtn.textContent = 'Save';
+        saveBtn.addEventListener('click', async () => {
+            const validation = validateMemoryForm({
+                content: textarea.value,
+                type: typeSelect.value,
+                importance: Number(importanceInput.value),
+            });
+            if (!validation.valid) {
+                errorEl.textContent = validation.errors.join(' ');
+                errorEl.hidden = false;
+                return;
+            }
+            try {
+                saveBtn.disabled = true;
+                const updated = await updateMemoryApi(mem.id, {
+                    content: validation.content,
+                    type: validation.type,
+                    importance: validation.importance,
+                });
+                const idx = memories.findIndex(m => m.id === mem.id);
+                if (idx !== -1) memories[idx] = updated;
+                editingMemoryId = null;
+                renderMemoryPanel();
+            } catch (e) {
+                errorEl.textContent = e.message || 'Failed to save';
+                errorEl.hidden = false;
+            } finally {
+                saveBtn.disabled = false;
+            }
+        });
+
+        const cancelBtn = document.createElement('button');
+        cancelBtn.className = 'memory-edit-cancel';
+        cancelBtn.textContent = 'Cancel';
+        cancelBtn.addEventListener('click', () => {
+            editingMemoryId = null;
+            renderMemoryPanel();
+        });
+
+        actions.append(saveBtn, cancelBtn);
+        form.append(textarea, typeSelect, importanceInput, importanceLabel, errorEl, actions);
+        row.appendChild(form);
+    }
+
+    async function refreshMemoryPanel() {
+        if (!currentConversation) {
+            renderMemoryPanel();
+            return;
+        }
+        await fetchMemories(currentConversation.characterId);
+        renderMemoryPanel();
+    }
+
     // ── Actions ────────────────────────────────────────────────────────────
 
     async function handleCharacterFormSubmit() {
@@ -1215,6 +1545,7 @@ if (typeof document !== 'undefined') {
             renderConversations();
             renderMessages();
             updateChatHeader();
+            refreshMemoryPanel();
         } catch (e) {
             renderState(messagesEl, 'error', 'Failed to load conversation.');
         }
@@ -1236,6 +1567,7 @@ if (typeof document !== 'undefined') {
             renderConversations();
             renderMessages();
             updateChatHeader();
+            refreshMemoryPanel();
         } catch (e) {
             renderState(messagesEl, 'error', 'Failed to create conversation.');
         } finally {
