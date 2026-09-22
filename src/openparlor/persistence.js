@@ -20,6 +20,7 @@ import { sync as writeFileAtomicSync } from 'write-file-atomic';
  * @property {number} [temperature] Generation temperature 0–2
  * @property {number} [max_tokens] Maximum response tokens 1–8192
  * @property {boolean} [time_aware] Whether to include server-derived time context in prompts
+ * @property {boolean} [archived] Whether the character is archived (hidden from new chats; history preserved)
  * @property {string} owner_id User handle
  * @property {string} created_at ISO 8601
  * @property {string} updated_at ISO 8601
@@ -228,6 +229,7 @@ function normalizeCharacter(value) {
         ...(typeof character.temperature === 'number' && Number.isFinite(character.temperature) ? { temperature: character.temperature } : {}),
         ...(typeof character.max_tokens === 'number' && Number.isFinite(character.max_tokens) ? { max_tokens: character.max_tokens } : {}),
         ...(typeof character.time_aware === 'boolean' ? { time_aware: character.time_aware } : {}),
+        archived: character.archived === true,
         owner_id: character.owner_id,
         created_at: character.created_at,
         updated_at: character.updated_at,
@@ -261,6 +263,7 @@ export function createCharacter(directories, owner_id, data) {
         ...(typeof data.temperature === 'number' && Number.isFinite(data.temperature) ? { temperature: data.temperature } : {}),
         ...(typeof data.max_tokens === 'number' && Number.isFinite(data.max_tokens) ? { max_tokens: data.max_tokens } : {}),
         ...(typeof data.time_aware === 'boolean' ? { time_aware: data.time_aware } : {}),
+        archived: false,
         owner_id,
         created_at: now,
         updated_at: now,
@@ -279,17 +282,21 @@ export function getCharacter(directories, id) {
 }
 
 /**
+ * Lists characters for a user. Archived characters are
+ * excluded unless `options.includeArchived` is true.
  * @param {import('../users.js').UserDirectoryList} directories
  * @param {string} owner_id
+ * @param {{ includeArchived?: boolean }} [options]
  * @returns {Character[]}
  */
-export function listCharacters(directories, owner_id) {
+export function listCharacters(directories, owner_id, { includeArchived = false } = {}) {
     const dir = resolveWithinRoot(directories, 'characters');
     if (!fs.existsSync(dir)) return [];
     return fs.readdirSync(dir)
         .filter(f => f.endsWith('.json'))
         .map(f => normalizeCharacter(safeReadJSON(path.join(dir, f))))
-        .filter(c => c !== null && c.owner_id === owner_id);
+        .filter(c => c !== null && c.owner_id === owner_id)
+        .filter(c => includeArchived || !c.archived);
 }
 
 /**
@@ -325,6 +332,86 @@ export function deleteCharacter(directories, id) {
     if (!fs.existsSync(p)) return false;
     fs.unlinkSync(p);
     return true;
+}
+
+/**
+ * Archives a character (soft delete). The record is kept so conversations,
+ * participants, and memories remain resolvable; the character is hidden from
+ * normal new-chat selection.
+ * @param {import('../users.js').UserDirectoryList} directories
+ * @param {string} id
+ * @returns {Character|null}
+ */
+export function archiveCharacter(directories, id) {
+    return updateCharacter(directories, id, { archived: true });
+}
+
+/**
+ * Returns true when the character is still referenced by the owner's data:
+ * as the primary character of, or a participant in, any conversation
+ * (including archived conversations), or as the owner of, or a known-by
+ * character of, any memory. Used to decide whether deletion must become an
+ * archive so no dangling references remain.
+ * @param {import('../users.js').UserDirectoryList} directories
+ * @param {string} owner_id
+ * @param {string} character_id
+ * @returns {boolean}
+ */
+export function characterHasHistory(directories, owner_id, character_id) {
+    const convDir = resolveWithinRoot(directories, 'conversations');
+    if (fs.existsSync(convDir)) {
+        for (const file of fs.readdirSync(convDir).filter(f => f.endsWith('.json'))) {
+            const conversation = safeReadJSON(path.join(convDir, file));
+            if (!conversation || conversation.owner_id !== owner_id) continue;
+            if (conversation.character_id === character_id) return true;
+            const participants = Array.isArray(conversation.participants) ? conversation.participants : [];
+            if (participants.some(participant => participant && participant.character_id === character_id)) return true;
+        }
+    }
+    for (const memory of listMemories(directories, owner_id)) {
+        if (memory.character_id === character_id) return true;
+        if (memory.known_by_character_ids.includes(character_id)) return true;
+    }
+    return false;
+}
+
+/**
+ * Best-effort removal of a character's uploaded avatar file. Only removes
+ * files that OpenParlor itself uploaded (the `openparlor-avatar-<timestamp>`
+ * naming convention) inside the user's images directory, and only when no
+ * other character of the same owner references the same avatar. Returns true
+ * when a file was removed.
+ * @param {import('../users.js').UserDirectoryList} directories
+ * @param {Character} character
+ * @returns {boolean}
+ */
+export function removeCharacterAvatarFile(directories, character) {
+    const avatarUrl = character && typeof character.avatar_url === 'string' ? character.avatar_url : '';
+    if (avatarUrl === '' || !avatarUrl.startsWith('/')) return false;
+    const fileName = path.basename(avatarUrl);
+    if (!/^openparlor-avatar-\d+\.(png|jpe?g|webp|gif|bmp|jfif)$/i.test(fileName)) return false;
+    const imagesDir = typeof directories.userImages === 'string' && directories.userImages !== ''
+        ? path.resolve(directories.userImages)
+        : null;
+    if (imagesDir === null) return false;
+    const filePath = path.resolve(directories.root, '.' + avatarUrl);
+    if (!isWithinDirectory(imagesDir, filePath) || !fs.existsSync(filePath)) return false;
+    const shared = listCharacters(directories, character.owner_id, { includeArchived: true })
+        .some(c => c.id !== character.id && c.avatar_url === avatarUrl);
+    if (shared) return false;
+    fs.unlinkSync(filePath);
+    return true;
+}
+
+/**
+ * Checks that `child` resolves to a location inside `parent` (no traversal).
+ * @param {string} parent
+ * @param {string} child
+ * @returns {boolean}
+ */
+function isWithinDirectory(parent, child) {
+    const relative = path.relative(parent, child);
+    return relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative);
 }
 
 // ─── Conversation ────────────────────────────────────────────────────────────

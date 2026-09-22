@@ -587,6 +587,38 @@ button {
     background: #202226;
 }
 
+.character-card.archived {
+    opacity: 0.62;
+}
+
+.character-card.archived:hover {
+    opacity: 1;
+}
+
+.character-archived-badge {
+    flex-shrink: 0;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: #c8b98a;
+    background: #26221a;
+    border: 1px solid #3a3222;
+    border-radius: 999px;
+    padding: 2px 7px;
+}
+
+.character-notice {
+    margin: 4px 2px 6px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    border: 1px solid #33402f;
+    background: #1c241b;
+    color: #b5d3a8;
+    font-size: 12px;
+    line-height: 1.4;
+}
+
 .character-name {
     font-size: 14px;
     font-weight: 580;

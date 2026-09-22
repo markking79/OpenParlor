@@ -51,6 +51,7 @@ export function normalizeCharacter(raw) {
         name: typeof raw.name === 'string' ? raw.name : 'Unknown',
         avatarUrl: typeof raw.avatar_url === 'string' ? raw.avatar_url : '',
         ttsVoice: typeof raw.tts_voice === 'string' ? raw.tts_voice : '',
+        archived: raw.archived === true,
     };
 }
 
@@ -1132,6 +1133,7 @@ if (typeof document !== 'undefined') {
     const voiceModeButton = document.getElementById('voiceModeButton');
 
     let characters = [];
+    let allCharacters = [];
     let conversations = [];
     let currentConversation = null;
     let currentMessages = [];
@@ -1251,7 +1253,7 @@ if (typeof document !== 'undefined') {
         }
 
         for (const conv of conversations) {
-            const char = characters.find(c => c.id === conv.characterId);
+            const char = findCharacter(conv.characterId);
             const item = document.createElement('div');
             item.className = 'conversation' + (currentConversation && currentConversation.id === conv.id ? ' active' : '');
             item.dataset.id = conv.id;
@@ -1279,17 +1281,18 @@ if (typeof document !== 'undefined') {
         characterList.innerHTML = '';
         characterSelect.innerHTML = '<option value="">Select a character…</option>';
 
-        if (characters.length === 0) {
+        if (allCharacters.length === 0) {
             renderState(characterList, 'empty', 'No characters found.');
             newChatButton.disabled = true;
             characterSelect.disabled = true;
             return;
         }
 
-        for (const char of characters) {
-            // Sidebar card
+        for (const char of allCharacters) {
+            // Sidebar card (archived characters remain visible to their owner
+            // but are dimmed and badged)
             const card = document.createElement('div');
-            card.className = 'character-card';
+            card.className = 'character-card' + (char.archived ? ' archived' : '');
             card.dataset.id = char.id;
 
             const avatar = document.createElement('div');
@@ -1311,14 +1314,21 @@ if (typeof document !== 'undefined') {
             nameEl.textContent = char.name;
             info.appendChild(nameEl);
 
+            if (char.archived) {
+                const badge = document.createElement('span');
+                badge.className = 'character-archived-badge';
+                badge.textContent = 'Archived';
+                info.appendChild(badge);
+            }
+
             card.append(avatar, info);
             card.addEventListener('click', () => showCharacterForm(char));
 
             const deleteButton = document.createElement('button');
             deleteButton.className = 'character-delete-btn';
             deleteButton.type = 'button';
-            deleteButton.title = 'Delete character';
-            deleteButton.setAttribute('aria-label', `Delete ${char.name}`);
+            deleteButton.title = char.archived ? 'Delete archived character' : 'Delete character';
+            deleteButton.setAttribute('aria-label', `${char.archived ? 'Delete archived character ' : 'Delete '}${char.name}`);
             deleteButton.textContent = '✕';
             deleteButton.addEventListener('click', event => {
                 event.stopPropagation();
@@ -1327,15 +1337,24 @@ if (typeof document !== 'undefined') {
             card.appendChild(deleteButton);
             characterList.appendChild(card);
 
-            // Select option
-            const opt = document.createElement('option');
-            opt.value = char.id;
-            opt.textContent = char.name;
-            characterSelect.appendChild(opt);
+            // Select option — active characters only (normal new-chat selection)
+            if (!char.archived) {
+                const opt = document.createElement('option');
+                opt.value = char.id;
+                opt.textContent = char.name;
+                characterSelect.appendChild(opt);
+            }
         }
 
         // Make the primary action usable immediately when characters exist.
         // Preserve an explicit selection when re-rendering after edits.
+        if (characters.length === 0) {
+            // Only archived characters exist: nothing is selectable for a new chat.
+            characterSelect.value = '';
+            characterSelect.disabled = true;
+            newChatButton.disabled = true;
+            return;
+        }
         characterSelect.value = characters.some(char => char.id === selectedCharacterId)
             ? selectedCharacterId
             : characters[0].id;
@@ -1401,7 +1420,7 @@ if (typeof document !== 'undefined') {
             messageEl.className = 'message' + (isUser ? ' user-message' : '');
 
             const msgCharId = !isUser && msg.character_id ? msg.character_id : currentConversation.characterId;
-            const char = characters.find(c => c.id === msgCharId);
+            const char = findCharacter(msgCharId);
             const charName = char ? char.name : 'Assistant';
 
             if (!isUser) {
@@ -1510,7 +1529,7 @@ if (typeof document !== 'undefined') {
             renderParticipants();
             return;
         }
-        const char = characters.find(c => c.id === currentConversation.characterId);
+        const char = findCharacter(currentConversation.characterId);
         chatTitle.textContent = currentConversation.title;
         chatSubtitle.textContent = char ? char.name : '';
         messageInput.disabled = false;
@@ -1542,7 +1561,7 @@ if (typeof document !== 'undefined') {
 
         const participants = currentConversation.participants || [];
         for (const p of participants) {
-            const char = characters.find(c => c.id === p.characterId);
+            const char = findCharacter(p.characterId);
             const chip = document.createElement('span');
             chip.className = 'participant-chip';
             chip.textContent = char ? char.name : p.characterId;
@@ -1738,10 +1757,20 @@ if (typeof document !== 'undefined') {
     }
 
     async function fetchCharacters() {
-        const res = await fetch('/api/openparlor/characters');
+        const res = await fetch('/api/openparlor/characters?include_archived=true');
         if (!res.ok) throw new Error('Failed to load characters');
         const data = await res.json();
-        characters = (Array.isArray(data) ? data : []).map(normalizeCharacter).filter(Boolean);
+        allCharacters = (Array.isArray(data) ? data : []).map(normalizeCharacter).filter(Boolean);
+        // Archived characters stay resolvable for history but are hidden from
+        // normal new-chat selection.
+        characters = allCharacters.filter(c => !c.archived);
+    }
+
+    // Resolves a character by id across active and archived characters, so
+    // historical conversations and memories of archived characters keep
+    // rendering names and avatars.
+    function findCharacter(id) {
+        return allCharacters.find(c => c.id === id);
     }
 
     async function fetchConversations() {
@@ -1867,6 +1896,32 @@ if (typeof document !== 'undefined') {
             const err = await res.json().catch(() => ({}));
             throw new Error(normalizeServiceError(err, 'Failed to delete character'));
         }
+        // 204 → hard delete. 200 + JSON → character was archived (still referenced).
+        if (res.status === 204) return { deleted: true, archived: false, character: null };
+        const data = await res.json().catch(() => ({}));
+        return {
+            deleted: false,
+            archived: data.archived === true,
+            character: data.character ? normalizeCharacter(data.character) : null,
+        };
+    }
+
+    let characterNoticeTimer = null;
+    function showCharacterNotice(text) {
+        const existing = characterList.querySelector('.character-notice');
+        if (existing) existing.remove();
+        if (characterNoticeTimer) {
+            clearTimeout(characterNoticeTimer);
+            characterNoticeTimer = null;
+        }
+        const notice = document.createElement('div');
+        notice.className = 'character-notice';
+        notice.textContent = text;
+        characterList.prepend(notice);
+        characterNoticeTimer = setTimeout(() => {
+            notice.remove();
+            characterNoticeTimer = null;
+        }, 6000);
     }
 
     async function fetchTtsVoices() {
@@ -2198,21 +2253,41 @@ if (typeof document !== 'undefined') {
         }
     }
 
+    function characterHasLocalHistory(characterId) {
+        return conversations.some(conv => conv.characterId === characterId
+            || (conv.participants || []).some(p => p.characterId === characterId));
+    }
+
     async function handleDeleteCharacter(character) {
-        if (!window.confirm(`Delete ${character.name}? This cannot be undone.`)) return;
+        // The server is authoritative: referenced characters are archived
+        // (200 + JSON), unreferenced ones are hard-deleted (204). The local
+        // history check only tunes the confirmation wording.
+        const hasHistory = characterHasLocalHistory(character.id);
+        const message = hasHistory
+            ? `${character.name} has conversations. Deleting it will archive the character: it will be hidden from new chats, but existing conversations and memories stay intact. Continue?`
+            : `Delete ${character.name}? This cannot be undone.`;
+        if (!window.confirm(message)) return;
         try {
-            await deleteCharacter(character.id);
-            characters = characters.filter(item => item.id !== character.id);
+            const result = await deleteCharacter(character.id);
             if (editingCharacterId === character.id) hideCharacterForm();
-            if (currentConversation && currentConversation.characterId === character.id) {
-                currentConversation = null;
-                currentMessages = [];
-                renderMessages();
-                updateChatHeader();
-                refreshMemoryPanel();
+            if (result.archived && result.character) {
+                // Character was archived: keep it resolvable for history.
+                const idx = allCharacters.findIndex(item => item.id === character.id);
+                if (idx !== -1) allCharacters[idx] = result.character;
+                characters = allCharacters.filter(item => !item.archived);
+                renderCharacters();
+                renderConversations();
+                showCharacterNotice(`${result.character.name} was archived — its conversations and memories are preserved.`);
+                return;
             }
-            renderCharacters();
-            renderConversations();
+            if (result.deleted) {
+                allCharacters = allCharacters.filter(item => item.id !== character.id);
+                characters = characters.filter(item => item.id !== character.id);
+                // A hard delete only happens for unreferenced characters, so no
+                // open conversation can reference this id anymore.
+                renderCharacters();
+                renderConversations();
+            }
         } catch (e) {
             showFormError(e.message || 'Failed to delete character');
             characterForm.hidden = false;
@@ -2386,7 +2461,7 @@ if (typeof document !== 'undefined') {
                 for (const msg of turnMessages) {
                     if (!msg.content) continue;
                     const charId = msg.character_id || currentConversation.characterId;
-                    const char = characters.find(c => c.id === charId);
+                    const char = findCharacter(charId);
                     const voice = char ? char.ttsVoice : '';
                     if (voice) {
                         groupQueue.enqueue(msg.content, voice);

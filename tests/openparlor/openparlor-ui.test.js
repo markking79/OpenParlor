@@ -139,7 +139,14 @@ describe('normalizeCharacter', () => {
             name: 'Emma',
             avatarUrl: '/avatars/emma.png',
             ttsVoice: 'af_heart',
+            archived: false,
         });
+    });
+
+    test('maps archived characters and defaults archived to false', () => {
+        assert.equal(normalizeCharacter({ id: 'c2', name: 'Old', archived: true }).archived, true);
+        assert.equal(normalizeCharacter({ id: 'c3', name: 'New' }).archived, false);
+        assert.equal(normalizeCharacter({ id: 'c4', name: 'Weird', archived: 'true' }).archived, false);
     });
 
     test('provides defaults for missing fields', () => {
@@ -148,6 +155,7 @@ describe('normalizeCharacter', () => {
         assert.equal(result.name, 'Unknown');
         assert.equal(result.avatarUrl, '');
         assert.equal(result.ttsVoice, '');
+        assert.equal(result.archived, false);
     });
 });
 
