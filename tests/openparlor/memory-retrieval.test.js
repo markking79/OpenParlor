@@ -69,6 +69,68 @@ test('respects visibility isolation via known_by_character_ids', () => {
     }
 });
 
+test('memory with multiple known_by_character_ids is visible to each listed character but not to absent character', () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        persistence.createMemory(dirs, 'alice', {
+            character_id: 'emma',
+            content: 'the user codename for the project is phoenix',
+            type: 'fact',
+            importance: 0.9,
+            known_by_character_ids: ['emma', 'rachel'],
+        });
+
+        // Emma can retrieve it
+        const emmaResult = retrieveMemories(dirs, 'alice', 'emma', 'project codename');
+        assert.equal(emmaResult.length, 1);
+        assert.ok(emmaResult[0].includes('phoenix'));
+
+        // Rachel can retrieve it
+        const rachelResult = retrieveMemories(dirs, 'alice', 'rachel', 'project codename');
+        assert.equal(rachelResult.length, 1);
+        assert.ok(rachelResult[0].includes('phoenix'));
+
+        // Sarah CANNOT retrieve it
+        const sarahResult = retrieveMemories(dirs, 'alice', 'sarah', 'project codename');
+        assert.deepEqual(sarahResult, []);
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('visibility isolation holds across separate retrieval calls simulating fresh conversations', () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        persistence.createMemory(dirs, 'alice', {
+            character_id: 'emma',
+            content: 'the user plans to travel to tokyo in march',
+            type: 'fact',
+            importance: 0.7,
+            known_by_character_ids: ['emma', 'rachel'],
+        });
+
+        // Fresh retrieval for Sarah (simulating a new one-on-one conversation)
+        const sarahResult = retrieveMemories(dirs, 'alice', 'sarah', 'travel tokyo march');
+        assert.deepEqual(sarahResult, []);
+
+        // Fresh retrieval for Rachel (simulating a new one-on-one conversation)
+        const rachelResult = retrieveMemories(dirs, 'alice', 'rachel', 'travel tokyo march');
+        assert.equal(rachelResult.length, 1);
+        assert.ok(rachelResult[0].includes('tokyo'));
+
+        // Fresh retrieval for Emma
+        const emmaResult = retrieveMemories(dirs, 'alice', 'emma', 'travel tokyo march');
+        assert.equal(emmaResult.length, 1);
+        assert.ok(emmaResult[0].includes('tokyo'));
+    } finally {
+        tmp.cleanup();
+    }
+});
+
 test('excludes inactive memories', () => {
     const tmp = makeTempDirs();
     try {

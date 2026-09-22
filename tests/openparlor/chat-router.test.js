@@ -423,6 +423,7 @@ test('requires an authenticated user with directories', async () => {
         await withChatServer({
             loadConfig: async () => configuredConfig,
             createProvider: () => mock.provider,
+            runMemoryExtraction: async () => [],
         }, user, async baseUrl => {
             const result = await postChat(baseUrl, { messages: [{ role: 'user', content: 'hello' }] });
             assert.equal(result.status, 401);
@@ -973,6 +974,73 @@ test('does not inject memories from other characters', async () => {
 
         const sentMessages = mock.calls[0];
         assert.ok(!sentMessages[0].content.includes('secret only bob knows'));
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('memory shared between Emma and Rachel is injected in their fresh conversations but not in Sarah\'s', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const emma = persistence.createCharacter(dirs, 'alice', { name: 'Emma', system_prompt: 'You are Emma.' });
+        const rachel = persistence.createCharacter(dirs, 'alice', { name: 'Rachel', system_prompt: 'You are Rachel.' });
+        const sarah = persistence.createCharacter(dirs, 'alice', { name: 'Sarah', system_prompt: 'You are Sarah.' });
+
+        // Memory known by Emma and Rachel, but NOT Sarah
+        persistence.createMemory(dirs, 'alice', {
+            character_id: emma.id,
+            content: 'the user codename for the project is phoenix',
+            type: 'fact',
+            importance: 0.9,
+            known_by_character_ids: [emma.id, rachel.id],
+        });
+
+        // Fresh one-on-one conversations
+        const emmaConv = persistence.createConversation(dirs, 'alice', emma.id, 'Emma Chat');
+        const rachelConv = persistence.createConversation(dirs, 'alice', rachel.id, 'Rachel Chat');
+        const sarahConv = persistence.createConversation(dirs, 'alice', sarah.id, 'Sarah Chat');
+
+        const mock = mockProvider(() => completion);
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+            runMemoryExtraction: async () => [],
+        }, user, async baseUrl => {
+            const emmaResult = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'what is the project codename' }],
+                conversation_id: emmaConv.id,
+            });
+            assert.equal(emmaResult.status, 200);
+
+            const rachelResult = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'what is the project codename' }],
+                conversation_id: rachelConv.id,
+            });
+            assert.equal(rachelResult.status, 200);
+
+            const sarahResult = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'what is the project codename' }],
+                conversation_id: sarahConv.id,
+            });
+            assert.equal(sarahResult.status, 200);
+        });
+
+        // Emma's system prompt includes the shared memory
+        const emmaPrompt = mock.calls[0][0].content;
+        assert.ok(emmaPrompt.includes('phoenix'), 'Emma should see the shared memory');
+
+        // Rachel's system prompt includes the shared memory
+        const rachelPrompt = mock.calls[1][0].content;
+        assert.ok(rachelPrompt.includes('phoenix'), 'Rachel should see the shared memory');
+
+        // Sarah's system prompt does NOT include the shared memory
+        const sarahPrompt = mock.calls[2][0].content;
+        assert.ok(!sarahPrompt.includes('phoenix'), 'Sarah must NOT see the shared memory');
+        assert.ok(!sarahPrompt.includes('codename'), 'Sarah must NOT see the shared memory content');
     } finally {
         tmp.cleanup();
     }
