@@ -104,7 +104,7 @@ test('create: rejects missing or invalid fields', async () => {
     try {
         const dirs = { root: tmp.root };
         persistence.ensureOpenParlorDirs(dirs);
-        const char = persistence.createCharacter(dirs, 'alice', { name: 'C' });
+        persistence.createCharacter(dirs, 'alice', { name: 'C' });
         const user = { profile: { handle: 'alice' }, directories: dirs };
 
         await withConversationServer(user, async baseUrl => {
@@ -599,6 +599,159 @@ test('rejects path traversal in conversation ID', async () => {
         await withConversationServer(user, async baseUrl => {
             const result = await request(baseUrl, 'GET', '/..%2F..%2Fetc%2Fpasswd');
             assert.equal(result.status, 400);
+        });
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+// ─── PUT /:id (legacy verb, shared with PATCH) ──────────────────────────────
+
+test('PUT /:id renames a conversation (legacy verb, same validation as PATCH)', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'C' });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'Old');
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withConversationServer(user, async baseUrl => {
+            const result = await request(baseUrl, 'PUT', `/${conv.id}`, { title: 'PUT Title' });
+            assert.equal(result.status, 200);
+            assert.equal(result.body.title, 'PUT Title');
+            assert.equal(result.body.id, conv.id);
+        });
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('PUT /:id rejects an empty body with 400', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'C' });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'T');
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withConversationServer(user, async baseUrl => {
+            const result = await request(baseUrl, 'PUT', `/${conv.id}`, {});
+            assert.equal(result.status, 400);
+        });
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+// ─── Messages ────────────────────────────────────────────────────────────────
+
+test('POST /:id/messages appends a message and GET /:id/messages returns it', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'C' });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'T');
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withConversationServer(user, async baseUrl => {
+            const posted = await request(baseUrl, 'POST', `/${conv.id}/messages`, {
+                participant_id: char.id,
+                content: 'Hello there',
+                role: 'user',
+            });
+            assert.equal(posted.status, 201);
+            assert.equal(posted.body.content, 'Hello there');
+            assert.equal(posted.body.role, 'user');
+            assert.equal(posted.body.conversation_id, conv.id);
+
+            const listed = await request(baseUrl, 'GET', `/${conv.id}/messages`);
+            assert.equal(listed.status, 200);
+            assert.equal(listed.body.length, 1);
+            assert.equal(listed.body[0].content, 'Hello there');
+        });
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('POST /:id/messages rejects missing content with 400', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'C' });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'T');
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withConversationServer(user, async baseUrl => {
+            const result = await request(baseUrl, 'POST', `/${conv.id}/messages`, {
+                participant_id: char.id,
+                role: 'user',
+            });
+            assert.equal(result.status, 400);
+        });
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('POST /:id/messages rejects an invalid role with 400', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'C' });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'T');
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withConversationServer(user, async baseUrl => {
+            const result = await request(baseUrl, 'POST', `/${conv.id}/messages`, {
+                participant_id: char.id,
+                content: 'x',
+                role: 'admin',
+            });
+            assert.equal(result.status, 400);
+        });
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('POST /:id/messages returns 404 for a missing conversation', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withConversationServer(user, async baseUrl => {
+            const result = await request(baseUrl, 'POST', '/nonexistent/messages', {
+                participant_id: 'p',
+                content: 'x',
+                role: 'user',
+            });
+            assert.equal(result.status, 404);
+        });
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('GET /:id/messages returns 403 for a non-owner', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'C' });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'T');
+        const bob = { profile: { handle: 'bob' }, directories: dirs };
+
+        await withConversationServer(bob, async baseUrl => {
+            const result = await request(baseUrl, 'GET', `/${conv.id}/messages`);
+            assert.equal(result.status, 403);
         });
     } finally {
         tmp.cleanup();

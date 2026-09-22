@@ -225,6 +225,102 @@ describe('OpenParlor Character Router', () => {
             assert.equal(body.id, created.id);
         });
 
+        it('updates a character via PUT (legacy verb, same validation)', async () => {
+            const created = await (await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'Original' }),
+            })).json();
+
+            const res = await fetch(`${baseUrl}/api/openparlor/characters/${created.id}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'PUT-updated', temperature: 0.7 }),
+            });
+            assert.equal(res.status, 200);
+            const body = await res.json();
+            assert.equal(body.name, 'PUT-updated');
+            assert.equal(body.temperature, 0.7);
+            assert.equal(body.id, created.id);
+        });
+
+        it('applies field validation to PUT (rejects an unsupported field)', async () => {
+            const created = await (await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'Guarded' }),
+            })).json();
+
+            // The legacy monolith PUT had no validation and would have stored
+            // arbitrary fields. The canonical router must reject them.
+            const res = await fetch(`${baseUrl}/api/openparlor/characters/${created.id}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'ok', owner_id: 'hacker', evil: true }),
+            });
+            assert.equal(res.status, 400);
+        });
+
+        it('applies length validation to PUT (rejects an oversized name)', async () => {
+            const created = await (await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'Guarded' }),
+            })).json();
+
+            const res = await fetch(`${baseUrl}/api/openparlor/characters/${created.id}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'x'.repeat(20_001) }),
+            });
+            assert.equal(res.status, 400);
+        });
+
+        it('rejects an empty PUT body', async () => {
+            const created = await (await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'Guarded' }),
+            })).json();
+
+            const res = await fetch(`${baseUrl}/api/openparlor/characters/${created.id}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({}),
+            });
+            assert.equal(res.status, 400);
+        });
+
+        it('returns 404 for PUT on a non-existent character', async () => {
+            const res = await fetch(`${baseUrl}/api/openparlor/characters/nonexistent`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'nope' }),
+            });
+            assert.equal(res.status, 404);
+        });
+
+        it('returns 403 for PUT on a non-owned character', async () => {
+            const created = await (await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'Alice Secret' }),
+            })).json();
+
+            const bobApp = createTestApp(persistence, makeUser('bob'));
+            const { server: bobServer, baseUrl: bobUrl } = await startServer(bobApp);
+            try {
+                const res = await fetch(`${bobUrl}/api/openparlor/characters/${created.id}`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: 'hacked' }),
+                });
+                assert.equal(res.status, 403);
+            } finally {
+                await stopServer(bobServer);
+            }
+        });
+
         it('deletes a character', async () => {
             const created = await (await fetch(`${baseUrl}/api/openparlor/characters`, {
                 method: 'POST',

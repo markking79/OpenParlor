@@ -166,7 +166,7 @@ export function createOpenParlorCharacterRouter({ persistence: persistenceModule
         return character ? response.json(character) : undefined;
     });
 
-    router.patch('/:id', async (request, response) => {
+    async function updateCharacterHandler(request, response) {
         const auth = withAuth(request, response);
         if (!auth) return;
         if (!getOwnedCharacter(request, response, auth)) return;
@@ -180,7 +180,13 @@ export function createOpenParlorCharacterRouter({ persistence: persistenceModule
             }
         }
         return response.json(persistenceModule.updateCharacter(auth.directories, request.params.id, validated.value));
-    });
+    }
+
+    // PUT /:id and PATCH /:id share the same canonical, validated update path.
+    // (PUT is preserved for backwards compatibility with the legacy monolith
+    // route, which previously applied no field validation.)
+    router.put('/:id', updateCharacterHandler);
+    router.patch('/:id', updateCharacterHandler);
 
     router.delete('/:id', (request, response) => {
         const auth = withAuth(request, response);
