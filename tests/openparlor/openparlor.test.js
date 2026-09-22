@@ -7,6 +7,7 @@ import {
     normalizeParticipants,
     normalizeConversation,
     createGroupPlaybackQueue,
+    normalizeSettings,
 } from '../../public/openparlor/openparlor.js';
 
 describe('normalizeMemory', () => {
@@ -263,6 +264,133 @@ describe('validateMemoryForm', () => {
     it('should handle non-object input', () => {
         const result = validateMemoryForm('string');
         assert.equal(result.valid, false);
+    });
+});
+
+describe('normalizeSettings', () => {
+    it('should normalize valid settings with all sections', () => {
+        const raw = {
+            model: { provider: 'openai', model: 'gpt-4', connected: true },
+            speech: { voicesAvailable: true, voiceModeEnabled: false },
+            character: { defaultCharacterId: 'char-1', count: 3 },
+        };
+        const result = normalizeSettings(raw);
+        assert.deepEqual(result.model, { provider: 'openai', model: 'gpt-4', connected: true });
+        assert.deepEqual(result.speech, { voicesAvailable: true, voiceModeEnabled: false });
+        assert.deepEqual(result.character, { defaultCharacterId: 'char-1', count: 3 });
+    });
+
+    it('should return null sections for null input', () => {
+        const result = normalizeSettings(null);
+        assert.equal(result.model, null);
+        assert.equal(result.speech, null);
+        assert.equal(result.character, null);
+    });
+
+    it('should return null sections for non-object input', () => {
+        const result = normalizeSettings('string');
+        assert.equal(result.model, null);
+        assert.equal(result.speech, null);
+        assert.equal(result.character, null);
+    });
+
+    it('should handle missing sections gracefully', () => {
+        const result = normalizeSettings({});
+        assert.equal(result.model, null);
+        assert.equal(result.speech, null);
+        assert.equal(result.character, null);
+    });
+
+    it('should not leak endpoint URLs', () => {
+        const raw = {
+            model: {
+                provider: 'openai',
+                model: 'gpt-4',
+                connected: true,
+                endpoint: 'https://api.openai.com/v1',
+                base_url: 'http://localhost:8080',
+            },
+        };
+        const result = normalizeSettings(raw);
+        assert.equal(result.model.endpoint, undefined);
+        assert.equal(result.model.base_url, undefined);
+        assert.equal(result.model.provider, 'openai');
+    });
+
+    it('should not leak credentials or API keys', () => {
+        const raw = {
+            model: {
+                provider: 'openai',
+                model: 'gpt-4',
+                connected: true,
+                api_key: 'sk-secret-123',
+                credentials: { token: 'abc' },
+                provider_config: { api_key: 'sk-other' },
+            },
+            speech: {
+                voicesAvailable: true,
+                voiceModeEnabled: false,
+                stt_api_key: 'stt-secret',
+            },
+        };
+        const result = normalizeSettings(raw);
+        assert.equal(result.model.api_key, undefined);
+        assert.equal(result.model.credentials, undefined);
+        assert.equal(result.model.provider_config, undefined);
+        assert.equal(result.speech.stt_api_key, undefined);
+    });
+
+    it('should not leak filesystem paths', () => {
+        const raw = {
+            model: {
+                provider: 'local',
+                model: 'llama',
+                connected: true,
+                file_path: '/models/llama-7b.gguf',
+                model_path: '/opt/models/llama',
+            },
+            character: {
+                defaultCharacterId: 'char-1',
+                count: 2,
+                avatar_dir: '/var/avatars',
+            },
+        };
+        const result = normalizeSettings(raw);
+        assert.equal(result.model.file_path, undefined);
+        assert.equal(result.model.model_path, undefined);
+        assert.equal(result.character.avatar_dir, undefined);
+    });
+
+    it('should default model fields to safe values when types are wrong', () => {
+        const result = normalizeSettings({
+            model: { provider: 42, model: null, connected: 'yes' },
+        });
+        assert.deepEqual(result.model, { provider: '', model: '', connected: false });
+    });
+
+    it('should default speech fields to false when types are wrong', () => {
+        const result = normalizeSettings({
+            speech: { voicesAvailable: 'yes', voiceModeEnabled: 1 },
+        });
+        assert.deepEqual(result.speech, { voicesAvailable: false, voiceModeEnabled: false });
+    });
+
+    it('should clamp character count to non-negative integer', () => {
+        assert.equal(normalizeSettings({ character: { count: -5 } }).character.count, 0);
+        assert.equal(normalizeSettings({ character: { count: 3.7 } }).character.count, 3);
+        assert.equal(normalizeSettings({ character: { count: 'ten' } }).character.count, 0);
+        assert.equal(normalizeSettings({ character: { count: Infinity } }).character.count, 0);
+    });
+
+    it('should handle non-object section values as null', () => {
+        const result = normalizeSettings({
+            model: 'not-an-object',
+            speech: 42,
+            character: null,
+        });
+        assert.equal(result.model, null);
+        assert.equal(result.speech, null);
+        assert.equal(result.character, null);
     });
 });
 

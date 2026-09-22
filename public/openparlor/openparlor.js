@@ -248,6 +248,42 @@ export function validateMemoryForm(data) {
     return { valid: errors.length === 0, errors, content, type, importance };
 }
 
+/**
+ * Normalizes server-owned settings into a safe, browser-displayable shape.
+ * Only exposes status-level information (model, speech, character preference).
+ * Strips any endpoint URLs, credentials, API keys, or filesystem paths.
+ * @param {object|null} raw
+ * @returns {{
+ *   model: { provider: string, model: string, connected: boolean } | null,
+ *   speech: { voicesAvailable: boolean, voiceModeEnabled: boolean } | null,
+ *   character: { defaultCharacterId: string, count: number } | null,
+ * }}
+ */
+export function normalizeSettings(raw) {
+    if (!raw || typeof raw !== 'object') {
+        return { model: null, speech: null, character: null };
+    }
+
+    const model = (raw.model && typeof raw.model === 'object') ? {
+        provider: typeof raw.model.provider === 'string' ? raw.model.provider : '',
+        model: typeof raw.model.model === 'string' ? raw.model.model : '',
+        connected: raw.model.connected === true,
+    } : null;
+
+    const speech = (raw.speech && typeof raw.speech === 'object') ? {
+        voicesAvailable: raw.speech.voicesAvailable === true,
+        voiceModeEnabled: raw.speech.voiceModeEnabled === true,
+    } : null;
+
+    const character = (raw.character && typeof raw.character === 'object') ? {
+        defaultCharacterId: typeof raw.character.defaultCharacterId === 'string' ? raw.character.defaultCharacterId : '',
+        count: (typeof raw.character.count === 'number' && Number.isFinite(raw.character.count) && raw.character.count >= 0)
+            ? Math.floor(raw.character.count) : 0,
+    } : null;
+
+    return { model, speech, character };
+}
+
 export function normalizeModelStatus(raw) {
     if (!raw || typeof raw !== 'object') {
         return { provider: '', model: '', endpointLabel: '', models: [], connected: false };
