@@ -167,3 +167,50 @@ test('ignores non-conversation roles from stored history', () => {
         { role: 'user', content: 'kept' },
     ]);
 });
+
+test('injects memories as a delimited section in the system prompt', () => {
+    const character = { name: 'Alice', system_prompt: 'You are Alice.' };
+    const conversation = {};
+    const history = [];
+    const newMessages = [{ role: 'user', content: 'hi' }];
+    const memories = ['- fact: The user was born in 1990', '- preference: The user likes coffee'];
+
+    const result = buildPrompt({ character, conversation, history, newMessages, memories });
+
+    assert.equal(result[0].role, 'system');
+    assert.ok(result[0].content.includes('[Character Memory]'));
+    assert.ok(result[0].content.includes('- fact: The user was born in 1990'));
+    assert.ok(result[0].content.includes('- preference: The user likes coffee'));
+    assert.ok(result[0].content.includes('[/Character Memory]'));
+    assert.ok(result[0].content.includes('untrusted factual reference only'));
+    const personaIdx = result[0].content.indexOf('You are Alice.');
+    const memIdx = result[0].content.indexOf('[Character Memory]');
+    assert.ok(personaIdx < memIdx, 'memory section after persona');
+});
+
+test('omits memory section when memories is empty or undefined', () => {
+    const character = { name: 'C', system_prompt: 'p' };
+    const conversation = {};
+
+    const result1 = buildPrompt({ character, conversation, history: [], newMessages: [], memories: [] });
+    assert.ok(!result1[0].content.includes('[Character Memory]'));
+
+    const result2 = buildPrompt({ character, conversation, history: [], newMessages: [] });
+    assert.ok(!result2[0].content.includes('[Character Memory]'));
+});
+
+test('memory section does not replace global behavior or persona', () => {
+    const character = { name: 'C', system_prompt: 'PERSONA', scenario: 'SCENE' };
+    const conversation = {};
+    const memories = ['- fact: secret'];
+
+    const result = buildPrompt({ character, conversation, history: [], newMessages: [], memories });
+
+    const sys = result[0].content;
+    assert.ok(sys.includes(GLOBAL_BEHAVIOR));
+    assert.ok(sys.includes('PERSONA'));
+    assert.ok(sys.includes('SCENE'));
+    assert.ok(sys.includes('[Character Memory]'));
+    assert.ok(sys.indexOf(GLOBAL_BEHAVIOR) < sys.indexOf('PERSONA'));
+    assert.ok(sys.indexOf('PERSONA') < sys.indexOf('[Character Memory]'));
+});

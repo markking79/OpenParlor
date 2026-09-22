@@ -4,6 +4,7 @@ import { loadOpenParlorConfig } from './config.js';
 import { createModelProvider, ModelProviderError } from './model-provider.js';
 import * as persistence from './persistence.js';
 import { buildPrompt } from './prompt-builder.js';
+import { retrieveMemories } from './memory-retrieval.js';
 import { extractAndPersistMemories } from './memory-extractor.js';
 
 /**
@@ -138,9 +139,12 @@ export function createOpenParlorChatRouter({
             }
 
             const history = persistence.getMessages(user.directories, conversationId);
-            modelMessages = buildPrompt({ character, conversation, history, newMessages: safeMessages });
-
             const lastUserMsg = [...safeMessages].reverse().find(m => m.role === 'user');
+            const memoryLines = lastUserMsg
+                ? retrieveMemories(user.directories, handle, character.id, lastUserMsg.content)
+                : [];
+            modelMessages = buildPrompt({ character, conversation, history, newMessages: safeMessages, memories: memoryLines });
+
             if (lastUserMsg) {
                 persistence.appendMessage(user.directories, conversationId, participantId, lastUserMsg.content, 'user');
             }

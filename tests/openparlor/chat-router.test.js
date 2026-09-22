@@ -904,6 +904,80 @@ test('memory extraction is NOT triggered on provider error', async () => {
     }
 });
 
+test('retrieves and injects memories into the prompt when conversation_id is provided', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'Alice', system_prompt: 'You are Alice.' });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'Test');
+        persistence.createMemory(dirs, 'alice', {
+            character_id: char.id,
+            content: 'the user was born in 1990',
+            type: 'fact',
+            importance: 0.8,
+            known_by_character_ids: [char.id],
+        });
+        const mock = mockProvider(() => completion);
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+        }, user, async baseUrl => {
+            const result = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'when was I born' }],
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+        });
+
+        const sentMessages = mock.calls[0];
+        assert.equal(sentMessages[0].role, 'system');
+        assert.ok(sentMessages[0].content.includes('[Character Memory]'));
+        assert.ok(sentMessages[0].content.includes('the user was born in 1990'));
+        assert.ok(sentMessages[0].content.includes('[/Character Memory]'));
+        assert.ok(!sentMessages[0].content.includes('secret-model-key'));
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('does not inject memories from other characters', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char1 = persistence.createCharacter(dirs, 'alice', { name: 'Alice' });
+        const char2 = persistence.createCharacter(dirs, 'alice', { name: 'Bob' });
+        const conv = persistence.createConversation(dirs, 'alice', char1.id, 'Test');
+        persistence.createMemory(dirs, 'alice', {
+            character_id: char2.id,
+            content: 'secret only bob knows',
+            type: 'fact',
+            known_by_character_ids: [char2.id],
+        });
+        const mock = mockProvider(() => completion);
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+        }, user, async baseUrl => {
+            const result = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'tell me secrets' }],
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+        });
+
+        const sentMessages = mock.calls[0];
+        assert.ok(!sentMessages[0].content.includes('secret only bob knows'));
+    } finally {
+        tmp.cleanup();
+    }
+});
+
 test('memory extraction is NOT triggered on stream error', async () => {
     const tmp = makeTempDirs();
     try {
