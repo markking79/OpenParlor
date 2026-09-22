@@ -1151,11 +1151,16 @@ if (typeof document !== 'undefined') {
             let saved;
             if (editingCharacterId) {
                 saved = await updateCharacter(editingCharacterId, sanitized.name, avatarUrl, sanitized.ttsVoice);
-                const idx = characters.findIndex(c => c.id === editingCharacterId);
+                // Keep both arrays in sync: cards render from allCharacters,
+                // new-chat selection from characters (active only).
+                const allIdx = allCharacters.findIndex(c => c.id === saved.id);
+                if (allIdx !== -1) allCharacters[allIdx] = saved;
+                const idx = characters.findIndex(c => c.id === saved.id);
                 if (idx !== -1) characters[idx] = saved;
             } else {
                 saved = await createCharacter(sanitized.name, avatarUrl, sanitized.ttsVoice);
-                characters.push(saved);
+                allCharacters.push(saved);
+                characters.push(saved); // new characters are active
             }
             hideCharacterForm();
             renderCharacters();
