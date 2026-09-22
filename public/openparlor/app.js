@@ -1304,6 +1304,7 @@ if (typeof document !== 'undefined') {
                 const err = await response.json().catch(() => ({}));
                 currentAssistantMsg.content = normalizeServiceError(err, 'Request failed');
                 if (lastBubble) lastBubble.textContent = currentAssistantMsg.content;
+                renderMessages();
                 scrollMessages();
                 if (isDev) voiceTurnTimer.log();
                 voiceTurnTimer.cancel();
@@ -1358,6 +1359,10 @@ if (typeof document !== 'undefined') {
             parser.flush();
             processNewRecords();
             if (streamDone) voiceTurnTimer.markStreamComplete();
+            // Final full render: the delta path only updates the live bubble
+            // text, so completed messages need a re-render to gain their TTS
+            // controls and server-identified speaker.
+            renderMessages();
 
             // Auto-speak: queue completed group replies for sequential playback
             let ttsHandled = false;
@@ -1398,6 +1403,7 @@ if (typeof document !== 'undefined') {
         } catch {
             currentAssistantMsg.content = 'Connection error';
             if (lastBubble) lastBubble.textContent = currentAssistantMsg.content;
+            renderMessages();
             scrollMessages();
             if (isDev) voiceTurnTimer.log();
             voiceTurnTimer.cancel();
