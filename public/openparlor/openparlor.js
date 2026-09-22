@@ -1214,6 +1214,7 @@ if (typeof document !== 'undefined') {
     }
 
     function renderCharacters() {
+        const selectedCharacterId = characterSelect.value;
         characterList.innerHTML = '';
         characterSelect.innerHTML = '<option value="">Select a character…</option>';
 
@@ -1260,6 +1261,11 @@ if (typeof document !== 'undefined') {
             characterSelect.appendChild(opt);
         }
 
+        // Make the primary action usable immediately when characters exist.
+        // Preserve an explicit selection when re-rendering after edits.
+        characterSelect.value = characters.some(char => char.id === selectedCharacterId)
+            ? selectedCharacterId
+            : characters[0].id;
         characterSelect.disabled = false;
         newChatButton.disabled = false;
     }
@@ -2080,7 +2086,10 @@ if (typeof document !== 'undefined') {
 
     async function handleNewConversation() {
         const charId = characterSelect.value;
-        if (!charId) return;
+        if (!charId) {
+            renderState(messagesEl, 'error', 'Select a character before starting a conversation.');
+            return;
+        }
 
         const char = characters.find(c => c.id === charId);
         const title = char ? 'Chat with ' + char.name : 'New conversation';
