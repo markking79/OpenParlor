@@ -647,6 +647,7 @@ export function createPlaybackController(deps = {}) {
     let currentUrl = null;
     let _isPlaying = false;
     let generation = 0;
+    let _onEnded = null;
 
     function stop() {
         generation++;
@@ -660,6 +661,11 @@ export function createPlaybackController(deps = {}) {
             currentUrl = null;
         }
         _isPlaying = false;
+        if (_onEnded) {
+            const cb = _onEnded;
+            _onEnded = null;
+            cb();
+        }
     }
 
     async function play(text, voice) {
@@ -682,7 +688,9 @@ export function createPlaybackController(deps = {}) {
         const audio = currentAudio;
         if (typeof audio.addEventListener === 'function') {
             audio.addEventListener('ended', () => {
-                if (currentAudio === audio) stop();
+                if (currentAudio === audio) {
+                    stop();
+                }
             }, { once: true });
         }
         _isPlaying = true;
@@ -704,6 +712,75 @@ export function createPlaybackController(deps = {}) {
         stop,
         replay,
         get isPlaying() { return _isPlaying; },
+        set onEnded(fn) { _onEnded = fn; },
+        get onEnded() { return _onEnded; },
+    };
+}
+
+/**
+ * Creates a sequential playback queue for group-speaker TTS replies.
+ * Items are played one at a time in enqueue order. All external
+ * dependencies are injectable for deterministic testing.
+ * @param {{
+ *   playItem?: (text: string, voice: string) => Promise<void>,
+ *   onAllDone?: () => void,
+ * }} [deps]
+ * @returns {{
+ *   enqueue: (text: string, voice: string) => void,
+ *   clear: () => void,
+ *   playAll: () => Promise<void>,
+ *   isPlaying: boolean,
+ *   pending: number,
+ * }}
+ */
+export function createGroupPlaybackQueue(deps = {}) {
+    const {
+        playItem = async () => {},
+        onAllDone = null,
+    } = deps;
+
+    let queue = [];
+    let _isPlaying = false;
+    let generation = 0;
+
+    function enqueue(text, voice) {
+        if (!text || !text.trim() || !voice) return;
+        queue.push({ text, voice });
+    }
+
+    function clear() {
+        generation++;
+        queue = [];
+        _isPlaying = false;
+    }
+
+    async function playAll() {
+        if (queue.length === 0) return;
+        const gen = generation;
+        _isPlaying = true;
+        let hadError = false;
+        try {
+            for (const item of queue) {
+                if (gen !== generation) return;
+                await playItem(item.text, item.voice);
+            }
+        } catch {
+            hadError = true;
+        } finally {
+            if (gen === generation) {
+                _isPlaying = false;
+                queue = [];
+                if (!hadError && onAllDone) onAllDone();
+            }
+        }
+    }
+
+    return {
+        enqueue,
+        clear,
+        playAll,
+        get isPlaying() { return _isPlaying; },
+        get pending() { return queue.length; },
     };
 }
 
@@ -740,6 +817,30 @@ if (typeof document !== 'undefined') {
     let editingCharacterId = null;
     let ttsVoices = { voices: [], available: false };
     const playback = createPlaybackController();
+    let ttsMarkedForTurn = false;
+    const groupQueue = createGroupPlaybackQueue({
+        playItem: (text, voice) => {
+            return new Promise((resolve, reject) => {
+                let settled = false;
+                const onEnd = () => {
+                    if (!settled) { settled = true; resolve(); }
+                };
+                playback.onEnded = onEnd;
+                playback.play(text, voice).then(() => {
+                    if (!ttsMarkedForTurn) {
+                        ttsMarkedForTurn = true;
+                        voiceTurnTimer.markTtsReady();
+                    }
+                }).catch((e) => {
+                    if (!settled) { settled = true; reject(e); }
+                });
+            });
+        },
+        onAllDone: () => {
+            if (isDev) voiceTurnTimer.log();
+            voiceTurnTimer.cancel();
+        },
+    });
     let selectionEpoch = 0;
     let recordingInterruptionPending = false;
     const isDev = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
@@ -1001,6 +1102,7 @@ if (typeof document !== 'undefined') {
                 playBtn.textContent = '▶';
                 playBtn.addEventListener('click', async () => {
                     try {
+                        groupQueue.clear();
                         await playback.play(msg.content, voice);
                         updatePlaybackButtons();
                     } catch {
@@ -1013,6 +1115,7 @@ if (typeof document !== 'undefined') {
                 stopBtn.setAttribute('aria-label', 'Stop playback');
                 stopBtn.textContent = '■';
                 stopBtn.addEventListener('click', () => {
+                    groupQueue.clear();
                     playback.stop();
                     updatePlaybackButtons();
                 });
@@ -1023,6 +1126,7 @@ if (typeof document !== 'undefined') {
                 replayBtn.textContent = '↺';
                 replayBtn.addEventListener('click', async () => {
                     try {
+                        groupQueue.clear();
                         await playback.replay(msg.content, voice);
                         updatePlaybackButtons();
                     } catch {
@@ -1638,6 +1742,7 @@ if (typeof document !== 'undefined') {
 
     async function selectConversation(id) {
         selectionEpoch++;
+        groupQueue.clear();
         playback.stop();
         voiceTurnTimer.cancel();
         try {
@@ -1693,6 +1798,7 @@ if (typeof document !== 'undefined') {
         renderMessages();
 
         // Create assistant bubble placeholder
+        const assistantMsgStartIndex = currentMessages.length;
         let currentAssistantMsg = { role: 'assistant', content: '' };
         currentMessages.push(currentAssistantMsg);
         renderMessages();
@@ -1775,8 +1881,9 @@ if (typeof document !== 'undefined') {
             processNewRecords();
             if (streamDone) voiceTurnTimer.markStreamComplete();
 
-            // Auto-speak: play completed reply if enabled and conversation unchanged
+            // Auto-speak: queue completed group replies for sequential playback
             let ttsHandled = false;
+            ttsMarkedForTurn = false;
             if (
                 shouldAutoSpeak({
                     sendConversationId,
@@ -1786,21 +1893,23 @@ if (typeof document !== 'undefined') {
                     streamDone,
                     hadStreamError,
                     autoSpeakEnabled: getAutoSpeakState(sendConversationId) || getVoiceModeState(sendConversationId),
-                    hasContent: !!currentAssistantMsg?.content,
+                    hasContent: currentMessages.slice(assistantMsgStartIndex).some(m => m.content),
                     recordingActive: recorder.state === 'recording' || recordingInterruptionPending,
                 })
             ) {
-                const speakerCharId = currentAssistantMsg?.character_id || currentConversation.characterId;
-                const char = characters.find(c => c.id === speakerCharId);
-                const voice = char ? char.ttsVoice : '';
-                if (voice) {
+                const turnMessages = currentMessages.slice(assistantMsgStartIndex);
+                for (const msg of turnMessages) {
+                    if (!msg.content) continue;
+                    const charId = msg.character_id || currentConversation.characterId;
+                    const char = characters.find(c => c.id === charId);
+                    const voice = char ? char.ttsVoice : '';
+                    if (voice) {
+                        groupQueue.enqueue(msg.content, voice);
+                    }
+                }
+                if (groupQueue.pending > 0) {
                     ttsHandled = true;
-                    playback.play(currentAssistantMsg.content, voice).then((url) => {
-                        if (url) voiceTurnTimer.markTtsReady();
-                    }).catch(() => {}).finally(() => {
-                        if (isDev) voiceTurnTimer.log();
-                        voiceTurnTimer.cancel();
-                    });
+                    groupQueue.playAll().catch(() => {});
                     updatePlaybackButtons();
                 }
             }
@@ -1852,6 +1961,7 @@ if (typeof document !== 'undefined') {
             const newState = !getAutoSpeakState(currentConversation.id);
             setAutoSpeakState(currentConversation.id, newState);
             if (!newState) {
+                groupQueue.clear();
                 playback.stop();
                 updatePlaybackButtons();
             }
@@ -1865,6 +1975,7 @@ if (typeof document !== 'undefined') {
             const newState = !getVoiceModeState(currentConversation.id);
             setVoiceModeState(currentConversation.id, newState);
             if (!newState) {
+                groupQueue.clear();
                 playback.stop();
                 updatePlaybackButtons();
             }

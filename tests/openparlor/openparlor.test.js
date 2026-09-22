@@ -6,6 +6,7 @@ import {
     validateMemoryForm,
     normalizeParticipants,
     normalizeConversation,
+    createGroupPlaybackQueue,
 } from '../../public/openparlor/openparlor.js';
 
 describe('normalizeMemory', () => {
@@ -262,5 +263,147 @@ describe('validateMemoryForm', () => {
     it('should handle non-object input', () => {
         const result = validateMemoryForm('string');
         assert.equal(result.valid, false);
+    });
+});
+
+describe('createGroupPlaybackQueue', () => {
+    it('should play items in enqueue order', async () => {
+        const played = [];
+        const queue = createGroupPlaybackQueue({
+            playItem: async (text, voice) => { played.push({ text, voice }); },
+        });
+        queue.enqueue('Hello', 'voice-a');
+        queue.enqueue('World', 'voice-b');
+        queue.enqueue('!', 'voice-c');
+        await queue.playAll();
+        assert.equal(played.length, 3);
+        assert.equal(played[0].text, 'Hello');
+        assert.equal(played[0].voice, 'voice-a');
+        assert.equal(played[1].text, 'World');
+        assert.equal(played[1].voice, 'voice-b');
+        assert.equal(played[2].text, '!');
+        assert.equal(played[2].voice, 'voice-c');
+    });
+
+    it('should handle single item (one-on-one regression)', async () => {
+        const played = [];
+        const queue = createGroupPlaybackQueue({
+            playItem: async (text, voice) => { played.push({ text, voice }); },
+        });
+        queue.enqueue('Only message', 'voice-x');
+        await queue.playAll();
+        assert.equal(played.length, 1);
+        assert.equal(played[0].text, 'Only message');
+        assert.equal(played[0].voice, 'voice-x');
+    });
+
+    it('should skip items with empty text or voice', () => {
+        const queue = createGroupPlaybackQueue({ playItem: async () => {} });
+        queue.enqueue('', 'voice-a');
+        queue.enqueue('   ', 'voice-b');
+        queue.enqueue('text', '');
+        queue.enqueue(null, 'voice-c');
+        queue.enqueue(undefined, 'voice-d');
+        assert.equal(queue.pending, 0);
+    });
+
+    it('should clear pending items and stop subsequent playback', async () => {
+        const played = [];
+        let resolveFirst;
+        const queue = createGroupPlaybackQueue({
+            playItem: (text, voice) => {
+                played.push(text);
+                if (text === 'first') {
+                    return new Promise(r => { resolveFirst = r; });
+                }
+                return Promise.resolve();
+            },
+        });
+        queue.enqueue('first', 'v1');
+        queue.enqueue('second', 'v2');
+        queue.enqueue('third', 'v3');
+        const playPromise = queue.playAll();
+        await new Promise(r => setTimeout(r, 10));
+        assert.equal(played.length, 1);
+        queue.clear();
+        resolveFirst();
+        await playPromise;
+        assert.equal(played.length, 1);
+        assert.equal(queue.pending, 0);
+        assert.equal(queue.isPlaying, false);
+    });
+
+    it('should call onAllDone when all items complete successfully', async () => {
+        let doneCalled = false;
+        const queue = createGroupPlaybackQueue({
+            playItem: async () => {},
+            onAllDone: () => { doneCalled = true; },
+        });
+        queue.enqueue('a', 'v1');
+        queue.enqueue('b', 'v2');
+        await queue.playAll();
+        assert.equal(doneCalled, true);
+    });
+
+    it('should not call onAllDone if cleared mid-playback', async () => {
+        let doneCalled = false;
+        let resolveFirst;
+        const queue = createGroupPlaybackQueue({
+            playItem: (text) => {
+                if (text === 'a') return new Promise(r => { resolveFirst = r; });
+                return Promise.resolve();
+            },
+            onAllDone: () => { doneCalled = true; },
+        });
+        queue.enqueue('a', 'v1');
+        queue.enqueue('b', 'v2');
+        const playPromise = queue.playAll();
+        await new Promise(r => setTimeout(r, 10));
+        queue.clear();
+        resolveFirst();
+        await playPromise;
+        assert.equal(doneCalled, false);
+    });
+
+    it('should not call onAllDone if playItem rejects', async () => {
+        let doneCalled = false;
+        const queue = createGroupPlaybackQueue({
+            playItem: async () => { throw new Error('TTS failed'); },
+            onAllDone: () => { doneCalled = true; },
+        });
+        queue.enqueue('a', 'v1');
+        await queue.playAll();
+        assert.equal(doneCalled, false);
+        assert.equal(queue.isPlaying, false);
+        assert.equal(queue.pending, 0);
+    });
+
+    it('should report isPlaying and pending correctly', async () => {
+        let resolveItem;
+        const queue = createGroupPlaybackQueue({
+            playItem: () => new Promise(r => { resolveItem = r; }),
+        });
+        assert.equal(queue.isPlaying, false);
+        assert.equal(queue.pending, 0);
+        queue.enqueue('test', 'v1');
+        assert.equal(queue.pending, 1);
+        const playPromise = queue.playAll();
+        await new Promise(r => setTimeout(r, 10));
+        assert.equal(queue.isPlaying, true);
+        resolveItem();
+        await playPromise;
+        assert.equal(queue.isPlaying, false);
+        assert.equal(queue.pending, 0);
+    });
+
+    it('should do nothing when playAll is called with empty queue', async () => {
+        let doneCalled = false;
+        const queue = createGroupPlaybackQueue({
+            playItem: async () => { throw new Error('should not be called'); },
+            onAllDone: () => { doneCalled = true; },
+        });
+        await queue.playAll();
+        assert.equal(doneCalled, false);
+        assert.equal(queue.isPlaying, false);
     });
 });
