@@ -397,6 +397,198 @@ test('restart/read round trip: conversation persists across router instances', a
     }
 });
 
+test('participants: PUT requires authentication', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        await withConversationServer(null, async baseUrl => {
+            const result = await request(baseUrl, 'PUT', '/some-id/participants', { character_ids: ['x'] });
+            assert.equal(result.status, 401);
+            assert.deepEqual(result.body, { error: 'Authentication is required' });
+        });
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('participants: PUT returns 404 for non-existent conversation', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withConversationServer(user, async baseUrl => {
+            const result = await request(baseUrl, 'PUT', '/nonexistent/participants', { character_ids: ['x'] });
+            assert.equal(result.status, 404);
+            assert.deepEqual(result.body, { error: 'Conversation not found' });
+        });
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('participants: PUT returns 403 for cross-user conversation', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'bob', { name: 'C' });
+        const conv = persistence.createConversation(dirs, 'bob', char.id, 'BobConv');
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withConversationServer(user, async baseUrl => {
+            const result = await request(baseUrl, 'PUT', `/${conv.id}/participants`, { character_ids: [char.id] });
+            assert.equal(result.status, 403);
+            assert.deepEqual(result.body, { error: 'Forbidden' });
+        });
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('participants: PUT rejects empty character_ids array', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'C' });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'T');
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withConversationServer(user, async baseUrl => {
+            const result = await request(baseUrl, 'PUT', `/${conv.id}/participants`, { character_ids: [] });
+            assert.equal(result.status, 400);
+        });
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('participants: PUT rejects non-array character_ids', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'C' });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'T');
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withConversationServer(user, async baseUrl => {
+            const result = await request(baseUrl, 'PUT', `/${conv.id}/participants`, { character_ids: 'not-an-array' });
+            assert.equal(result.status, 400);
+        });
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('participants: PUT rejects duplicate character IDs', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'C' });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'T');
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withConversationServer(user, async baseUrl => {
+            const result = await request(baseUrl, 'PUT', `/${conv.id}/participants`, { character_ids: [char.id, char.id] });
+            assert.equal(result.status, 400);
+            assert.ok(result.body.error.includes('Duplicate'));
+        });
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('participants: PUT rejects non-existent character with 404', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'C' });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'T');
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withConversationServer(user, async baseUrl => {
+            const result = await request(baseUrl, 'PUT', `/${conv.id}/participants`, { character_ids: ['nonexistent'] });
+            assert.equal(result.status, 404);
+            assert.deepEqual(result.body, { error: 'Character not found' });
+        });
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('participants: PUT rejects cross-user character with 403', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const aliceChar = persistence.createCharacter(dirs, 'alice', { name: 'AC' });
+        const bobChar = persistence.createCharacter(dirs, 'bob', { name: 'BC' });
+        const conv = persistence.createConversation(dirs, 'alice', aliceChar.id, 'T');
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withConversationServer(user, async baseUrl => {
+            const result = await request(baseUrl, 'PUT', `/${conv.id}/participants`, { character_ids: [bobChar.id] });
+            assert.equal(result.status, 403);
+            assert.deepEqual(result.body, { error: 'Forbidden' });
+        });
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('participants: PUT valid update returns 200 with updated participants', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char1 = persistence.createCharacter(dirs, 'alice', { name: 'C1' });
+        const char2 = persistence.createCharacter(dirs, 'alice', { name: 'C2' });
+        const conv = persistence.createConversation(dirs, 'alice', char1.id, 'T');
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withConversationServer(user, async baseUrl => {
+            const result = await request(baseUrl, 'PUT', `/${conv.id}/participants`, { character_ids: [char1.id, char2.id] });
+            assert.equal(result.status, 200);
+            assert.equal(result.body.participants.length, 2);
+            const ids = result.body.participants.map(p => p.character_id);
+            assert.ok(ids.includes(char1.id));
+            assert.ok(ids.includes(char2.id));
+            assert.ok(result.body.participants.every(p => p.id && p.conversation_id === conv.id && p.joined_at));
+
+            const primaryChanged = await request(baseUrl, 'PUT', `/${conv.id}/participants`, { character_ids: [char2.id] });
+            assert.equal(primaryChanged.status, 200);
+            assert.equal(primaryChanged.body.character_id, char2.id);
+            assert.deepEqual(primaryChanged.body.participants.map(p => p.character_id), [char2.id]);
+        });
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('participants: PUT rejects path traversal in character ID', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'C' });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'T');
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withConversationServer(user, async baseUrl => {
+            const result = await request(baseUrl, 'PUT', `/${conv.id}/participants`, { character_ids: ['../evil'] });
+            assert.equal(result.status, 400);
+        });
+    } finally {
+        tmp.cleanup();
+    }
+});
+
 test('rejects path traversal in conversation ID', async () => {
     const tmp = makeTempDirs();
     try {

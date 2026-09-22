@@ -152,6 +152,71 @@ export function createOpenParlorConversationRouter({
         return response.json(updated);
     });
 
+    // PUT /:id/participants — Set conversation participants
+    router.put('/:id/participants', (request, response) => {
+        const auth = getAuthContext(request);
+        if (!auth) {
+            return response.status(401).json({ error: 'Authentication is required' });
+        }
+        const result = getOwnedConversation(auth.directories, request.params.id, auth.handle);
+        if (result.error) {
+            return response.status(result.status).json({ error: result.error });
+        }
+        const { character_ids } = request.body ?? {};
+        if (!Array.isArray(character_ids) || character_ids.length === 0) {
+            return response.status(400).json({ error: '"character_ids" must be a non-empty array' });
+        }
+        if (character_ids.length > 10) {
+            return response.status(400).json({ error: 'Maximum 10 participants allowed' });
+        }
+        for (const cid of character_ids) {
+            if (typeof cid !== 'string' || cid === '') {
+                return response.status(400).json({ error: 'Each character_id must be a non-empty string' });
+            }
+            if (!isValidId(cid)) {
+                return response.status(400).json({ error: 'Invalid character ID' });
+            }
+        }
+        const uniqueIds = new Set(character_ids);
+        if (uniqueIds.size !== character_ids.length) {
+            return response.status(400).json({ error: 'Duplicate character IDs not allowed' });
+        }
+        const existingByCharacterId = new Map(
+            (result.conversation.participants ?? []).map(participant => [participant.character_id, participant]),
+        );
+        const participants = [];
+        for (const cid of character_ids) {
+            let character;
+            try {
+                character = persistenceModule.getCharacter(auth.directories, cid);
+            } catch {
+                return response.status(400).json({ error: 'Invalid character ID' });
+            }
+            if (!character) {
+                return response.status(404).json({ error: 'Character not found' });
+            }
+            if (character.owner_id !== auth.handle) {
+                return response.status(403).json({ error: 'Forbidden' });
+            }
+            const existingParticipant = existingByCharacterId.get(cid);
+            participants.push(existingParticipant ?? {
+                id: crypto.randomUUID(),
+                conversation_id: result.conversation.id,
+                character_id: cid,
+                role: 'character',
+                joined_at: new Date().toISOString(),
+            });
+        }
+        const updated = persistenceModule.updateConversation(auth.directories, request.params.id, {
+            participants,
+            character_id: character_ids[0],
+        });
+        if (!updated) {
+            return response.status(404).json({ error: 'Conversation not found' });
+        }
+        return response.json(updated);
+    });
+
     // DELETE /:id — Delete a conversation
     router.delete('/:id', (request, response) => {
         const auth = getAuthContext(request);

@@ -20,12 +20,26 @@ export function formatRelativeTime(isoString) {
     return date.toLocaleDateString();
 }
 
+export function normalizeParticipants(raw) {
+    if (!Array.isArray(raw)) return [];
+    return raw
+        .filter(p => p && typeof p === 'object')
+        .map(p => ({
+            characterId: typeof p.character_id === 'string'
+                ? p.character_id
+                : (typeof p.characterId === 'string' ? p.characterId : ''),
+            role: typeof p.role === 'string' ? p.role : 'character',
+        }))
+        .filter(p => p.characterId !== '');
+}
+
 export function normalizeConversation(raw) {
     if (!raw || typeof raw !== 'object') return null;
     return {
         id: typeof raw.id === 'string' ? raw.id : String(raw.id || ''),
         title: typeof raw.title === 'string' ? raw.title : 'Untitled',
         characterId: raw.character_id != null ? String(raw.character_id) : '',
+        participants: normalizeParticipants(raw.participants),
         updatedAt: typeof raw.updated_at === 'string' ? raw.updated_at : '',
     };
 }
@@ -938,13 +952,14 @@ if (typeof document !== 'undefined') {
             return;
         }
 
-        const char = characters.find(c => c.id === currentConversation.characterId);
-        const charName = char ? char.name : 'Assistant';
-
         for (const msg of currentMessages) {
             const isUser = msg.role === 'user';
             const messageEl = document.createElement('div');
             messageEl.className = 'message' + (isUser ? ' user-message' : '');
+
+            const msgCharId = !isUser && msg.character_id ? msg.character_id : currentConversation.characterId;
+            const char = characters.find(c => c.id === msgCharId);
+            const charName = char ? char.name : 'Assistant';
 
             if (!isUser) {
                 const avatar = document.createElement('div');
@@ -978,7 +993,6 @@ if (typeof document !== 'undefined') {
                 const actions = document.createElement('div');
                 actions.className = 'message-actions';
 
-                const char = characters.find(c => c.id === currentConversation.characterId);
                 const voice = char ? char.ttsVoice : '';
 
                 const playBtn = document.createElement('button');
@@ -1047,6 +1061,7 @@ if (typeof document !== 'undefined') {
             sendButton.disabled = true;
             updateAutoSpeakButton();
             updateVoiceModeButton();
+            renderParticipants();
             return;
         }
         const char = characters.find(c => c.id === currentConversation.characterId);
@@ -1056,10 +1071,96 @@ if (typeof document !== 'undefined') {
         sendButton.disabled = false;
         updateAutoSpeakButton();
         updateVoiceModeButton();
+        renderParticipants();
     }
 
     function scrollMessages() {
         messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    // ── Participants ───────────────────────────────────────────────────────
+
+    const participantsBar = document.getElementById('participantsBar');
+    const participantsList = document.getElementById('participantsList');
+    const addParticipantButton = document.getElementById('addParticipantButton');
+    const addParticipantSelect = document.getElementById('addParticipantSelect');
+
+    function renderParticipants() {
+        if (!participantsBar) return;
+        if (!currentConversation) {
+            participantsBar.hidden = true;
+            return;
+        }
+        participantsBar.hidden = false;
+        participantsList.innerHTML = '';
+
+        const participants = currentConversation.participants || [];
+        for (const p of participants) {
+            const char = characters.find(c => c.id === p.characterId);
+            const chip = document.createElement('span');
+            chip.className = 'participant-chip';
+            chip.textContent = char ? char.name : p.characterId;
+
+            const removeBtn = document.createElement('button');
+            removeBtn.className = 'participant-remove';
+            removeBtn.setAttribute('aria-label', 'Remove ' + (char ? char.name : p.characterId));
+            removeBtn.textContent = '×';
+            removeBtn.addEventListener('click', async () => {
+                const remaining = participants.filter(x => x.characterId !== p.characterId);
+                if (remaining.length === 0) return;
+                await updateParticipants(remaining.map(x => x.characterId));
+            });
+
+            chip.appendChild(removeBtn);
+            participantsList.appendChild(chip);
+        }
+
+        // Populate add-select with characters not already participants
+        if (addParticipantSelect) {
+            addParticipantSelect.innerHTML = '<option value="">Add character…</option>';
+            const participantIds = new Set(participants.map(p => p.characterId));
+            for (const char of characters) {
+                if (participantIds.has(char.id)) continue;
+                const opt = document.createElement('option');
+                opt.value = char.id;
+                opt.textContent = char.name;
+                addParticipantSelect.appendChild(opt);
+            }
+            addParticipantSelect.disabled = participants.length >= 10;
+        }
+    }
+
+    async function updateParticipants(characterIds) {
+        try {
+            const token = await getCsrfToken();
+            const res = await fetch('/api/openparlor/conversations/' + encodeURIComponent(currentConversation.id) + '/participants', {
+                method: 'PUT',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRF-Token': token,
+                },
+                body: JSON.stringify({ character_ids: characterIds }),
+            });
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                throw new Error(err.error || 'Failed to update participants');
+            }
+            const updated = normalizeConversation(await res.json());
+            currentConversation = updated;
+            renderParticipants();
+            renderConversations();
+        } catch (e) {
+            renderState(messagesEl, 'error', e.message || 'Failed to update participants.');
+        }
+    }
+
+    if (addParticipantButton) {
+        addParticipantButton.addEventListener('click', () => {
+            if (!addParticipantSelect || !addParticipantSelect.value) return;
+            const currentIds = (currentConversation.participants || []).map(p => p.characterId);
+            const newIds = [...currentIds, addParticipantSelect.value];
+            updateParticipants(newIds);
+        });
     }
 
     // ── API helpers ────────────────────────────────────────────────────────

@@ -4,6 +4,8 @@ import {
     normalizeMemory,
     normalizeMemorySource,
     validateMemoryForm,
+    normalizeParticipants,
+    normalizeConversation,
 } from '../../public/openparlor/openparlor.js';
 
 describe('normalizeMemory', () => {
@@ -118,6 +120,64 @@ describe('normalizeMemorySource', () => {
         const memory = { sourceConversationId: 'conv-1' };
         const result = normalizeMemorySource(memory, conversations);
         assert.ok(!result.label.includes('conv-1'));
+    });
+});
+
+describe('normalizeParticipants', () => {
+    it('should normalize a valid participants array', () => {
+        const raw = [
+            { id: 'participant-1', character_id: 'char-1', role: 'character' },
+            { id: 'participant-2', character_id: 'char-2', role: 'character' },
+        ];
+        const result = normalizeParticipants(raw);
+        assert.equal(result.length, 2);
+        assert.equal(result[0].characterId, 'char-1');
+        assert.equal(result[0].role, 'character');
+        assert.equal(result[1].characterId, 'char-2');
+    });
+
+    it('should return empty array for null or non-array input', () => {
+        assert.deepEqual(normalizeParticipants(null), []);
+        assert.deepEqual(normalizeParticipants(undefined), []);
+        assert.deepEqual(normalizeParticipants('string'), []);
+    });
+
+    it('should filter out invalid entries', () => {
+        const raw = [
+            { character_id: 'char-1', role: 'character' },
+            null,
+            'invalid',
+            { character_id: '', role: 'character' },
+            { role: 'character' },
+        ];
+        const result = normalizeParticipants(raw);
+        assert.equal(result.length, 1);
+        assert.equal(result[0].characterId, 'char-1');
+    });
+
+    it('should default role to "character" when missing', () => {
+        const result = normalizeParticipants([{ character_id: 'char-1' }]);
+        assert.equal(result[0].role, 'character');
+    });
+});
+
+describe('normalizeConversation', () => {
+    it('should include participants in normalized output', () => {
+        const raw = {
+            id: 'conv-1',
+            title: 'Test',
+            character_id: 'char-1',
+            participants: [{ id: 'participant-1', character_id: 'char-1', role: 'character' }],
+            updated_at: '2024-01-01T00:00:00Z',
+        };
+        const result = normalizeConversation(raw);
+        assert.equal(result.participants.length, 1);
+        assert.equal(result.participants[0].characterId, 'char-1');
+    });
+
+    it('should default participants to empty array when missing', () => {
+        const result = normalizeConversation({ id: 'conv-1', title: 'T' });
+        assert.deepEqual(result.participants, []);
     });
 });
 
