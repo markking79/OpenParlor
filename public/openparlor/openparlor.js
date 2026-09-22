@@ -368,6 +368,42 @@ export function normalizeAudioReadiness(healthStatus) {
 }
 
 /**
+ * Combines already-normalized local-stack status into a single readiness
+ * report for the browser harness. Reuses existing services without
+ * downloading or launching duplicate AI stacks. Read-only: no CSRF or
+ * mutation required.
+ * @param {{
+ *   modelStatus?: object | null,
+ *   healthStatus?: object | null,
+ *   prerequisite?: object | null,
+ * }} [params]
+ * @returns {{
+ *   model: { ready: boolean, reason: string },
+ *   audio: { stt: boolean, tts: boolean, ready: boolean },
+ *   prerequisite: { deferred: boolean, label: string },
+ *   ready: boolean,
+ *   blockers: string[],
+ * }}
+ */
+export function checkLocalReadiness({ modelStatus, healthStatus, prerequisite } = {}) {
+    const model = normalizeChatReadiness(modelStatus, healthStatus);
+    const audio = normalizeAudioReadiness(healthStatus);
+    const prereq = normalizeDeferredPrerequisite(prerequisite);
+
+    const blockers = [];
+    if (!model.ready) blockers.push(model.reason);
+    if (prereq.deferred) blockers.push(prereq.label);
+
+    return {
+        model,
+        audio,
+        prerequisite: prereq,
+        ready: model.ready && !prereq.deferred,
+        blockers,
+    };
+}
+
+/**
  * Normalizes a raw prerequisite check result into a safe deferred/satisfied
  * status. Used by the browser harness to report missing developer storage
  * state as a deferred local prerequisite without leaking sensitive details.

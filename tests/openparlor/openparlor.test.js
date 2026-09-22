@@ -14,6 +14,7 @@ import {
     normalizeTtsVoices,
     normalizeChatReadiness,
     normalizeAudioReadiness,
+    checkLocalReadiness,
     normalizeDeferredPrerequisite,
     fetchDeferredPrerequisite,
     selectSupportedMime,
@@ -661,6 +662,92 @@ describe('normalizeAudioReadiness', () => {
         assert.equal(result.stt, false);
         assert.equal(result.tts, false);
         assert.equal(result.ready, false);
+    });
+});
+
+describe('checkLocalReadiness', () => {
+    const readyModel = { provider: 'ollama', model: 'llama3', endpointLabel: 'Local', models: ['llama3'], connected: true };
+    const readyHealth = { model: { available: true, label: 'llama3' }, tts: { available: true, label: 'Piper' }, stt: { available: true, label: 'Whisper' } };
+    const satisfiedPrereq = { satisfied: true, label: 'Storage state found' };
+
+    it('should report ready when all services are available and prerequisite is satisfied', () => {
+        const result = checkLocalReadiness({ modelStatus: readyModel, healthStatus: readyHealth, prerequisite: satisfiedPrereq });
+        assert.equal(result.ready, true);
+        assert.equal(result.blockers.length, 0);
+        assert.equal(result.model.ready, true);
+        assert.equal(result.audio.ready, true);
+        assert.equal(result.prerequisite.deferred, false);
+    });
+
+    it('should report not ready when model is not connected', () => {
+        const result = checkLocalReadiness({
+            modelStatus: { provider: 'openai', model: 'gpt-4', endpointLabel: '', models: [], connected: false },
+            healthStatus: readyHealth,
+            prerequisite: satisfiedPrereq,
+        });
+        assert.equal(result.ready, false);
+        assert.ok(result.blockers.includes('Model not connected'));
+    });
+
+    it('should report not ready when prerequisite is deferred', () => {
+        const result = checkLocalReadiness({
+            modelStatus: readyModel,
+            healthStatus: readyHealth,
+            prerequisite: { satisfied: false, label: 'Developer storage state not found' },
+        });
+        assert.equal(result.ready, false);
+        assert.ok(result.blockers.includes('Developer storage state not found'));
+        assert.equal(result.prerequisite.deferred, true);
+    });
+
+    it('should report not ready when both model and prerequisite block', () => {
+        const result = checkLocalReadiness({
+            modelStatus: null,
+            healthStatus: null,
+            prerequisite: null,
+        });
+        assert.equal(result.ready, false);
+        assert.equal(result.blockers.length, 2);
+        assert.ok(result.blockers.includes('Model not connected'));
+        assert.ok(result.blockers.includes('Prerequisite not met'));
+    });
+
+    it('should report audio readiness independently of model readiness', () => {
+        const result = checkLocalReadiness({
+            modelStatus: readyModel,
+            healthStatus: { model: { available: true, label: 'llama3' }, tts: { available: false, label: '' }, stt: { available: false, label: '' } },
+            prerequisite: satisfiedPrereq,
+        });
+        assert.equal(result.ready, true);
+        assert.equal(result.audio.ready, false);
+        assert.equal(result.audio.stt, false);
+        assert.equal(result.audio.tts, false);
+    });
+
+    it('should handle null params object gracefully', () => {
+        const result = checkLocalReadiness();
+        assert.equal(result.ready, false);
+        assert.equal(result.model.ready, false);
+        assert.equal(result.audio.ready, false);
+        assert.equal(result.prerequisite.deferred, true);
+    });
+
+    it('should not leak endpoint URLs or credentials in blockers', () => {
+        const result = checkLocalReadiness({
+            modelStatus: { provider: 'openai', model: 'gpt-4', endpointLabel: 'https://api.openai.com/v1', models: [], connected: false },
+            healthStatus: null,
+            prerequisite: { satisfied: false, label: 'State at /home/dev/.openparlor/storage-state.json missing' },
+        });
+        for (const blocker of result.blockers) {
+            assert.ok(!blocker.includes('http'));
+            assert.ok(!blocker.includes('/home/dev'));
+        }
+    });
+
+    it('should not require CSRF or mutation for read-only check', () => {
+        // checkLocalReadiness is a pure function — no fetch, no CSRF token needed
+        const result = checkLocalReadiness({ modelStatus: readyModel, healthStatus: readyHealth, prerequisite: satisfiedPrereq });
+        assert.equal(result.ready, true);
     });
 });
 
