@@ -21,6 +21,9 @@ import {
     createRecorderController,
     createTranscriptionController,
     createPlaybackController,
+    createNdjsonParser,
+    normalizeCharacter,
+    sanitizeCharacterInput,
 } from '../../public/openparlor/openparlor.js';
 
 describe('normalizeMemory', () => {
@@ -1725,5 +1728,116 @@ describe('server-side provider ownership', () => {
         const result = normalizeDeferredPrerequisite(raw);
         assert.equal(result.deferred, false);
         assert.equal(result.label, '');
+    });
+});
+
+describe('HTML/message rendering safety', () => {
+    it('should preserve HTML-like content in service errors as plain text for textContent rendering', () => {
+        const result = normalizeServiceError({ error: '<script>alert("xss")</script>' });
+        assert.equal(result, '<script>alert("xss")</script>');
+    });
+
+    it('should preserve HTML tags in safe error messages without alteration', () => {
+        const result = normalizeServiceError({ error: '<b>bold</b> and <i>italic</i>' });
+        assert.equal(result, '<b>bold</b> and <i>italic</i>');
+    });
+
+    it('should return fallback when HTML error contains a URL', () => {
+        const result = normalizeServiceError({ error: '<a href="http://evil.com">click</a>' });
+        assert.equal(result, 'Service unavailable. Please try again.');
+    });
+
+    it('should return fallback when HTML error contains a filesystem path', () => {
+        const result = normalizeServiceError({ error: '<div>see /etc/passwd for details</div>' });
+        assert.equal(result, 'Service unavailable. Please try again.');
+    });
+
+    it('should handle HTML in deferred prerequisite labels with path redaction', () => {
+        const result = normalizeDeferredPrerequisite({
+            satisfied: false,
+            label: 'State missing at <code>/var/lib/app/session</code>',
+        });
+        assert.equal(result.deferred, true);
+        assert.ok(!result.label.includes('/var/lib'));
+    });
+
+    it('should produce safe plain-text from NDJSON delta records containing HTML', () => {
+        const parser = createNdjsonParser();
+        const record = JSON.stringify({ type: 'delta', text: '<script>alert("xss")</script>' });
+        parser.feed(new TextEncoder().encode(record + '\n'));
+        parser.flush();
+        assert.equal(parser.records.length, 1);
+        assert.equal(parser.records[0].text, '<script>alert("xss")</script>');
+    });
+
+    it('should produce safe plain-text from NDJSON error records containing HTML', () => {
+        const parser = createNdjsonParser();
+        const record = JSON.stringify({ type: 'error', error: '<img src=x onerror=alert(1)>' });
+        parser.feed(new TextEncoder().encode(record + '\n'));
+        parser.flush();
+        assert.equal(parser.records.length, 1);
+        assert.equal(parser.records[0].error, '<img src=x onerror=alert(1)>');
+    });
+
+    it('should preserve HTML-like conversation titles as plain strings', () => {
+        const result = normalizeConversation({
+            id: 'conv-1',
+            title: '<script>alert("xss")</script>',
+            character_id: 'char-1',
+        });
+        assert.equal(result.title, '<script>alert("xss")</script>');
+    });
+
+    it('should preserve HTML-like character names as plain strings', () => {
+        const result = normalizeCharacter({
+            id: 'char-1',
+            name: '<b>Evil</b> <script>bad()</script>',
+        });
+        assert.equal(result.name, '<b>Evil</b> <script>bad()</script>');
+    });
+
+    it('should preserve HTML-like memory content as plain strings', () => {
+        const result = normalizeMemory({
+            id: 'mem-1',
+            content: '<iframe src="http://evil.com"></iframe>',
+        });
+        assert.equal(result.content, '<iframe src="http://evil.com"></iframe>');
+    });
+
+    it('should preserve HTML-like character names through sanitization as text', () => {
+        const result = sanitizeCharacterInput({
+            name: '<script>alert(1)</script>',
+            avatar_url: '',
+            tts_voice: '',
+        });
+        assert.equal(result.name, '<script>alert(1)</script>');
+    });
+
+    it('should strip control characters from HTML-like names but keep visible HTML as text', () => {
+        const result = sanitizeCharacterInput({
+            name: '<script>\x00alert(1)</script>',
+            avatar_url: '',
+            tts_voice: '',
+        });
+        assert.equal(result.name, '<script>alert(1)</script>');
+    });
+
+    it('should not allow HTML injection through model status endpoint label', () => {
+        const result = normalizeModelStatus({
+            provider: 'test',
+            model: 'm1',
+            endpointLabel: '<script>document.cookie</script>',
+            connected: true,
+        });
+        assert.equal(result.endpointLabel, '<script>document.cookie</script>');
+    });
+
+    it('should not allow HTML injection through health status labels', () => {
+        const result = normalizeHealthStatus({
+            model: { available: true, label: '<b>safe</b>' },
+            tts: null,
+            stt: null,
+        });
+        assert.equal(result.model.label, '<b>safe</b>');
     });
 });

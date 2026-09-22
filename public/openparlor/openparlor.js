@@ -371,7 +371,7 @@ export function normalizeDeferredPrerequisite(raw) {
     const safeLabel = label
         .replace(/https?:\/\/\S+/g, '[redacted]')
         .replace(/file:\/\/\S+/g, '[redacted]')
-        .replace(/(?:^|[\s"'(])\/[\w.-]+(?:\/[\w.-]+)+/g, ' [redacted]')
+        .replace(/(?:^|[\s"'(>])\/[\w.-]+(?:\/[\w.-]+)+/g, ' [redacted]')
         .replace(/(?:api[_-]?key|token|secret|password|credential|authorization|bearer)\s*[:=]\s*\S+/gi, '[redacted]')
         .trim();
     return { deferred: true, label: !safeLabel || safeLabel === '[redacted]' ? 'Prerequisite not met' : safeLabel };
