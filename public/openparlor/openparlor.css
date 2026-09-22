@@ -508,6 +508,18 @@ button {
     border-color: #555860;
 }
 
+.form-field input[type="file"] {
+    padding: 6px;
+    font-size: 12px;
+}
+
+.form-help {
+    margin-top: 4px;
+    color: #777b84;
+    font-size: 11px;
+    line-height: 1.35;
+}
+
 .form-select {
     width: 100%;
     border: 1px solid #34363b;
@@ -578,6 +590,28 @@ button {
 .character-name {
     font-size: 14px;
     font-weight: 580;
+    flex: 1;
+}
+
+.character-delete-btn {
+    border: 0;
+    background: transparent;
+    color: #8d6262;
+    border-radius: 5px;
+    padding: 4px 6px;
+    font-size: 12px;
+    cursor: pointer;
+    opacity: 0;
+}
+
+.character-card:hover .character-delete-btn,
+.character-delete-btn:focus-visible {
+    opacity: 1;
+}
+
+.character-delete-btn:hover {
+    background: #3a2527;
+    color: #f0a0a0;
 }
 
 .character-status {

@@ -1060,6 +1060,7 @@ if (typeof document !== 'undefined') {
     const characterForm = document.getElementById('characterForm');
     const charNameInput = document.getElementById('charNameInput');
     const charAvatarInput = document.getElementById('charAvatarInput');
+    const charAvatarFileInput = document.getElementById('charAvatarFileInput');
     const charFormError = document.getElementById('charFormError');
     const charFormSave = document.getElementById('charFormSave');
     const charFormCancel = document.getElementById('charFormCancel');
@@ -1252,6 +1253,18 @@ if (typeof document !== 'undefined') {
 
             card.append(avatar, info);
             card.addEventListener('click', () => showCharacterForm(char));
+
+            const deleteButton = document.createElement('button');
+            deleteButton.className = 'character-delete-btn';
+            deleteButton.type = 'button';
+            deleteButton.title = 'Delete character';
+            deleteButton.setAttribute('aria-label', `Delete ${char.name}`);
+            deleteButton.textContent = '✕';
+            deleteButton.addEventListener('click', event => {
+                event.stopPropagation();
+                handleDeleteCharacter(char);
+            });
+            card.appendChild(deleteButton);
             characterList.appendChild(card);
 
             // Select option
@@ -1274,6 +1287,7 @@ if (typeof document !== 'undefined') {
         editingCharacterId = character ? character.id : null;
         charNameInput.value = character ? character.name : '';
         charAvatarInput.value = character ? character.avatarUrl : '';
+        charAvatarFileInput.value = '';
         populateVoiceSelect(character ? character.ttsVoice : '');
         charFormError.hidden = true;
         charFormError.textContent = '';
@@ -1297,6 +1311,7 @@ if (typeof document !== 'undefined') {
         characterForm.hidden = true;
         charNameInput.value = '';
         charAvatarInput.value = '';
+        charAvatarFileInput.value = '';
         charVoiceSelect.value = '';
         charFormError.hidden = true;
         charFormError.textContent = '';
@@ -1740,6 +1755,60 @@ if (typeof document !== 'undefined') {
         return normalizeCharacter(await res.json());
     }
 
+    async function uploadCharacterAvatar(file) {
+        if (!file) return '';
+        const allowedTypes = new Map([
+            ['image/bmp', 'bmp'],
+            ['image/png', 'png'],
+            ['image/jpeg', 'jpg'],
+            ['image/webp', 'webp'],
+            ['image/gif', 'gif'],
+            ['image/jfif', 'jfif'],
+        ]);
+        const format = allowedTypes.get(file.type);
+        if (!format) throw new Error('Choose a PNG, JPEG, GIF, WebP, BMP, or JFIF image.');
+        if (file.size > 5 * 1024 * 1024) throw new Error('Avatar images must be 5 MB or smaller.');
+
+        const dataUrl = await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result);
+            reader.onerror = () => reject(new Error('Unable to read the avatar image.'));
+            reader.readAsDataURL(file);
+        });
+        const comma = dataUrl.indexOf(',');
+        if (comma < 0) throw new Error('Invalid avatar image data.');
+
+        const token = await getCsrfToken();
+        const res = await fetch('/api/images/upload', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': token },
+            body: JSON.stringify({
+                image: dataUrl.slice(comma + 1),
+                format,
+                filename: `openparlor-avatar-${Date.now()}.${format}`,
+            }),
+        });
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(normalizeServiceError(err, 'Failed to upload avatar'));
+        }
+        const data = await res.json();
+        if (typeof data.path !== 'string' || !data.path.startsWith('/')) throw new Error('Avatar upload returned an invalid path.');
+        return data.path;
+    }
+
+    async function deleteCharacter(id) {
+        const token = await getCsrfToken();
+        const res = await fetch('/api/openparlor/characters/' + encodeURIComponent(id), {
+            method: 'DELETE',
+            headers: { 'X-CSRF-Token': token },
+        });
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(normalizeServiceError(err, 'Failed to delete character'));
+        }
+    }
+
     async function fetchTtsVoices() {
         try {
             const res = await fetch('/api/openparlor/tts/voices');
@@ -2049,13 +2118,15 @@ if (typeof document !== 'undefined') {
 
         try {
             charFormSave.disabled = true;
+            const uploadedAvatarUrl = await uploadCharacterAvatar(charAvatarFileInput.files[0]);
+            const avatarUrl = uploadedAvatarUrl || sanitized.avatarUrl;
             let saved;
             if (editingCharacterId) {
-                saved = await updateCharacter(editingCharacterId, sanitized.name, sanitized.avatarUrl, sanitized.ttsVoice);
+                saved = await updateCharacter(editingCharacterId, sanitized.name, avatarUrl, sanitized.ttsVoice);
                 const idx = characters.findIndex(c => c.id === editingCharacterId);
                 if (idx !== -1) characters[idx] = saved;
             } else {
-                saved = await createCharacter(sanitized.name, sanitized.avatarUrl, sanitized.ttsVoice);
+                saved = await createCharacter(sanitized.name, avatarUrl, sanitized.ttsVoice);
                 characters.push(saved);
             }
             hideCharacterForm();
@@ -2064,6 +2135,27 @@ if (typeof document !== 'undefined') {
             showFormError(e.message || 'Something went wrong');
         } finally {
             charFormSave.disabled = false;
+        }
+    }
+
+    async function handleDeleteCharacter(character) {
+        if (!window.confirm(`Delete ${character.name}? This cannot be undone.`)) return;
+        try {
+            await deleteCharacter(character.id);
+            characters = characters.filter(item => item.id !== character.id);
+            if (editingCharacterId === character.id) hideCharacterForm();
+            if (currentConversation && currentConversation.characterId === character.id) {
+                currentConversation = null;
+                currentMessages = [];
+                renderMessages();
+                updateChatHeader();
+                refreshMemoryPanel();
+            }
+            renderCharacters();
+            renderConversations();
+        } catch (e) {
+            showFormError(e.message || 'Failed to delete character');
+            characterForm.hidden = false;
         }
     }
 
