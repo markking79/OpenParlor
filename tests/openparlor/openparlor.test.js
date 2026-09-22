@@ -13,6 +13,7 @@ import {
     normalizeModelStatus,
     normalizeTtsVoices,
     normalizeChatReadiness,
+    normalizeAudioReadiness,
     normalizeDeferredPrerequisite,
     selectSupportedMime,
     shouldAutoSendTranscription,
@@ -567,6 +568,98 @@ describe('normalizeChatReadiness', () => {
         const result = normalizeChatReadiness(modelStatus, null);
         assert.equal(result.ready, false);
         assert.ok(!result.reason.includes('http'));
+    });
+});
+
+describe('normalizeAudioReadiness', () => {
+    it('should report both stt and tts ready when both are available', () => {
+        const health = {
+            model: { available: true, label: 'llama3' },
+            tts: { available: true, label: 'Piper' },
+            stt: { available: true, label: 'Whisper' },
+        };
+        const result = normalizeAudioReadiness(health);
+        assert.equal(result.stt, true);
+        assert.equal(result.tts, true);
+        assert.equal(result.ready, true);
+    });
+
+    it('should report not ready when stt is unavailable', () => {
+        const health = {
+            model: { available: true, label: 'llama3' },
+            tts: { available: true, label: 'Piper' },
+            stt: { available: false, label: '' },
+        };
+        const result = normalizeAudioReadiness(health);
+        assert.equal(result.stt, false);
+        assert.equal(result.tts, true);
+        assert.equal(result.ready, false);
+    });
+
+    it('should report not ready when tts is unavailable', () => {
+        const health = {
+            model: { available: true, label: 'llama3' },
+            tts: { available: false, label: '' },
+            stt: { available: true, label: 'Whisper' },
+        };
+        const result = normalizeAudioReadiness(health);
+        assert.equal(result.stt, true);
+        assert.equal(result.tts, false);
+        assert.equal(result.ready, false);
+    });
+
+    it('should report not ready when both are unavailable', () => {
+        const health = {
+            model: { available: true, label: 'llama3' },
+            tts: { available: false, label: '' },
+            stt: { available: false, label: '' },
+        };
+        const result = normalizeAudioReadiness(health);
+        assert.equal(result.stt, false);
+        assert.equal(result.tts, false);
+        assert.equal(result.ready, false);
+    });
+
+    it('should report not ready for null input', () => {
+        const result = normalizeAudioReadiness(null);
+        assert.equal(result.stt, false);
+        assert.equal(result.tts, false);
+        assert.equal(result.ready, false);
+    });
+
+    it('should report not ready for non-object input', () => {
+        const result = normalizeAudioReadiness('invalid');
+        assert.equal(result.stt, false);
+        assert.equal(result.tts, false);
+        assert.equal(result.ready, false);
+    });
+
+    it('should report not ready when stt section is null', () => {
+        const health = { model: null, tts: { available: true, label: 'Piper' }, stt: null };
+        const result = normalizeAudioReadiness(health);
+        assert.equal(result.stt, false);
+        assert.equal(result.tts, true);
+        assert.equal(result.ready, false);
+    });
+
+    it('should report not ready when tts section is null', () => {
+        const health = { model: null, tts: null, stt: { available: true, label: 'Whisper' } };
+        const result = normalizeAudioReadiness(health);
+        assert.equal(result.stt, true);
+        assert.equal(result.tts, false);
+        assert.equal(result.ready, false);
+    });
+
+    it('should not treat non-boolean available as true', () => {
+        const health = {
+            model: null,
+            tts: { available: 'yes', label: 'Piper' },
+            stt: { available: 1, label: 'Whisper' },
+        };
+        const result = normalizeAudioReadiness(health);
+        assert.equal(result.stt, false);
+        assert.equal(result.tts, false);
+        assert.equal(result.ready, false);
     });
 });
 
@@ -1537,6 +1630,56 @@ describe('createPlaybackController', () => {
         mockAudio._fire('ended');
         assert.equal(endedCalled, true);
         assert.equal(controller.isPlaying, false);
+    });
+
+    it('should send CSRF token with TTS synthesis request when provider is configured', async () => {
+        const fetchCalls = [];
+        const controller = createPlaybackController({
+            fetchFn: async (url, opts) => {
+                fetchCalls.push({ url, opts });
+                return { ok: true, blob: async () => new Blob(['audio']) };
+            },
+            createObjectURL: () => 'blob:test',
+            revokeObjectURL: () => {},
+            audioFactory: () => ({ src: '', play: async () => {}, pause: () => {}, addEventListener: () => {} }),
+            getCsrfToken: async () => 'csrf-tts-token',
+        });
+
+        await controller.play('Hello', 'voice-a');
+        assert.equal(fetchCalls[0].opts.headers['X-CSRF-Token'], 'csrf-tts-token');
+    });
+
+    it('should omit CSRF header when no token provider is configured', async () => {
+        const fetchCalls = [];
+        const controller = createPlaybackController({
+            fetchFn: async (url, opts) => {
+                fetchCalls.push({ url, opts });
+                return { ok: true, blob: async () => new Blob(['audio']) };
+            },
+            createObjectURL: () => 'blob:test',
+            revokeObjectURL: () => {},
+            audioFactory: () => ({ src: '', play: async () => {}, pause: () => {}, addEventListener: () => {} }),
+        });
+
+        await controller.play('Hello', 'voice-a');
+        assert.equal(fetchCalls[0].opts.headers['X-CSRF-Token'], undefined);
+    });
+
+    it('should omit CSRF header when token provider returns empty string', async () => {
+        const fetchCalls = [];
+        const controller = createPlaybackController({
+            fetchFn: async (url, opts) => {
+                fetchCalls.push({ url, opts });
+                return { ok: true, blob: async () => new Blob(['audio']) };
+            },
+            createObjectURL: () => 'blob:test',
+            revokeObjectURL: () => {},
+            audioFactory: () => ({ src: '', play: async () => {}, pause: () => {}, addEventListener: () => {} }),
+            getCsrfToken: async () => '',
+        });
+
+        await controller.play('Hello', 'voice-a');
+        assert.equal(fetchCalls[0].opts.headers['X-CSRF-Token'], undefined);
     });
 });
 

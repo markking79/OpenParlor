@@ -354,6 +354,20 @@ export function normalizeChatReadiness(modelStatus, healthStatus) {
 }
 
 /**
+ * Determines whether the audio pipeline (STT + TTS) is ready based on
+ * already-normalized health status. Used to gate browser audio features
+ * on existing local services without launching duplicate stacks.
+ * @param {{ model: { available: boolean, label: string } | null, tts: { available: boolean, label: string } | null, stt: { available: boolean, label: string } | null } | null} healthStatus
+ * @returns {{ stt: boolean, tts: boolean, ready: boolean }}
+ */
+export function normalizeAudioReadiness(healthStatus) {
+    const health = (healthStatus && typeof healthStatus === 'object') ? healthStatus : null;
+    const stt = !!(health && health.stt && health.stt.available === true);
+    const tts = !!(health && health.tts && health.tts.available === true);
+    return { stt, tts, ready: stt && tts };
+}
+
+/**
  * Normalizes a raw prerequisite check result into a safe deferred/satisfied
  * status. Used by the browser harness to report missing developer storage
  * state as a deferred local prerequisite without leaking sensitive details.
@@ -794,6 +808,7 @@ export function createPlaybackController(deps = {}) {
         createObjectURL = (blob) => URL.createObjectURL(blob),
         revokeObjectURL = (url) => URL.revokeObjectURL(url),
         audioFactory = (url) => new Audio(url),
+        getCsrfToken = null,
     } = deps;
 
     let currentAudio = null;
@@ -824,9 +839,14 @@ export function createPlaybackController(deps = {}) {
     async function play(text, voice) {
         stop();
         const gen = generation;
+        const headers = { 'Content-Type': 'application/json' };
+        if (getCsrfToken) {
+            const token = await getCsrfToken();
+            if (token) headers['X-CSRF-Token'] = token;
+        }
         const res = await fetchFn('/api/openparlor/tts/synthesize', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers,
             body: JSON.stringify({ text, voice }),
         });
         if (gen !== generation) return null;
@@ -969,7 +989,7 @@ if (typeof document !== 'undefined') {
     let isSending = false;
     let editingCharacterId = null;
     let ttsVoices = { voices: [], available: false };
-    const playback = createPlaybackController();
+    const playback = createPlaybackController({ getCsrfToken });
     let ttsMarkedForTurn = false;
     const groupQueue = createGroupPlaybackQueue({
         playItem: (text, voice) => {
