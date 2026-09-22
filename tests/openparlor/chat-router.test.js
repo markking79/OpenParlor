@@ -533,6 +533,38 @@ test('non-stream chat with conversation_id persists user and assistant messages 
     }
 });
 
+test('group chat directs an addressed character without changing one-on-one flow', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const emma = persistence.createCharacter(dirs, 'alice', { name: 'Emma', system_prompt: 'You are Emma.' });
+        const rachel = persistence.createCharacter(dirs, 'alice', { name: 'Rachel', system_prompt: 'You are Rachel.' });
+        const conv = persistence.createConversation(dirs, 'alice', emma.id, 'Group', [{ character_id: rachel.id, role: 'character' }]);
+        const rachelParticipant = conv.participants.find(p => p.character_id === rachel.id);
+        const mock = mockProvider(() => completion);
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+        }, user, async baseUrl => {
+            const result = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'Rachel, what do you think?' }],
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+        });
+
+        assert.ok(mock.calls[0][0].content.includes('You are Rachel.'));
+        const messages = persistence.getMessages(dirs, conv.id);
+        assert.equal(messages[0].participant_id, rachelParticipant.id);
+        assert.equal(messages[1].participant_id, rachelParticipant.id);
+    } finally {
+        tmp.cleanup();
+    }
+});
+
 test('stream success with conversation_id persists assistant exactly once', async () => {
     const tmp = makeTempDirs();
     try {
@@ -1041,6 +1073,187 @@ test('memory shared between Emma and Rachel is injected in their fresh conversat
         const sarahPrompt = mock.calls[2][0].content;
         assert.ok(!sarahPrompt.includes('phoenix'), 'Sarah must NOT see the shared memory');
         assert.ok(!sarahPrompt.includes('codename'), 'Sarah must NOT see the shared memory content');
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+// ─── Multi-character speaker director tests ──────────────────────────────────
+
+function findAndModifyConversation(dirs, conversationId, modifier) {
+    function search(dir) {
+        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        for (const entry of entries) {
+            const fullPath = path.join(dir, entry.name);
+            if (entry.isDirectory()) {
+                const result = search(fullPath);
+                if (result) return result;
+            } else if (entry.name.endsWith('.json')) {
+                const content = fs.readFileSync(fullPath, 'utf-8');
+                if (content.includes(conversationId)) {
+                    const data = JSON.parse(content);
+                    if (data.id === conversationId) {
+                        modifier(data);
+                        fs.writeFileSync(fullPath, JSON.stringify(data, null, 2));
+                        return data;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+    return search(dirs.root);
+}
+
+test('multi-character conversation: mentions a character by name and selects that character', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const alice = persistence.createCharacter(dirs, 'alice', { name: 'Alice', system_prompt: 'You are Alice.' });
+        const bob = persistence.createCharacter(dirs, 'alice', { name: 'Bob', system_prompt: 'You are Bob.' });
+        const conv = persistence.createConversation(dirs, 'alice', alice.id, 'Group Chat');
+
+        // Add Bob as a second character participant
+        findAndModifyConversation(dirs, conv.id, data => {
+            data.participants.push({ id: 'part-bob', character_id: bob.id, role: 'character' });
+        });
+
+        const mock = mockProvider(() => completion);
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+        }, user, async baseUrl => {
+            const result = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'Bob, what do you think?' }],
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+        });
+
+        // The prompt should be built for Bob (the mentioned character)
+        const sentMessages = mock.calls[0];
+        assert.equal(sentMessages[0].role, 'system');
+        assert.ok(sentMessages[0].content.includes('You are Bob.'));
+        assert.ok(!sentMessages[0].content.includes('You are Alice.'));
+
+        // Message persisted under Bob's participant
+        const messages = persistence.getMessages(dirs, conv.id);
+        assert.equal(messages.length, 2);
+        assert.equal(messages[0].participant_id, 'part-bob');
+        assert.equal(messages[1].participant_id, 'part-bob');
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('multi-character conversation: no mention selects the first character deterministically', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const alice = persistence.createCharacter(dirs, 'alice', { name: 'Alice', system_prompt: 'You are Alice.' });
+        const bob = persistence.createCharacter(dirs, 'alice', { name: 'Bob', system_prompt: 'You are Bob.' });
+        const conv = persistence.createConversation(dirs, 'alice', alice.id, 'Group Chat');
+
+        // Add Bob as a second character participant
+        findAndModifyConversation(dirs, conv.id, data => {
+            data.participants.push({ id: 'part-bob', character_id: bob.id, role: 'character' });
+        });
+
+        const mock = mockProvider(() => completion);
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+        }, user, async baseUrl => {
+            const result = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'what should we do today?' }],
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+        });
+
+        // No name mentioned → first character (Alice) is selected
+        const sentMessages = mock.calls[0];
+        assert.ok(sentMessages[0].content.includes('You are Alice.'));
+        assert.ok(!sentMessages[0].content.includes('You are Bob.'));
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('multi-character conversation: one-on-one behavior is preserved for single-character conversations', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const alice = persistence.createCharacter(dirs, 'alice', { name: 'Alice', system_prompt: 'You are Alice.' });
+        const conv = persistence.createConversation(dirs, 'alice', alice.id, 'Solo Chat');
+        const participant = conv.participants.find(p => p.role === 'character');
+
+        const mock = mockProvider(() => completion);
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+        }, user, async baseUrl => {
+            const result = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'hello Alice' }],
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+        });
+
+        const sentMessages = mock.calls[0];
+        assert.ok(sentMessages[0].content.includes('You are Alice.'));
+
+        const messages = persistence.getMessages(dirs, conv.id);
+        assert.equal(messages.length, 2);
+        assert.equal(messages[0].participant_id, participant.id);
+        assert.equal(messages[1].participant_id, participant.id);
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('multi-character conversation: safe no-speaker behavior when character record is missing', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const alice = persistence.createCharacter(dirs, 'alice', { name: 'Alice', system_prompt: 'You are Alice.' });
+        const conv = persistence.createConversation(dirs, 'alice', alice.id, 'Group Chat');
+
+        // Add a participant referencing a non-existent character
+        findAndModifyConversation(dirs, conv.id, data => {
+            data.participants.push({ id: 'part-ghost', character_id: 'nonexistent-char-id', role: 'character' });
+        });
+
+        const mock = mockProvider(() => completion);
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+        }, user, async baseUrl => {
+            // Mention the ghost character by a name that won't match (no record)
+            // Director will fall back to first valid character (Alice)
+            const result = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'hello everyone' }],
+                conversation_id: conv.id,
+            });
+            // Should still work — the ghost is filtered out by .filter(Boolean) in charRecords
+            assert.equal(result.status, 200);
+        });
+
+        // Alice (first valid) should be selected
+        const sentMessages = mock.calls[0];
+        assert.ok(sentMessages[0].content.includes('You are Alice.'));
     } finally {
         tmp.cleanup();
     }

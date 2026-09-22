@@ -6,6 +6,7 @@ import * as persistence from './persistence.js';
 import { buildPrompt } from './prompt-builder.js';
 import { retrieveMemories } from './memory-retrieval.js';
 import { extractAndPersistMemories } from './memory-extractor.js';
+import { selectSpeaker } from './speaker-director.js';
 
 /**
  * @typedef {Object} ChatMessage
@@ -127,7 +128,11 @@ export function createOpenParlorChatRouter({
             if (conversation.owner_id !== handle) {
                 return response.status(403).json({ error: 'Forbidden' });
             }
-            const characterParticipant = conversation.participants.find(p => p.role === 'character');
+            const characterParticipants = conversation.participants.filter(p => p.role === 'character');
+            const lastUserMsg = [...safeMessages].reverse().find(m => m.role === 'user');
+            const participantCharacters = characterParticipants.map(participant => persistence.getCharacter(user.directories, participant.character_id))
+                .filter(Boolean);
+            const characterParticipant = selectSpeaker(characterParticipants, participantCharacters, lastUserMsg?.content ?? '')[0];
             if (!characterParticipant) {
                 return response.status(400).json({ error: 'Conversation has no character participant' });
             }
@@ -139,7 +144,6 @@ export function createOpenParlorChatRouter({
             }
 
             const history = persistence.getMessages(user.directories, conversationId);
-            const lastUserMsg = [...safeMessages].reverse().find(m => m.role === 'user');
             const memoryLines = lastUserMsg
                 ? retrieveMemories(user.directories, handle, character.id, lastUserMsg.content)
                 : [];
