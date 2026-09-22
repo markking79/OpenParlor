@@ -168,6 +168,66 @@ export function mapChatRole(role) {
     return role;
 }
 
+/**
+ * Pure stream-message state machine for group chat replies.
+ *
+ * Tracks the assistant message(s) being built from NDJSON stream records:
+ * - A single pending message exists before any record (standalone streams
+ *   that emit deltas without a speaker_start).
+ * - The first speaker_start assigns the server-determined character identity
+ *   to the pending message; it never creates a new message.
+ * - Each subsequent speaker_start starts a new message.
+ * - Deltas and error lines append to the current message.
+ *
+ * @returns {{
+ *   handleRecord: (record: object | null) => ({type: string, isNewMessage?: boolean, message?: object} | null),
+ *   getPendingMessage: () => object,
+ *   getMessages: () => Array<object>
+ * }}
+ */
+export function createStreamMessageCollector() {
+    const messages = [{ role: 'assistant', content: '' }];
+    let current = messages[0];
+    let speakerCount = 0;
+
+    function handleRecord(record) {
+        if (!record || typeof record !== 'object') return null;
+        if (record.type === 'speaker_start') {
+            speakerCount++;
+            const characterId = typeof record.character_id === 'string' ? record.character_id : '';
+            if (speakerCount === 1) {
+                if (characterId) current.character_id = characterId;
+                return { type: 'speaker_start', isNewMessage: false, message: current };
+            }
+            current = { role: 'assistant', content: '', character_id: characterId };
+            messages.push(current);
+            return { type: 'speaker_start', isNewMessage: true, message: current };
+        }
+        if (record.type === 'delta') {
+            current.content += typeof record.text === 'string' ? record.text : '';
+            return { type: 'delta', message: current };
+        }
+        if (record.type === 'speaker_end') {
+            return { type: 'speaker_end', message: current };
+        }
+        if (record.type === 'error') {
+            const errorText = typeof record.error === 'string' && record.error ? record.error : 'Stream error';
+            current.content += '\n' + errorText;
+            return { type: 'error', message: current };
+        }
+        if (record.type === 'done') {
+            return { type: 'done' };
+        }
+        return null;
+    }
+
+    return {
+        handleRecord,
+        getPendingMessage: () => current,
+        getMessages: () => messages,
+    };
+}
+
 export function validateCharacterForm(data) {
     const errors = [];
     if (!data || typeof data !== 'object') {
@@ -2219,14 +2279,16 @@ if (typeof document !== 'undefined') {
         currentMessages.push({ role: 'user', content: text });
         renderMessages();
 
-        // Create assistant bubble placeholder
+        // Create assistant bubble placeholder; the server's first
+        // speaker_start determines the actual character identity before any
+        // text is shown.
         const assistantMsgStartIndex = currentMessages.length;
-        let currentAssistantMsg = { role: 'assistant', content: '' };
+        const streamCollector = createStreamMessageCollector();
+        let currentAssistantMsg = streamCollector.getPendingMessage();
         currentMessages.push(currentAssistantMsg);
         renderMessages();
 
         let lastBubble = messagesEl.querySelector('.message:last-child .bubble');
-        let speakerCount = 0;
 
         try {
             const token = await getCsrfToken();
@@ -2237,7 +2299,9 @@ if (typeof document !== 'undefined') {
                     'X-CSRF-Token': token,
                 },
                 body: JSON.stringify({
-                    messages: currentMessages.map(m => ({ role: mapChatRole(m.role), content: m.content })),
+                    // The server owns persisted history; send only the new
+                    // user turn so history is never duplicated.
+                    messages: [{ role: 'user', content: text }],
                     stream: true,
                     conversation_id: currentConversation.id,
                 }),
@@ -2262,31 +2326,30 @@ if (typeof document !== 'undefined') {
             function processNewRecords() {
                 for (let i = processedCount; i < parser.records.length; i++) {
                     const record = parser.records[i];
-                    if (record.type === 'speaker_start') {
-                        speakerCount++;
-                        if (speakerCount === 1) {
-                            currentAssistantMsg.character_id = record.character_id;
-                        } else {
-                            currentAssistantMsg = { role: 'assistant', content: '', character_id: record.character_id };
-                            currentMessages.push(currentAssistantMsg);
-                            renderMessages();
-                            lastBubble = messagesEl.querySelector('.message:last-child .bubble');
-                        }
-                    } else if (record.type === 'delta') {
-                        voiceTurnTimer.markFirstToken();
-                        currentAssistantMsg.content += record.text;
-                        if (lastBubble) lastBubble.textContent = currentAssistantMsg.content;
-                        scrollMessages();
-                    } else if (record.type === 'speaker_end') {
-                        // Speaker finished; next speaker_start will create a new message
-                    } else if (record.type === 'error') {
-                        hadStreamError = true;
-                        currentAssistantMsg.content += '\n' + (record.error || 'Stream error');
-                        if (lastBubble) lastBubble.textContent = currentAssistantMsg.content;
-                        scrollMessages();
-                    } else if (record.type === 'done') {
+                    if (record.type === 'done') {
                         streamDone = true;
                         break;
+                    }
+                    const outcome = streamCollector.handleRecord(record);
+                    if (outcome === null) continue;
+                    if (outcome.type === 'speaker_start') {
+                        currentAssistantMsg = outcome.message;
+                        if (outcome.isNewMessage) {
+                            currentMessages.push(currentAssistantMsg);
+                        }
+                        // Re-render on every speaker_start so the
+                        // server-identified speaker is displayed before the
+                        // first text delta of that bubble.
+                        renderMessages();
+                        lastBubble = messagesEl.querySelector('.message:last-child .bubble');
+                    } else if (outcome.type === 'delta') {
+                        voiceTurnTimer.markFirstToken();
+                        if (lastBubble) lastBubble.textContent = currentAssistantMsg.content;
+                        scrollMessages();
+                    } else if (outcome.type === 'error') {
+                        hadStreamError = true;
+                        if (lastBubble) lastBubble.textContent = currentAssistantMsg.content;
+                        scrollMessages();
                     }
                 }
                 processedCount = parser.records.length;

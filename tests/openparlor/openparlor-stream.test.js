@@ -1,20 +1,6 @@
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import path from 'node:path';
 import test from 'node:test';
-import { fileURLToPath } from 'node:url';
-import vm from 'node:vm';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-function loadBrowserParser() {
-    const source = fs.readFileSync(path.join(__dirname, '../../public/openparlor/openparlor.js'), 'utf8');
-    const context = { TextDecoder };
-    vm.runInNewContext(source, context, { filename: 'openparlor.js' });
-    return context.createNdjsonParser;
-}
-
-const createNdjsonParser = loadBrowserParser();
+import { createNdjsonParser } from '../../public/openparlor/openparlor.js';
 
 function parsedRecords(parser) {
     return JSON.parse(JSON.stringify(parser.records));

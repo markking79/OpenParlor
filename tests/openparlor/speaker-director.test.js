@@ -109,3 +109,114 @@ test('ignores non-character participants in selection', () => {
     assert.equal(result.length, 1);
     assert.equal(result[0].id, 'part-1');
 });
+
+// ─── Whole-group intent (QWEN-GROUP-001) ─────────────────────────────────────
+
+test('selects all character participants for "everyone say hello"', () => {
+    const participants = makeParticipants(['Doug', 'Monica', 'Rachel']);
+    const characters = makeCharacters(['Doug', 'Monica', 'Rachel']);
+    const result = selectSpeaker(participants, characters, 'everyone say hello');
+    assert.deepEqual(result.map(p => p.id), ['part-0', 'part-1', 'part-2']);
+});
+
+test('selects all character participants for "everybody say hello"', () => {
+    const participants = makeParticipants(['Doug', 'Monica', 'Rachel']);
+    const characters = makeCharacters(['Doug', 'Monica', 'Rachel']);
+    const result = selectSpeaker(participants, characters, 'everybody say hello');
+    assert.deepEqual(result.map(p => p.id), ['part-0', 'part-1', 'part-2']);
+});
+
+test('selects all character participants for "all of you say hello"', () => {
+    const participants = makeParticipants(['Doug', 'Monica', 'Rachel']);
+    const characters = makeCharacters(['Doug', 'Monica', 'Rachel']);
+    const result = selectSpeaker(participants, characters, 'all of you say hello');
+    assert.deepEqual(result.map(p => p.id), ['part-0', 'part-1', 'part-2']);
+});
+
+test('selects all character participants for "you all say hello"', () => {
+    const participants = makeParticipants(['Doug', 'Monica', 'Rachel']);
+    const characters = makeCharacters(['Doug', 'Monica', 'Rachel']);
+    const result = selectSpeaker(participants, characters, 'you all say hello');
+    assert.deepEqual(result.map(p => p.id), ['part-0', 'part-1', 'part-2']);
+});
+
+test('selects both characters in a two-character chat for "both of you say hello"', () => {
+    const participants = makeParticipants(['Doug', 'Monica']);
+    const characters = makeCharacters(['Doug', 'Monica']);
+    const result = selectSpeaker(participants, characters, 'both of you say hello');
+    assert.deepEqual(result.map(p => p.id), ['part-0', 'part-1']);
+});
+
+test('selects both characters in a two-character chat for "you both say hello"', () => {
+    const participants = makeParticipants(['Doug', 'Monica']);
+    const characters = makeCharacters(['Doug', 'Monica']);
+    const result = selectSpeaker(participants, characters, 'you both say hello');
+    assert.deepEqual(result.map(p => p.id), ['part-0', 'part-1']);
+});
+
+test('selects both characters in a two-character chat for "you two say hello"', () => {
+    const participants = makeParticipants(['Doug', 'Monica']);
+    const characters = makeCharacters(['Doug', 'Monica']);
+    const result = selectSpeaker(participants, characters, 'you two say hello');
+    assert.deepEqual(result.map(p => p.id), ['part-0', 'part-1']);
+});
+
+test('selects both characters in a two-character chat for the bare word "both"', () => {
+    const participants = makeParticipants(['Doug', 'Monica']);
+    const characters = makeCharacters(['Doug', 'Monica']);
+    const result = selectSpeaker(participants, characters, 'Tell both a joke');
+    assert.deepEqual(result.map(p => p.id), ['part-0', 'part-1']);
+});
+
+test('"Monica, what do you think?" selects Monica only', () => {
+    const participants = makeParticipants(['Doug', 'Monica']);
+    const characters = makeCharacters(['Doug', 'Monica']);
+    const result = selectSpeaker(participants, characters, 'Monica, what do you think?');
+    assert.deepEqual(result.map(p => p.id), ['part-1']);
+});
+
+test('"Doug and Monica answer" selects both in participant order', () => {
+    const participants = makeParticipants(['Doug', 'Monica', 'Rachel']);
+    const characters = makeCharacters(['Doug', 'Monica', 'Rachel']);
+    const result = selectSpeaker(participants, characters, 'Doug and Monica answer');
+    assert.deepEqual(result.map(p => p.id), ['part-0', 'part-1']);
+});
+
+test('whole-group cue takes precedence over an explicit name', () => {
+    const participants = makeParticipants(['Doug', 'Monica']);
+    const characters = makeCharacters(['Doug', 'Monica']);
+    const result = selectSpeaker(participants, characters, 'Monica, can everyone say hello?');
+    assert.deepEqual(result.map(p => p.id), ['part-0', 'part-1']);
+});
+
+test('"That\'s all I wanted to say" does NOT select the whole group', () => {
+    const participants = makeParticipants(['Doug', 'Monica']);
+    const characters = makeCharacters(['Doug', 'Monica']);
+    const result = selectSpeaker(participants, characters, "That's all I wanted to say.");
+    assert.equal(result.length, 1);
+    assert.equal(result[0].id, 'part-0');
+});
+
+test('"both of you" does not select everyone in a three-character chat', () => {
+    const participants = makeParticipants(['Doug', 'Monica', 'Rachel']);
+    const characters = makeCharacters(['Doug', 'Monica', 'Rachel']);
+    const result = selectSpeaker(participants, characters, 'both of you say hello');
+    assert.equal(result.length, 1);
+    assert.equal(result[0].id, 'part-0');
+});
+
+test('"you two" does not select everyone in a three-character chat', () => {
+    const participants = makeParticipants(['Doug', 'Monica', 'Rachel']);
+    const characters = makeCharacters(['Doug', 'Monica', 'Rachel']);
+    const result = selectSpeaker(participants, characters, 'you two say hello');
+    assert.equal(result.length, 1);
+    assert.equal(result[0].id, 'part-0');
+});
+
+test('generic unnamed turn keeps deterministic first-character fallback', () => {
+    const participants = makeParticipants(['Doug', 'Monica']);
+    const characters = makeCharacters(['Doug', 'Monica']);
+    const result = selectSpeaker(participants, characters, 'What should we do today?');
+    assert.equal(result.length, 1);
+    assert.equal(result[0].id, 'part-0');
+});
