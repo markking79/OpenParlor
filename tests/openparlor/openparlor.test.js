@@ -10,6 +10,8 @@ import {
     normalizeSettings,
     normalizeHealthStatus,
     normalizeServiceError,
+    normalizeModelStatus,
+    normalizeTtsVoices,
 } from '../../public/openparlor/openparlor.js';
 
 describe('normalizeMemory', () => {
@@ -748,5 +750,154 @@ describe('createGroupPlaybackQueue', () => {
         await queue.playAll();
         assert.equal(doneCalled, false);
         assert.equal(queue.isPlaying, false);
+    });
+});
+
+describe('normalizeModelStatus', () => {
+    it('should normalize valid model status', () => {
+        const raw = {
+            provider: 'ollama',
+            model: 'llama3',
+            endpointLabel: 'Local',
+            models: ['llama3', 'mistral'],
+            connected: true,
+        };
+        const result = normalizeModelStatus(raw);
+        assert.deepEqual(result, {
+            provider: 'ollama',
+            model: 'llama3',
+            endpointLabel: 'Local',
+            models: ['llama3', 'mistral'],
+            connected: true,
+        });
+    });
+
+    it('should return safe defaults for null input', () => {
+        const result = normalizeModelStatus(null);
+        assert.deepEqual(result, { provider: '', model: '', endpointLabel: '', models: [], connected: false });
+    });
+
+    it('should return safe defaults for non-object input', () => {
+        const result = normalizeModelStatus('string');
+        assert.deepEqual(result, { provider: '', model: '', endpointLabel: '', models: [], connected: false });
+    });
+
+    it('should handle missing fields with safe defaults', () => {
+        const result = normalizeModelStatus({});
+        assert.deepEqual(result, { provider: '', model: '', endpointLabel: '', models: [], connected: false });
+    });
+
+    it('should not leak endpoint URLs or base URLs', () => {
+        const raw = {
+            provider: 'openai',
+            model: 'gpt-4',
+            connected: true,
+            endpoint: 'https://api.openai.com/v1',
+            base_url: 'http://localhost:11434',
+            api_base: 'http://192.168.1.1:8080',
+        };
+        const result = normalizeModelStatus(raw);
+        assert.equal(result.endpoint, undefined);
+        assert.equal(result.base_url, undefined);
+        assert.equal(result.api_base, undefined);
+        assert.equal(result.provider, 'openai');
+    });
+
+    it('should not leak credentials or API keys', () => {
+        const raw = {
+            provider: 'openai',
+            model: 'gpt-4',
+            connected: true,
+            api_key: 'sk-secret-123',
+            credentials: { token: 'abc' },
+            auth_header: 'Bearer eyJhbGciOi',
+        };
+        const result = normalizeModelStatus(raw);
+        assert.equal(result.api_key, undefined);
+        assert.equal(result.credentials, undefined);
+        assert.equal(result.auth_header, undefined);
+    });
+
+    it('should not leak filesystem paths', () => {
+        const raw = {
+            provider: 'local',
+            model: 'llama',
+            connected: true,
+            model_path: '/opt/models/llama-7b.gguf',
+            config_path: '/etc/app/config.yaml',
+        };
+        const result = normalizeModelStatus(raw);
+        assert.equal(result.model_path, undefined);
+        assert.equal(result.config_path, undefined);
+    });
+
+    it('should filter non-string entries from models array', () => {
+        const result = normalizeModelStatus({
+            provider: 'test',
+            model: 'm1',
+            connected: true,
+            models: ['valid', 42, null, 'also-valid', undefined],
+        });
+        assert.deepEqual(result.models, ['valid', 'also-valid']);
+    });
+
+    it('should default connected to false when not explicitly true', () => {
+        assert.equal(normalizeModelStatus({ connected: 'yes' }).connected, false);
+        assert.equal(normalizeModelStatus({ connected: 1 }).connected, false);
+        assert.equal(normalizeModelStatus({ connected: null }).connected, false);
+    });
+
+    it('should default endpointLabel to empty string when not a string', () => {
+        assert.equal(normalizeModelStatus({ endpointLabel: 42 }).endpointLabel, '');
+        assert.equal(normalizeModelStatus({ endpointLabel: null }).endpointLabel, '');
+    });
+});
+
+describe('normalizeTtsVoices', () => {
+    it('should normalize valid TTS voices response', () => {
+        const raw = { voices: ['en-US-AriaNeural', 'en-GB-SoniaNeural'], available: true };
+        const result = normalizeTtsVoices(raw);
+        assert.deepEqual(result, {
+            voices: ['en-US-AriaNeural', 'en-GB-SoniaNeural'],
+            available: true,
+        });
+    });
+
+    it('should return safe defaults for null input', () => {
+        assert.deepEqual(normalizeTtsVoices(null), { voices: [], available: false });
+    });
+
+    it('should return safe defaults for non-object input', () => {
+        assert.deepEqual(normalizeTtsVoices('string'), { voices: [], available: false });
+        assert.deepEqual(normalizeTtsVoices(42), { voices: [], available: false });
+    });
+
+    it('should handle missing fields with safe defaults', () => {
+        assert.deepEqual(normalizeTtsVoices({}), { voices: [], available: false });
+    });
+
+    it('should filter non-string entries from voices array', () => {
+        const result = normalizeTtsVoices({ voices: ['valid', 42, null, 'also-valid'], available: true });
+        assert.deepEqual(result.voices, ['valid', 'also-valid']);
+    });
+
+    it('should default available to false when not explicitly true', () => {
+        assert.equal(normalizeTtsVoices({ voices: ['a'], available: 'yes' }).available, false);
+        assert.equal(normalizeTtsVoices({ voices: ['a'], available: 1 }).available, false);
+    });
+
+    it('should not leak endpoint URLs or credentials', () => {
+        const raw = {
+            voices: ['voice-a'],
+            available: true,
+            endpoint: 'https://tts.example.com/api',
+            api_key: 'tts-secret',
+            model_path: '/opt/tts/models',
+        };
+        const result = normalizeTtsVoices(raw);
+        assert.equal(result.endpoint, undefined);
+        assert.equal(result.api_key, undefined);
+        assert.equal(result.model_path, undefined);
+        assert.deepEqual(result.voices, ['voice-a']);
     });
 });
