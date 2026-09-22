@@ -298,6 +298,40 @@ export function normalizeModelStatus(raw) {
 }
 
 /**
+ * Normalizes raw local-stack health data into safe availability-only indicators.
+ * Only exposes `available` (boolean) and `label` (safe string) per service.
+ * Strips any endpoint URLs, credentials, API keys, or filesystem paths.
+ * @param {object|null} raw
+ * @returns {{
+ *   model: { available: boolean, label: string } | null,
+ *   tts: { available: boolean, label: string } | null,
+ *   stt: { available: boolean, label: string } | null,
+ * }}
+ */
+export function normalizeHealthStatus(raw) {
+    if (!raw || typeof raw !== 'object') {
+        return { model: null, tts: null, stt: null };
+    }
+
+    const model = (raw.model && typeof raw.model === 'object') ? {
+        available: raw.model.available === true,
+        label: typeof raw.model.label === 'string' ? raw.model.label : '',
+    } : null;
+
+    const tts = (raw.tts && typeof raw.tts === 'object') ? {
+        available: raw.tts.available === true,
+        label: typeof raw.tts.label === 'string' ? raw.tts.label : '',
+    } : null;
+
+    const stt = (raw.stt && typeof raw.stt === 'object') ? {
+        available: raw.stt.available === true,
+        label: typeof raw.stt.label === 'string' ? raw.stt.label : '',
+    } : null;
+
+    return { model, tts, stt };
+}
+
+/**
  * Selects the first MIME type from candidates that the given
  * isTypeSupported predicate accepts. Returns '' if none are supported.
  * @param {string[]} candidates
@@ -1361,6 +1395,54 @@ if (typeof document !== 'undefined') {
         }
     }
 
+    // ── Health status ──────────────────────────────────────────────────────
+
+    const healthStatusList = document.getElementById('healthStatusList');
+
+    async function fetchHealthStatus() {
+        try {
+            const res = await fetch('/api/openparlor/health');
+            if (!res.ok) throw new Error('Failed to load health status');
+            const data = await res.json();
+            return normalizeHealthStatus(data);
+        } catch {
+            return normalizeHealthStatus(null);
+        }
+    }
+
+    function renderHealthStatus(status) {
+        if (!healthStatusList) return;
+        healthStatusList.innerHTML = '';
+
+        const services = [
+            { key: 'model', name: 'Model' },
+            { key: 'tts', name: 'TTS' },
+            { key: 'stt', name: 'STT' },
+        ];
+
+        for (const svc of services) {
+            const item = document.createElement('div');
+            item.className = 'health-item';
+
+            const service = status[svc.key];
+            const available = service ? service.available : false;
+
+            item.setAttribute('role', 'status');
+            item.setAttribute('aria-label', svc.name + (available ? ' available' : ' unavailable'));
+
+            const dot = document.createElement('span');
+            dot.className = 'health-dot' + (available ? ' available' : ' unavailable');
+            dot.setAttribute('aria-hidden', 'true');
+
+            const label = document.createElement('span');
+            label.className = 'health-label';
+            label.textContent = svc.name + (available ? '' : ' — unavailable');
+
+            item.append(dot, label);
+            healthStatusList.appendChild(item);
+        }
+    }
+
     async function getCsrfToken() {
         const res = await fetch('/csrf-token');
         if (!res.ok) throw new Error('Unable to get CSRF token');
@@ -2169,6 +2251,9 @@ if (typeof document !== 'undefined') {
 
         const status = await fetchModelStatus();
         renderModelStatus(status);
+
+        const health = await fetchHealthStatus();
+        renderHealthStatus(health);
     }
 
     init();

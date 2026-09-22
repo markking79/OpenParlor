@@ -8,6 +8,7 @@ import {
     normalizeConversation,
     createGroupPlaybackQueue,
     normalizeSettings,
+    normalizeHealthStatus,
 } from '../../public/openparlor/openparlor.js';
 
 describe('normalizeMemory', () => {
@@ -391,6 +392,106 @@ describe('normalizeSettings', () => {
         assert.equal(result.model, null);
         assert.equal(result.speech, null);
         assert.equal(result.character, null);
+    });
+});
+
+describe('normalizeHealthStatus', () => {
+    it('should normalize valid health with all services available', () => {
+        const raw = {
+            model: { available: true, label: 'gpt-4' },
+            tts: { available: true, label: 'Piper' },
+            stt: { available: true, label: 'Whisper' },
+        };
+        const result = normalizeHealthStatus(raw);
+        assert.deepEqual(result.model, { available: true, label: 'gpt-4' });
+        assert.deepEqual(result.tts, { available: true, label: 'Piper' });
+        assert.deepEqual(result.stt, { available: true, label: 'Whisper' });
+    });
+
+    it('should return null sections for null input', () => {
+        const result = normalizeHealthStatus(null);
+        assert.equal(result.model, null);
+        assert.equal(result.tts, null);
+        assert.equal(result.stt, null);
+    });
+
+    it('should return null sections for non-object input', () => {
+        const result = normalizeHealthStatus('string');
+        assert.equal(result.model, null);
+        assert.equal(result.tts, null);
+        assert.equal(result.stt, null);
+    });
+
+    it('should handle missing sections gracefully', () => {
+        const result = normalizeHealthStatus({});
+        assert.equal(result.model, null);
+        assert.equal(result.tts, null);
+        assert.equal(result.stt, null);
+    });
+
+    it('should handle non-object section values as null', () => {
+        const result = normalizeHealthStatus({
+            model: 'not-an-object',
+            tts: 42,
+            stt: null,
+        });
+        assert.equal(result.model, null);
+        assert.equal(result.tts, null);
+        assert.equal(result.stt, null);
+    });
+
+    it('should not leak endpoint URLs or credentials', () => {
+        const raw = {
+            model: {
+                available: true,
+                label: 'gpt-4',
+                endpoint: 'https://api.openai.com/v1',
+                api_key: 'sk-secret',
+                base_url: 'http://localhost:8080',
+            },
+            tts: {
+                available: true,
+                label: 'Piper',
+                model_path: '/opt/models/piper',
+                credentials: { token: 'abc' },
+            },
+            stt: {
+                available: true,
+                label: 'Whisper',
+                stt_api_key: 'stt-secret',
+                file_path: '/models/whisper',
+            },
+        };
+        const result = normalizeHealthStatus(raw);
+        assert.equal(result.model.endpoint, undefined);
+        assert.equal(result.model.api_key, undefined);
+        assert.equal(result.model.base_url, undefined);
+        assert.equal(result.tts.model_path, undefined);
+        assert.equal(result.tts.credentials, undefined);
+        assert.equal(result.stt.stt_api_key, undefined);
+        assert.equal(result.stt.file_path, undefined);
+    });
+
+    it('should default available to false when not explicitly true', () => {
+        const result = normalizeHealthStatus({
+            model: { available: 'yes', label: 'test' },
+            tts: { label: 'test' },
+            stt: { available: 1, label: 'test' },
+        });
+        assert.equal(result.model.available, false);
+        assert.equal(result.tts.available, false);
+        assert.equal(result.stt.available, false);
+    });
+
+    it('should default label to empty string when not a string', () => {
+        const result = normalizeHealthStatus({
+            model: { available: true, label: 42 },
+            tts: { available: true },
+            stt: { available: true, label: null },
+        });
+        assert.equal(result.model.label, '');
+        assert.equal(result.tts.label, '');
+        assert.equal(result.stt.label, '');
     });
 });
 
