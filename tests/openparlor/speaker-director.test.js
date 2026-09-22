@@ -220,3 +220,59 @@ test('generic unnamed turn keeps deterministic first-character fallback', () => 
     assert.equal(result.length, 1);
     assert.equal(result[0].id, 'part-0');
 });
+
+test('direct address takes precedence over a name mentioned in the question', () => {
+    const participants = makeParticipants(['Doug', 'Monica']);
+    const characters = makeCharacters(['Doug', 'Monica']);
+    const result = selectSpeaker(participants, characters, 'Doug, what did Monica just say?');
+    assert.deepEqual(result.map(p => p.id), ['part-0']);
+});
+
+test('direct address takes precedence (symmetric): "Monica, what did Doug say?"', () => {
+    const participants = makeParticipants(['Doug', 'Monica']);
+    const characters = makeCharacters(['Doug', 'Monica']);
+    const result = selectSpeaker(participants, characters, 'Monica, what did Doug say?');
+    assert.deepEqual(result.map(p => p.id), ['part-1']);
+});
+
+test('comma-terminated address list selects all addressed characters in participant order', () => {
+    const participants = makeParticipants(['Doug', 'Monica', 'Rachel']);
+    const characters = makeCharacters(['Doug', 'Monica', 'Rachel']);
+    const result = selectSpeaker(participants, characters, 'Doug and Monica, answer this');
+    assert.deepEqual(result.map(p => p.id), ['part-0', 'part-1']);
+});
+
+test('direct address with greeting selects the addressed character only', () => {
+    const participants = makeParticipants(['Doug', 'Monica', 'Rachel']);
+    const characters = makeCharacters(['Doug', 'Monica', 'Rachel']);
+    const result = selectSpeaker(participants, characters, 'Hey Doug, what does Monica think?');
+    assert.deepEqual(result.map(p => p.id), ['part-0']);
+});
+
+test('a non-first participant addressed directly answers instead of the first participant', () => {
+    const participants = makeParticipants(['Doug', 'Monica', 'Rachel']);
+    const characters = makeCharacters(['Doug', 'Monica', 'Rachel']);
+    const result = selectSpeaker(participants, characters, 'Rachel, tell me what Doug and Monica said');
+    assert.deepEqual(result.map(p => p.id), ['part-2']);
+});
+
+test('mid-sentence vocative comma selects the addressed character only', () => {
+    const participants = makeParticipants(['Doug', 'Monica']);
+    const characters = makeCharacters(['Doug', 'Monica']);
+    const result = selectSpeaker(participants, characters, 'I think, Doug, that you\'re right');
+    assert.deepEqual(result.map(p => p.id), ['part-0']);
+});
+
+test('name without a following comma falls back to mention matching', () => {
+    const participants = makeParticipants(['Doug', 'Monica']);
+    const characters = makeCharacters(['Doug', 'Monica']);
+    const result = selectSpeaker(participants, characters, 'What did Doug think?');
+    assert.deepEqual(result.map(p => p.id), ['part-0']);
+});
+
+test('whole-group cue still takes precedence over direct address', () => {
+    const participants = makeParticipants(['Doug', 'Monica']);
+    const characters = makeCharacters(['Doug', 'Monica']);
+    const result = selectSpeaker(participants, characters, 'Doug, everyone, say hello');
+    assert.deepEqual(result.map(p => p.id), ['part-0', 'part-1']);
+});
