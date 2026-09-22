@@ -14,6 +14,13 @@ import {
     normalizeTtsVoices,
     normalizeChatReadiness,
     normalizeDeferredPrerequisite,
+    selectSupportedMime,
+    shouldAutoSendTranscription,
+    shouldAutoSpeak,
+    createVoiceTurnTimer,
+    createRecorderController,
+    createTranscriptionController,
+    createPlaybackController,
 } from '../../public/openparlor/openparlor.js';
 
 describe('normalizeMemory', () => {
@@ -1030,5 +1037,466 @@ describe('normalizeTtsVoices', () => {
         assert.equal(result.api_key, undefined);
         assert.equal(result.model_path, undefined);
         assert.deepEqual(result.voices, ['voice-a']);
+    });
+});
+
+describe('selectSupportedMime', () => {
+    it('should return the first supported MIME type', () => {
+        const result = selectSupportedMime(
+            ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg'],
+            (mime) => mime === 'audio/webm'
+        );
+        assert.equal(result, 'audio/webm');
+    });
+
+    it('should return empty string when none are supported', () => {
+        const result = selectSupportedMime(
+            ['audio/webm', 'audio/ogg'],
+            () => false
+        );
+        assert.equal(result, '');
+    });
+
+    it('should return empty string for empty candidates', () => {
+        const result = selectSupportedMime([], () => true);
+        assert.equal(result, '');
+    });
+});
+
+describe('shouldAutoSendTranscription', () => {
+    it('should return true when voice mode is enabled and transcription succeeded', () => {
+        assert.equal(
+            shouldAutoSendTranscription({ voiceModeEnabled: true, transcriptionSucceeded: true }),
+            true
+        );
+    });
+
+    it('should return false when voice mode is disabled', () => {
+        assert.equal(
+            shouldAutoSendTranscription({ voiceModeEnabled: false, transcriptionSucceeded: true }),
+            false
+        );
+    });
+
+    it('should return false when transcription failed', () => {
+        assert.equal(
+            shouldAutoSendTranscription({ voiceModeEnabled: true, transcriptionSucceeded: false }),
+            false
+        );
+    });
+});
+
+describe('shouldAutoSpeak', () => {
+    const baseParams = {
+        sendConversationId: 'conv-1',
+        currentConversationId: 'conv-1',
+        sendEpoch: 1,
+        selectionEpoch: 1,
+        streamDone: true,
+        hadStreamError: false,
+        autoSpeakEnabled: true,
+        hasContent: true,
+        recordingActive: false,
+    };
+
+    it('should return true when all conditions are met', () => {
+        assert.equal(shouldAutoSpeak(baseParams), true);
+    });
+
+    it('should return false when conversation changed', () => {
+        assert.equal(shouldAutoSpeak({ ...baseParams, currentConversationId: 'conv-2' }), false);
+    });
+
+    it('should return false when epoch mismatch', () => {
+        assert.equal(shouldAutoSpeak({ ...baseParams, selectionEpoch: 2 }), false);
+    });
+
+    it('should return false when stream not done', () => {
+        assert.equal(shouldAutoSpeak({ ...baseParams, streamDone: false }), false);
+    });
+
+    it('should return false when stream had error', () => {
+        assert.equal(shouldAutoSpeak({ ...baseParams, hadStreamError: true }), false);
+    });
+
+    it('should return false when auto-speak disabled', () => {
+        assert.equal(shouldAutoSpeak({ ...baseParams, autoSpeakEnabled: false }), false);
+    });
+
+    it('should return false when no content', () => {
+        assert.equal(shouldAutoSpeak({ ...baseParams, hasContent: false }), false);
+    });
+
+    it('should return false when recording is active', () => {
+        assert.equal(shouldAutoSpeak({ ...baseParams, recordingActive: true }), false);
+    });
+
+    it('should return false when sendConversationId is empty', () => {
+        assert.equal(shouldAutoSpeak({ ...baseParams, sendConversationId: '' }), false);
+    });
+});
+
+describe('createVoiceTurnTimer', () => {
+    it('should track phases and report durations', () => {
+        let now = 0;
+        const timer = createVoiceTurnTimer({ now: () => now });
+        timer.start();
+        assert.equal(timer.active, true);
+
+        now = 100;
+        timer.markRecordingEnd();
+        now = 500;
+        timer.markSttComplete();
+        now = 600;
+        timer.markSendStart();
+        now = 800;
+        timer.markFirstToken();
+        now = 2000;
+        timer.markStreamComplete();
+        now = 2500;
+        timer.markTtsReady();
+
+        const report = timer.report();
+        assert.equal(report.recordingToStt, 400);
+        assert.equal(report.sendToFirstToken, 200);
+        assert.equal(report.firstTokenToComplete, 1200);
+        assert.equal(report.completeToTts, 500);
+        assert.equal(report.totalTurn, 2400);
+    });
+
+    it('should return null report when not active', () => {
+        const timer = createVoiceTurnTimer({ now: () => 0 });
+        assert.equal(timer.report(), null);
+    });
+
+    it('should reset on cancel', () => {
+        let now = 0;
+        const timer = createVoiceTurnTimer({ now: () => now });
+        timer.start();
+        now = 100;
+        timer.markRecordingEnd();
+        timer.cancel();
+        assert.equal(timer.active, false);
+        assert.equal(timer.report(), null);
+    });
+
+    it('should only record first token once', () => {
+        let now = 0;
+        const timer = createVoiceTurnTimer({ now: () => now });
+        timer.start();
+        now = 100;
+        timer.markSendStart();
+        now = 200;
+        timer.markFirstToken();
+        now = 300;
+        timer.markFirstToken();
+        now = 500;
+        timer.markStreamComplete();
+
+        const report = timer.report();
+        assert.equal(report.sendToFirstToken, 100);
+        assert.equal(report.firstTokenToComplete, 300);
+    });
+
+    it('should log via injected logFn', () => {
+        const logged = [];
+        let now = 0;
+        const timer = createVoiceTurnTimer({ now: () => now, logFn: (data) => logged.push(data) });
+        timer.start();
+        now = 100;
+        timer.markRecordingEnd();
+        now = 200;
+        timer.markSttComplete();
+        timer.log();
+        assert.equal(logged.length, 1);
+        assert.equal(logged[0].recordingToStt, '100ms');
+    });
+});
+
+describe('createRecorderController', () => {
+    function createMockMediaRecorder() {
+        const instances = [];
+        class MockMediaRecorder {
+            constructor(stream, options) {
+                this.stream = stream;
+                this.options = options;
+                this.state = 'inactive';
+                this.ondataavailable = null;
+                this.onstop = null;
+                instances.push(this);
+            }
+            start(timeslice) {
+                this.state = 'recording';
+                this._timeslice = timeslice;
+            }
+            stop() {
+                if (this.state === 'recording') {
+                    this.state = 'inactive';
+                    if (this.onstop) this.onstop();
+                }
+            }
+            static isTypeSupported(mime) {
+                return mime === 'audio/webm;codecs=opus';
+            }
+        }
+        return { Ctor: MockMediaRecorder, instances };
+    }
+
+    it('should start recording and produce a blob on stop', async () => {
+        const { Ctor, instances } = createMockMediaRecorder();
+        const mockStream = { getTracks: () => [{ stop: () => {} }] };
+        const states = [];
+
+        const controller = createRecorderController({
+            getUserMedia: async () => mockStream,
+            MediaRecorderCtor: Ctor,
+            onStateChange: (s) => states.push(s),
+        });
+
+        assert.equal(controller.state, 'idle');
+        await controller.start();
+        assert.equal(controller.state, 'recording');
+
+        const recorder = instances[0];
+        const chunk = new Blob(['fake-audio-data']);
+        recorder.ondataavailable({ data: chunk });
+
+        controller.stop();
+        assert.equal(controller.state, 'stopped');
+        assert.ok(controller.blob instanceof Blob);
+        assert.equal(controller.blob.size, chunk.size);
+    });
+
+    it('should report error when MediaRecorder is not supported', async () => {
+        const controller = createRecorderController({
+            MediaRecorderCtor: null,
+        });
+        await controller.start();
+        assert.equal(controller.state, 'error');
+        assert.equal(controller.error, 'MediaRecorder not supported');
+    });
+
+    it('should report permission denied', async () => {
+        const { Ctor } = createMockMediaRecorder();
+        const controller = createRecorderController({
+            getUserMedia: async () => { throw Object.assign(new Error('denied'), { name: 'NotAllowedError' }); },
+            MediaRecorderCtor: Ctor,
+        });
+        await controller.start();
+        assert.equal(controller.state, 'error');
+        assert.equal(controller.error, 'Permission denied');
+    });
+
+    it('should cancel and discard blob', async () => {
+        const { Ctor, instances } = createMockMediaRecorder();
+        const mockStream = { getTracks: () => [{ stop: () => {} }] };
+
+        const controller = createRecorderController({
+            getUserMedia: async () => mockStream,
+            MediaRecorderCtor: Ctor,
+        });
+
+        await controller.start();
+        const recorder = instances[0];
+        recorder.ondataavailable({ data: new Blob(['data']) });
+        controller.cancel();
+        assert.equal(controller.state, 'idle');
+        assert.equal(controller.blob, null);
+    });
+
+    it('should select supported MIME type', async () => {
+        const { Ctor, instances } = createMockMediaRecorder();
+        const mockStream = { getTracks: () => [{ stop: () => {} }] };
+
+        const controller = createRecorderController({
+            getUserMedia: async () => mockStream,
+            MediaRecorderCtor: Ctor,
+            mimeCandidates: ['audio/unsupported', 'audio/webm;codecs=opus'],
+        });
+
+        await controller.start();
+        assert.equal(instances[0].options.mimeType, 'audio/webm;codecs=opus');
+    });
+});
+
+describe('createTranscriptionController', () => {
+    it('should transcribe a blob and return text with CSRF token', async () => {
+        const blob = new Blob(['audio-data']);
+        const mockResponse = {
+            ok: true,
+            json: async () => ({ text: 'Hello world' }),
+        };
+        const fetchCalls = [];
+
+        const controller = createTranscriptionController({
+            fetchFn: async (url, opts) => {
+                fetchCalls.push({ url, opts });
+                return mockResponse;
+            },
+            getCsrfToken: async () => 'test-token',
+        });
+
+        const result = await controller.transcribe(blob);
+        assert.equal(result, 'Hello world');
+        assert.equal(controller.state, 'ready');
+        assert.equal(fetchCalls[0].url, '/api/openparlor/stt/transcribe');
+        assert.equal(fetchCalls[0].opts.headers['X-CSRF-Token'], 'test-token');
+    });
+
+    it('should return null for empty blob', async () => {
+        const controller = createTranscriptionController({
+            fetchFn: async () => ({ ok: true, json: async () => ({ text: 'x' }) }),
+        });
+        const result = await controller.transcribe(new Blob(['']));
+        assert.equal(result, null);
+    });
+
+    it('should return null and set error on failure', async () => {
+        const blob = new Blob(['audio-data']);
+        const controller = createTranscriptionController({
+            fetchFn: async () => ({ ok: false, json: async () => ({}) }),
+        });
+        const result = await controller.transcribe(blob);
+        assert.equal(result, null);
+        assert.equal(controller.state, 'error');
+        assert.ok(controller.error.length > 0);
+    });
+
+    it('should return null when response has no text', async () => {
+        const blob = new Blob(['audio-data']);
+        const controller = createTranscriptionController({
+            fetchFn: async () => ({ ok: true, json: async () => ({ text: '' }) }),
+        });
+        const result = await controller.transcribe(blob);
+        assert.equal(result, null);
+    });
+
+    it('should not call fetch when already busy', async () => {
+        let fetchCount = 0;
+        const blob = new Blob(['audio-data']);
+        const controller = createTranscriptionController({
+            fetchFn: async () => {
+                fetchCount++;
+                return new Promise(() => {});
+            },
+        });
+        const p1 = controller.transcribe(blob);
+        const p2 = await controller.transcribe(blob);
+        assert.equal(p2, null);
+    });
+});
+
+describe('createPlaybackController', () => {
+    function createMockAudio(url) {
+        const listeners = {};
+        return {
+            src: url,
+            play: async () => {},
+            pause: () => {},
+            addEventListener: (event, fn) => {
+                listeners[event] = fn;
+            },
+            _fire: (event) => {
+                if (listeners[event]) listeners[event]();
+            },
+        };
+    }
+
+    it('should play audio and report isPlaying', async () => {
+        const mockAudio = createMockAudio('blob:test');
+        const fetchCalls = [];
+
+        const controller = createPlaybackController({
+            fetchFn: async (url, opts) => {
+                fetchCalls.push({ url, opts });
+                return {
+                    ok: true,
+                    blob: async () => new Blob(['audio']),
+                };
+            },
+            createObjectURL: () => 'blob:test',
+            revokeObjectURL: () => {},
+            audioFactory: () => mockAudio,
+        });
+
+        assert.equal(controller.isPlaying, false);
+        const url = await controller.play('Hello', 'voice-a');
+        assert.equal(url, 'blob:test');
+        assert.equal(controller.isPlaying, true);
+        assert.equal(fetchCalls[0].url, '/api/openparlor/tts/synthesize');
+    });
+
+    it('should stop playback and revoke URL', async () => {
+        let revoked = false;
+        const mockAudio = createMockAudio('blob:test');
+        let paused = false;
+        mockAudio.pause = () => { paused = true; };
+
+        const controller = createPlaybackController({
+            fetchFn: async () => ({ ok: true, blob: async () => new Blob(['audio']) }),
+            createObjectURL: () => 'blob:test',
+            revokeObjectURL: () => { revoked = true; },
+            audioFactory: () => mockAudio,
+        });
+
+        await controller.play('Hello', 'voice-a');
+        controller.stop();
+        assert.equal(controller.isPlaying, false);
+        assert.equal(paused, true);
+        assert.equal(revoked, true);
+    });
+
+    it('should throw on synthesis failure with safe error', async () => {
+        const controller = createPlaybackController({
+            fetchFn: async () => ({
+                ok: false,
+                json: async () => ({ error: 'TTS engine failed' }),
+            }),
+            createObjectURL: () => 'blob:test',
+            revokeObjectURL: () => {},
+            audioFactory: () => createMockAudio('blob:test'),
+        });
+
+        await assert.rejects(
+            () => controller.play('Hello', 'voice-a'),
+            /TTS engine failed/
+        );
+    });
+
+    it('should stop previous playback when starting new one', async () => {
+        let revoked = 0;
+        let audioCount = 0;
+        const controller = createPlaybackController({
+            fetchFn: async () => ({ ok: true, blob: async () => new Blob(['audio']) }),
+            createObjectURL: () => 'blob:test',
+            revokeObjectURL: () => { revoked++; },
+            audioFactory: () => {
+                audioCount++;
+                return createMockAudio('blob:test');
+            },
+        });
+
+        await controller.play('First', 'voice-a');
+        await controller.play('Second', 'voice-b');
+        assert.equal(revoked, 1);
+        assert.equal(audioCount, 2);
+    });
+
+    it('should call onEnded when audio ends naturally', async () => {
+        const mockAudio = createMockAudio('blob:test');
+        let endedCalled = false;
+
+        const controller = createPlaybackController({
+            fetchFn: async () => ({ ok: true, blob: async () => new Blob(['audio']) }),
+            createObjectURL: () => 'blob:test',
+            revokeObjectURL: () => {},
+            audioFactory: () => mockAudio,
+        });
+
+        controller.onEnded = () => { endedCalled = true; };
+        await controller.play('Hello', 'voice-a');
+        mockAudio._fire('ended');
+        assert.equal(endedCalled, true);
+        assert.equal(controller.isPlaying, false);
     });
 });
