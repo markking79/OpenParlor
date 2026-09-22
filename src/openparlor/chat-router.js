@@ -6,7 +6,7 @@ import * as persistence from './persistence.js';
 import { buildPrompt } from './prompt-builder.js';
 import { retrieveMemories } from './memory-retrieval.js';
 import { extractAndPersistMemories } from './memory-extractor.js';
-import { selectSpeaker } from './speaker-director.js';
+import { selectSpeakers } from './speaker-director.js';
 
 /**
  * @typedef {Object} ChatMessage
@@ -137,6 +137,7 @@ export function createOpenParlorChatRouter({
         let speakerContexts = null;
         let participantContext = null;
         let conversation = null;
+        let provider = null;
         if (conversationId) {
             conversation = persistence.getConversation(user.directories, conversationId);
             if (!conversation) {
@@ -144,6 +145,20 @@ export function createOpenParlorChatRouter({
             }
             if (conversation.owner_id !== handle) {
                 return response.status(403).json({ error: 'Forbidden' });
+            }
+            // STAB-006: ambiguous group turns may consult a model speaker
+            // director, so the provider is resolved before speaker
+            // selection. The standalone path below reuses it when set.
+            try {
+                const config = await loadConfig(user.directories);
+                provider = createProvider(config.model);
+            } catch (error) {
+                if (error instanceof ModelProviderError) {
+                    const status = typeof error.status === 'number' ? error.status : 503;
+                    return response.status(status).json({ error: error.message });
+                }
+                console.error('OpenParlor chat completion failed');
+                return response.status(500).json({ error: 'Chat completion failed' });
             }
             const characterParticipants = conversation.participants.filter(p => p.role === 'character');
             const lastUserMsg = [...safeMessages].reverse().find(m => m.role === 'user');
@@ -162,12 +177,22 @@ export function createOpenParlorChatRouter({
                         : '',
                 }))
                 .filter(entry => entry.name !== '');
-            const selectedSpeakers = selectSpeaker(characterParticipants, participantCharacters, lastUserMsg?.content ?? '');
+            // STAB-006: deterministic rules first; ambiguous multi-character
+            // turns may consult the model speaker director, with a strict
+            // decision contract and a deterministic least-recently-spoken
+            // fallback when the model is unavailable or untrusted.
+            const history = persistence.getMessages(user.directories, conversationId);
+            const selectedSpeakers = await selectSpeakers({
+                participants: characterParticipants,
+                characters: participantCharacters,
+                userMessage: lastUserMsg?.content ?? '',
+                recentMessages: history,
+                provider,
+            });
             if (selectedSpeakers.length === 0) {
                 return response.status(400).json({ error: 'Conversation has no character participant' });
             }
 
-            const history = persistence.getMessages(user.directories, conversationId);
             speakerContexts = [];
             for (const speaker of selectedSpeakers) {
                 const character = persistence.getCharacter(user.directories, speaker.character_id);
@@ -188,8 +213,10 @@ export function createOpenParlorChatRouter({
         }
 
         try {
-            const config = await loadConfig(user.directories);
-            const provider = createProvider(config.model);
+            if (!provider) {
+                const config = await loadConfig(user.directories);
+                provider = createProvider(config.model);
+            }
 
             if (!stream) {
                 if (!speakerContexts) {

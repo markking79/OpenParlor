@@ -1523,7 +1523,7 @@ test('multi-character conversation: mentions a character by name and selects tha
     }
 });
 
-test('multi-character conversation: no mention selects the first character deterministically', async () => {
+test('multi-character conversation: ambiguous turn consults the director, then falls back to the first character', async () => {
     const tmp = makeTempDirs();
     try {
         const dirs = { root: tmp.root };
@@ -1543,6 +1543,7 @@ test('multi-character conversation: no mention selects the first character deter
         await withChatServer({
             loadConfig: async () => configuredConfig,
             createProvider: () => mock.provider,
+            runMemoryExtraction: async () => [],
         }, user, async baseUrl => {
             const result = await postChat(baseUrl, {
                 messages: [{ role: 'user', content: 'what should we do today?' }],
@@ -1551,10 +1552,117 @@ test('multi-character conversation: no mention selects the first character deter
             assert.equal(result.status, 200);
         });
 
-        // No name mentioned → first character (Alice) is selected
-        const sentMessages = mock.calls[0];
+        // STAB-006: the ambiguous turn makes one bounded director call first
+        // (mock.calls[0]); its unparseable output falls back to the
+        // least-recently-spoken character, which with no history is the
+        // first participant (Alice). The real response call is second.
+        assert.equal(mock.calls.length, 2);
+        assert.ok(mock.calls[0][0].content.toLowerCase().includes('speaker director'),
+            'the first call must be the director decision prompt');
+        const sentMessages = mock.calls[1];
         assert.ok(sentMessages[0].content.includes('You are Alice.'));
         assert.ok(!sentMessages[0].content.includes('You are Bob.'));
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('multi-character conversation: director decides the speaker when its output is valid', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const alice = persistence.createCharacter(dirs, 'alice', { name: 'Alice', system_prompt: 'You are Alice.' });
+        const bob = persistence.createCharacter(dirs, 'alice', { name: 'Bob', system_prompt: 'You are Bob.' });
+        const conv = persistence.createConversation(dirs, 'alice', alice.id, 'Group Chat');
+        const storedConversation = findAndModifyConversation(dirs, conv.id, data => {
+            data.participants.push({ id: 'part-bob', character_id: bob.id, role: 'character' });
+        });
+        const bobParticipant = storedConversation.participants.find(p => p.character_id === bob.id);
+
+        const mock = {
+            calls: [],
+            provider: {
+                chatCompletion: async messages => {
+                    mock.calls.push(messages);
+                    const isDirector = messages[0].content.toLowerCase().includes('speaker director');
+                    return isDirector
+                        ? { choices: [{ message: { content: '{"speakers": ["' + bob.id + '"]}' } }] }
+                        : completion;
+                },
+            },
+        };
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+            runMemoryExtraction: async () => [],
+        }, user, async baseUrl => {
+            const result = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'what should we do today?' }],
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+        });
+
+        assert.equal(mock.calls.length, 2, 'director call plus one response call');
+        const sentMessages = mock.calls[1];
+        assert.ok(sentMessages[0].content.includes('You are Bob.'), 'the director-picked speaker must be prompted');
+        assert.ok(!sentMessages[0].content.includes('You are Alice.'));
+        const messages = persistence.getMessages(dirs, conv.id);
+        assert.equal(messages.length, 2);
+        assert.equal(messages[1].participant_id, bobParticipant.id, 'the reply must be persisted under the chosen speaker');
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('multi-character conversation: invalid director IDs never reach the router', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const alice = persistence.createCharacter(dirs, 'alice', { name: 'Alice', system_prompt: 'You are Alice.' });
+        const bob = persistence.createCharacter(dirs, 'alice', { name: 'Bob', system_prompt: 'You are Bob.' });
+        const conv = persistence.createConversation(dirs, 'alice', alice.id, 'Group Chat');
+        findAndModifyConversation(dirs, conv.id, data => {
+            data.participants.push({ id: 'part-bob', character_id: bob.id, role: 'character' });
+        });
+
+        const mock = {
+            calls: [],
+            provider: {
+                chatCompletion: async messages => {
+                    mock.calls.push(messages);
+                    const isDirector = messages[0].content.toLowerCase().includes('speaker director');
+                    // The model tries to direct speech to a character that is
+                    // not in this conversation.
+                    return isDirector
+                        ? { choices: [{ message: { content: '{"speakers": ["injected-character-id"]}' } }] }
+                        : completion;
+                },
+            },
+        };
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+            runMemoryExtraction: async () => [],
+        }, user, async baseUrl => {
+            const result = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'what should we do today?' }],
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+        });
+
+        // The forged ID is rejected; the deterministic fallback picks Alice.
+        assert.equal(mock.calls.length, 2);
+        const sentMessages = mock.calls[1];
+        assert.ok(sentMessages[0].content.includes('You are Alice.'));
+        assert.ok(!sentMessages[0].content.includes('injected-character-id'));
     } finally {
         tmp.cleanup();
     }

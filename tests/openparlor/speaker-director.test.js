@@ -276,3 +276,219 @@ test('whole-group cue still takes precedence over direct address', () => {
     const result = selectSpeaker(participants, characters, 'Doug, everyone, say hello');
     assert.deepEqual(result.map(p => p.id), ['part-0', 'part-1']);
 });
+
+// ─── STAB-006: rule selection, anti-starvation rotation, model director ──────
+
+import {
+    selectSpeakerByRules,
+    leastRecentlySpoken,
+    parseDirectorDecision,
+    buildDirectorPrompt,
+    selectSpeakers,
+} from '../../src/openparlor/speaker-director.js';
+
+test('selectSpeakerByRules matches selectSpeaker when a deterministic rule fires', () => {
+    const participants = makeParticipants(['Alice', 'Bob', 'Charlie']);
+    const characters = makeCharacters(['Alice', 'Bob', 'Charlie']);
+    assert.deepEqual(selectSpeakerByRules(participants, characters, 'Hey Bob'), selectSpeaker(participants, characters, 'Hey Bob'));
+    assert.deepEqual(selectSpeakerByRules(participants, characters, 'everyone, hi'), selectSpeaker(participants, characters, 'everyone, hi'));
+    assert.deepEqual(selectSpeakerByRules(participants, characters, 'Alice, hi'), selectSpeaker(participants, characters, 'Alice, hi'));
+});
+
+test('selectSpeakerByRules returns null for ambiguous multi-character turns', () => {
+    const participants = makeParticipants(['Alice', 'Bob', 'Charlie']);
+    const characters = makeCharacters(['Alice', 'Bob', 'Charlie']);
+    assert.equal(selectSpeakerByRules(participants, characters, 'what should we do?'), null);
+});
+
+test('selectSpeakerByRules returns an empty array when no character participants exist', () => {
+    const participants = [{ id: 'p1', character_id: 'c1', role: 'user' }];
+    assert.deepEqual(selectSpeakerByRules(participants, [], 'hello'), []);
+});
+
+test('leastRecentlySpoken picks the first character when nobody has spoken yet', () => {
+    const participants = makeParticipants(['Alice', 'Bob', 'Charlie']);
+    assert.deepEqual(leastRecentlySpoken(participants, []).map(p => p.id), ['part-0']);
+});
+
+test('leastRecentlySpoken rotates to the least recently spoken character', () => {
+    const participants = makeParticipants(['Alice', 'Bob']);
+    const history = [
+        { role: 'character', participant_id: 'part-0' },
+        { role: 'character', participant_id: 'part-1' },
+        { role: 'character', participant_id: 'part-0' },
+    ];
+    assert.deepEqual(leastRecentlySpoken(participants, history).map(p => p.id), ['part-1']);
+    // The character with zero speeches wins outright.
+    const three = makeParticipants(['Alice', 'Bob', 'Charlie']);
+    assert.deepEqual(leastRecentlySpoken(three, history).map(p => p.id), ['part-2']);
+    // Tie on counts resolves in participant order.
+    const tie = [
+        { role: 'character', participant_id: 'part-0' },
+        { role: 'character', participant_id: 'part-1' },
+    ];
+    assert.deepEqual(leastRecentlySpoken(participants, tie).map(p => p.id), ['part-0']);
+});
+
+test('leastRecentlySpoken ignores unknown and user participant IDs', () => {
+    const participants = makeParticipants(['Alice', 'Bob']);
+    const history = [
+        { role: 'character', participant_id: 'ghost-participant' },
+        { role: 'user', participant_id: 'part-1' },
+        { role: 'character', participant_id: 'part-1' },
+    ];
+    // Only part-1 counts; part-0 is least spoken.
+    assert.deepEqual(leastRecentlySpoken(participants, history).map(p => p.id), ['part-0']);
+    assert.deepEqual(leastRecentlySpoken([{ id: 'u1', character_id: 'c1', role: 'user' }], []).map(p => p.id), []);
+});
+
+test('leastRecentlySpoken returns the single character even with history', () => {
+    const participants = makeParticipants(['Alice']);
+    assert.deepEqual(leastRecentlySpoken(participants, [{ role: 'character', participant_id: 'part-0' }]).map(p => p.id), ['part-0']);
+});
+
+
+test('parseDirectorDecision accepts a valid JSON decision with allowed IDs', () => {
+    const allowed = ['char-0', 'char-1'];
+    assert.deepEqual(parseDirectorDecision('{"speakers": ["char-1"], "reason": "variety"}', allowed), ['char-1']);
+    assert.deepEqual(parseDirectorDecision('{"speakers": ["char-0", "char-1"]}', allowed), ['char-0', 'char-1']);
+    // Plain objects are accepted too.
+    assert.deepEqual(parseDirectorDecision({ speakers: ['char-0'] }, allowed), ['char-0']);
+});
+
+test('parseDirectorDecision tolerates code fences and surrounding prose', () => {
+    const allowed = ['char-0'];
+    const fenced = '```json\n{"speakers": ["char-0"], "reason": "r"}\n```';
+    assert.deepEqual(parseDirectorDecision(fenced, allowed), ['char-0']);
+    assert.deepEqual(parseDirectorDecision('Sure! Here is the decision:\n{"speakers": ["char-0"]} thanks', allowed), ['char-0']);
+});
+
+test('parseDirectorDecision rejects malformed or empty decisions', () => {
+    const allowed = ['char-0', 'char-1'];
+    assert.equal(parseDirectorDecision('not json at all', allowed), null);
+    assert.equal(parseDirectorDecision('{"speakers": ', allowed), null);
+    assert.equal(parseDirectorDecision('{"speakers": []}', allowed), null);
+    assert.equal(parseDirectorDecision('{"speakers": "char-0"}', allowed), null);
+    assert.equal(parseDirectorDecision('{"reason": "no speakers field"}', allowed), null);
+    assert.equal(parseDirectorDecision('{"speakers": [1, 2]}', allowed), null);
+    assert.equal(parseDirectorDecision(null, allowed), null);
+    assert.equal(parseDirectorDecision(42, allowed), null);
+    assert.equal(parseDirectorDecision(['char-0'], allowed), null);
+});
+
+test('parseDirectorDecision never permits arbitrary or unknown IDs', () => {
+    const allowed = ['char-0', 'char-1'];
+    assert.equal(parseDirectorDecision('{"speakers": ["char-9"]}', allowed), null);
+    assert.equal(parseDirectorDecision('{"speakers": ["char-0", "char-9"]}', allowed), null, 'one bad ID invalidates the whole decision');
+    assert.equal(parseDirectorDecision('{"speakers": [""]}', allowed), null);
+    assert.equal(parseDirectorDecision('{"speakers": ["char-0"]}', []), null, 'empty allow-list rejects everything');
+});
+
+test('parseDirectorDecision deduplicates IDs while preserving order', () => {
+    const allowed = ['char-0', 'char-1'];
+    assert.deepEqual(parseDirectorDecision('{"speakers": ["char-1", "char-0", "char-1"]}', allowed), ['char-1', 'char-0']);
+});
+
+test('buildDirectorPrompt frames a strict structured choice over known characters only', () => {
+    const participants = makeParticipants(['Alice', 'Bob']);
+    const characters = makeCharacters(['Alice', 'Bob']);
+    const prompt = buildDirectorPrompt({
+        participants,
+        characters,
+        userMessage: 'what should we do?',
+        recentMessages: [{ role: 'character', participant_id: 'part-0', content: 'I would like tea.' }],
+    });
+    assert.equal(prompt.length, 2);
+    assert.equal(prompt[0].role, 'system');
+    assert.equal(prompt[1].role, 'user');
+    assert.ok(prompt[0].content.includes('"speakers"'), 'must demand the speakers array shape');
+    assert.ok(prompt[0].content.toLowerCase().includes('json'));
+    assert.ok(prompt[1].content.includes('char-0') && prompt[1].content.includes('char-1'), 'IDs must be listed for selection');
+    assert.ok(prompt[1].content.includes('Alice') && prompt[1].content.includes('Bob'));
+    assert.ok(prompt[1].content.includes('what should we do?'));
+    assert.ok(prompt[1].content.includes('I would like tea.'));
+    // Malformed inputs are safe.
+    const safe = buildDirectorPrompt({ participants: null, characters: null, userMessage: null, recentMessages: null });
+    assert.ok(typeof safe[1].content === 'string' && !safe[1].content.includes('[object Object]'));
+});
+
+
+test('selectSpeakers prefers deterministic rules and never calls the model for them', async () => {
+    const participants = makeParticipants(['Alice', 'Bob', 'Charlie']);
+    const characters = makeCharacters(['Alice', 'Bob', 'Charlie']);
+    let calls = 0;
+    const provider = { chatCompletion: async () => { calls++; return { choices: [{ message: { content: '{"speakers": ["char-0"]}' } }] }; } };
+    const result = await selectSpeakers({ participants, characters, userMessage: 'Hey Bob', provider });
+    assert.deepEqual(result.map(p => p.id), ['part-1']);
+    assert.equal(calls, 0);
+    const group = await selectSpeakers({ participants, characters, userMessage: 'everyone, hi', provider });
+    assert.equal(group.length, 3);
+    assert.equal(calls, 0, 'group cues are deterministic and must not consult the model');
+});
+
+test('selectSpeakers honors a valid model decision for ambiguous turns', async () => {
+    const participants = makeParticipants(['Alice', 'Bob', 'Charlie']);
+    const characters = makeCharacters(['Alice', 'Bob', 'Charlie']);
+    const seen = [];
+    const provider = {
+        chatCompletion: async messages => {
+            seen.push(messages);
+            return { choices: [{ message: { content: '{"speakers": ["char-2"], "reason": "not spoken recently"}' } }] };
+        },
+    };
+    const result = await selectSpeakers({ participants, characters, userMessage: 'what should we do?', provider });
+    assert.deepEqual(result.map(p => p.id), ['part-2']);
+    assert.equal(seen.length, 1);
+    assert.ok(seen[0][1].content.includes('what should we do?'));
+});
+
+test('selectSpeakers falls back to least-recently-spoken when the model decision is invalid', async () => {
+    const participants = makeParticipants(['Alice', 'Bob']);
+    const characters = makeCharacters(['Alice', 'Bob']);
+    const history = [
+        { role: 'character', participant_id: 'part-0', content: 'hi' },
+    ];
+    const provider = {
+        chatCompletion: async () => ({ choices: [{ message: { content: 'I think Bob should answer.' } }] }),
+    };
+    const result = await selectSpeakers({ participants, characters, userMessage: 'hmm', recentMessages: history, provider });
+    assert.deepEqual(result.map(p => p.id), ['part-1'], 'invalid output must fall back to deterministic rotation, not the first character');
+});
+
+test('selectSpeakers falls back to least-recently-spoken when the model call throws', async () => {
+    const participants = makeParticipants(['Alice', 'Bob']);
+    const characters = makeCharacters(['Alice', 'Bob']);
+    const provider = { chatCompletion: async () => { throw new Error('model offline'); } };
+    const result = await selectSpeakers({ participants, characters, userMessage: 'hmm', recentMessages: [{ role: 'character', participant_id: 'part-0' }], provider });
+    assert.deepEqual(result.map(p => p.id), ['part-1']);
+});
+
+test('selectSpeakers works without a provider using deterministic rotation', async () => {
+    const participants = makeParticipants(['Alice', 'Bob', 'Charlie']);
+    const characters = makeCharacters(['Alice', 'Bob', 'Charlie']);
+    const fresh = await selectSpeakers({ participants, characters, userMessage: 'hmm' });
+    assert.deepEqual(fresh.map(p => p.id), ['part-0'], 'no history: first character, as before');
+    const rotated = await selectSpeakers({
+        participants,
+        characters,
+        userMessage: 'hmm',
+        recentMessages: [{ role: 'character', participant_id: 'part-0' }],
+    });
+    assert.deepEqual(rotated.map(p => p.id), ['part-1'], 'the least recently spoken character goes next');
+});
+
+test('selectSpeakers returns an empty array when no character participants exist', async () => {
+    const participants = [{ id: 'p1', character_id: 'c1', role: 'user' }];
+    const result = await selectSpeakers({ participants, characters: [], userMessage: 'hello' });
+    assert.deepEqual(result, []);
+});
+
+test('selectSpeakers maps multiple model-selected IDs to participants in participant order', async () => {
+    const participants = makeParticipants(['Alice', 'Bob', 'Charlie']);
+    const characters = makeCharacters(['Alice', 'Bob', 'Charlie']);
+    const provider = {
+        chatCompletion: async () => ({ choices: [{ message: { content: '{"speakers": ["char-2", "char-0"]}' } }] }),
+    };
+    const result = await selectSpeakers({ participants, characters, userMessage: 'hmm', provider });
+    assert.deepEqual(result.map(p => p.id), ['part-0', 'part-2']);
+});

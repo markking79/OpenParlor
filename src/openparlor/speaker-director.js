@@ -91,10 +91,12 @@ function isDirectAddress(messageLower, nameLower) {
  * @param {CharacterParticipant[]} participants All participants in the conversation
  * @param {Character[]} characters Character records corresponding to the participants
  * @param {string} userMessage The user's message content
- * @returns {CharacterParticipant[]} The selected character participants (non-empty when character participants exist)
+ * @returns {CharacterParticipant[]|null} The selected participants, or null when no
+ *   deterministic rule fires (ambiguous turn). Returns [] when no character
+ *   participants exist.
  */
-export function selectSpeaker(participants, characters, userMessage) {
-    const charParticipants = participants.filter(p => p.role === 'character');
+export function selectSpeakerByRules(participants, characters, userMessage) {
+    const charParticipants = (Array.isArray(participants) ? participants : []).filter(p => p && p.role === 'character');
     if (charParticipants.length === 0 || typeof userMessage !== 'string' || userMessage.trim() === '') {
         return [];
     }
@@ -108,7 +110,7 @@ export function selectSpeaker(participants, characters, userMessage) {
     }
 
     const nameMap = new Map();
-    for (const char of characters) {
+    for (const char of Array.isArray(characters) ? characters : []) {
         nameMap.set(char.id, char.name);
     }
 
@@ -136,5 +138,209 @@ export function selectSpeaker(participants, characters, userMessage) {
         return mentioned;
     }
 
-    return [charParticipants[0]];
+    return null;
+}
+
+/**
+ * Selects which character participant(s) should respond to a user message.
+ * Deterministic: the same inputs always produce the same output.
+ *
+ * Delegates to selectSpeakerByRules; when no deterministic rule fires,
+ * falls back to the first character participant (deterministic by order).
+ *
+ * @param {CharacterParticipant[]} participants All participants in the conversation
+ * @param {Character[]} characters Character records corresponding to the participants
+ * @param {string} userMessage The user's message content
+ * @returns {CharacterParticipant[]} The selected character participants (non-empty when character participants exist)
+ */
+export function selectSpeaker(participants, characters, userMessage) {
+    const byRules = selectSpeakerByRules(participants, characters, userMessage);
+    if (byRules !== null) {
+        return byRules;
+    }
+    const charParticipants = (Array.isArray(participants) ? participants : []).filter(p => p && p.role === 'character');
+    return charParticipants.length > 0 ? [charParticipants[0]] : [];
+}
+
+/**
+ * Deterministic anti-starvation fallback: picks the character participant
+ * who has spoken least often in the recent history. Ties resolve in
+ * participant order, so with no history the first character is picked.
+ *
+ * @param {CharacterParticipant[]} participants All participants in the conversation
+ * @param {Array<{role: string, participant_id?: string}>} [recentMessages] Recent stored messages (only role 'character' messages count)
+ * @returns {CharacterParticipant[]} At most one participant; [] when no character participants exist
+ */
+export function leastRecentlySpoken(participants, recentMessages = []) {
+    const charParticipants = (Array.isArray(participants) ? participants : []).filter(p => p && p.role === 'character');
+    if (charParticipants.length === 0) return [];
+    if (charParticipants.length === 1) return charParticipants;
+    const counts = new Map(charParticipants.map(p => [p.id, 0]));
+    for (const message of Array.isArray(recentMessages) ? recentMessages : []) {
+        if (message && message.role === 'character' && typeof message.participant_id === 'string' && counts.has(message.participant_id)) {
+            counts.set(message.participant_id, counts.get(message.participant_id) + 1);
+        }
+    }
+    let best = charParticipants[0];
+    let bestCount = counts.get(best.id);
+    for (let i = 1; i < charParticipants.length; i++) {
+        const participant = charParticipants[i];
+        const count = counts.get(participant.id);
+        if (count < bestCount) {
+            best = participant;
+            bestCount = count;
+        }
+    }
+    return [best];
+}
+
+
+/**
+ * Strictly parses a model-produced speaker decision.
+ *
+ * Accepts a raw model output string (optionally wrapped in code fences or
+ * surrounding prose — the outermost `{...}` block is parsed) or an already
+ * parsed object. The result is an array of character IDs in the model's
+ * order with duplicates removed.
+ *
+ * The decision is rejected (null) unless it is an object with a non-empty
+ * `speakers` array in which EVERY entry is a string present in `allowedIds`.
+ * Unknown, empty, or malformed entries invalidate the whole decision — the
+ * director must never be able to address a character that is not in the
+ * current conversation.
+ *
+ * @param {unknown} raw Model output (string or object)
+ * @param {string[]} allowedIds Character IDs currently in the conversation
+ * @returns {string[]|null} Validated character IDs, or null when invalid
+ */
+export function parseDirectorDecision(raw, allowedIds = []) {
+    const allowed = new Set((Array.isArray(allowedIds) ? allowedIds : [])
+        .filter(id => typeof id === 'string' && id !== ''));
+    let data = raw;
+    if (typeof data === 'string') {
+        const text = data.trim();
+        const start = text.indexOf('{');
+        const end = text.lastIndexOf('}');
+        if (start === -1 || end <= start) return null;
+        try {
+            data = JSON.parse(text.slice(start, end + 1));
+        } catch {
+            return null;
+        }
+    }
+    if (data === null || typeof data !== 'object' || Array.isArray(data)) return null;
+    const speakers = data.speakers;
+    if (!Array.isArray(speakers) || speakers.length === 0) return null;
+    const result = [];
+    for (const id of speakers) {
+        if (typeof id !== 'string' || !allowed.has(id)) return null;
+        if (!result.includes(id)) result.push(id);
+    }
+    return result.length > 0 ? result : null;
+}
+
+/**
+ * Builds the bounded prompt for a model-backed speaker decision on an
+ * ambiguous group turn. Only known character IDs are offered, and the model
+ * is instructed to reply with a single strict JSON object.
+ *
+ * @param {object} params
+ * @param {CharacterParticipant[]} [params.participants] Conversation participants
+ * @param {Character[]} [params.characters] Character records
+ * @param {string} [params.userMessage] The user's newest message
+ * @param {Array<{role: string, participant_id?: string, content?: string}>} [params.recentMessages] Recent stored messages for context
+ * @returns {Array<{ role: string, content: string }>} Two model messages
+ */
+export function buildDirectorPrompt({ participants = [], characters = [], userMessage = '', recentMessages = [] } = {}) {
+    const system = [
+        'You are a speaker director for a multi-character roleplay group chat.',
+        'Decide which character(s) should respond to the latest user message.',
+        'Rules:',
+        '- You may only use the character IDs listed in the Characters section. Never invent or guess other IDs.',
+        '- Usually choose exactly one character; choose more than one only when the message clearly invites several.',
+        '- Vary turn-taking: when the message does not imply otherwise, prefer a character who has not spoken recently.',
+        '- Reply with a single JSON object only, no markdown and no commentary: {"speakers": ["character-id"], "reason": "brief internal reason"}',
+    ].join('\n');
+
+    const nameById = new Map();
+    for (const character of Array.isArray(characters) ? characters : []) {
+        if (character && typeof character.id === 'string' && typeof character.name === 'string' && character.name !== '') {
+            nameById.set(character.id, character.name);
+        }
+    }
+    const charParticipants = (Array.isArray(participants) ? participants : []).filter(p => p && p.role === 'character');
+
+    const lines = ['Characters:'];
+    for (const participant of charParticipants) {
+        const name = nameById.get(participant.character_id);
+        lines.push(`- id: ${participant.character_id}${typeof name === 'string' ? ` (name: ${name})` : ''}`);
+    }
+    const recent = (Array.isArray(recentMessages) ? recentMessages : []).slice(-6);
+    if (recent.length > 0) {
+        lines.push('Recent conversation:');
+        for (const message of recent) {
+            if (message === null || typeof message !== 'object') continue;
+            const content = typeof message.content === 'string' ? message.content : '';
+            if (content === '') continue;
+            const speaker = message.role === 'character' ? `Character ${typeof message.participant_id === 'string' ? message.participant_id : ''}` : 'User';
+            lines.push(`${speaker}: ${content}`);
+        }
+    }
+    lines.push(`User's newest message: ${typeof userMessage === 'string' ? userMessage : ''}`);
+    lines.push('Choose the speaker(s) now.');
+
+    return [
+        { role: 'system', content: system },
+        { role: 'user', content: lines.join('\n') },
+    ];
+}
+
+// Bounded generation for the tiny director decision call.
+const DIRECTOR_MAX_MODEL_TOKENS = 200;
+
+/**
+ * Selects speakers with the hybrid STAB-006 design: deterministic rules
+ * first; for an ambiguous multi-character turn, an optional bounded model
+ * decision; strict validation of that decision; and a deterministic
+ * least-recently-spoken fallback when no model is available or the model
+ * output is invalid or fails. Never returns a participant whose character
+ * is not in the conversation.
+ *
+ * @param {object} params
+ * @param {CharacterParticipant[]} [params.participants] Conversation participants
+ * @param {Character[]} [params.characters] Character records
+ * @param {string} [params.userMessage] The user's newest message
+ * @param {Array<{role: string, participant_id?: string, content?: string}>} [params.recentMessages] Recent stored messages
+ * @param {{ chatCompletion: (messages: Array<{role: string, content: string}>, options?: object) => Promise<unknown> }} [params.provider] Model provider for the director call
+ * @returns {Promise<CharacterParticipant[]>} Selected participants in participant order (empty when no character participants exist)
+ */
+export async function selectSpeakers({ participants = [], characters = [], userMessage = '', recentMessages = [], provider = null } = {}) {
+    const byRules = selectSpeakerByRules(participants, characters, userMessage);
+    if (byRules !== null) {
+        return byRules;
+    }
+    const charParticipants = (Array.isArray(participants) ? participants : []).filter(p => p && p.role === 'character');
+    const fallback = leastRecentlySpoken(participants, recentMessages);
+    if (!provider || charParticipants.length < 2) {
+        return fallback;
+    }
+    const byCharacterId = new Map(charParticipants.map(p => [p.character_id, p]));
+    try {
+        const prompt = buildDirectorPrompt({ participants, characters, userMessage, recentMessages });
+        const completion = await provider.chatCompletion(prompt, { max_tokens: DIRECTOR_MAX_MODEL_TOKENS });
+        const raw = typeof completion?.choices?.[0]?.message?.content === 'string'
+            ? completion.choices[0].message.content
+            : '';
+        const ids = parseDirectorDecision(raw, [...byCharacterId.keys()]);
+        if (ids) {
+            const chosen = new Set(ids);
+            const selected = charParticipants.filter(p => chosen.has(p.character_id));
+            if (selected.length > 0) {
+                return selected;
+            }
+        }
+    } catch (error) {
+        console.error('OpenParlor: speaker director decision failed', error);
+    }
+    return fallback;
 }
