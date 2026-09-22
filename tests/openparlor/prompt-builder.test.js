@@ -380,3 +380,107 @@ test('single-character prompt remains compatible without participants field', ()
     assert.ok(!sys.includes('Present participants'));
     assert.equal(result.length, 3);
 });
+
+// ─── Speaker-relative group history (QWEN-GROUP-001) ─────────────────────────
+
+const GROUP_CONTEXT = [
+    { participant_id: 'part-doug', character_id: 'char-doug', name: 'Doug' },
+    { participant_id: 'part-monica', character_id: 'char-monica', name: 'Monica' },
+];
+
+const GROUP_HISTORY = [
+    { role: 'user', content: 'Hello everyone', participant_id: 'part-doug' },
+    { role: 'character', content: "Hi, I'm Doug", participant_id: 'part-doug' },
+    { role: 'character', content: "Hi, I'm Monica", participant_id: 'part-monica' },
+];
+
+test('group prompt for Monica keeps her own line as assistant and labels Doug\'s line', () => {
+    const character = { id: 'char-monica', name: 'Monica', system_prompt: 'You are Monica.' };
+    const conversation = {};
+    const newMessages = [{ role: 'user', content: 'What are you working on today?' }];
+    const result = buildPrompt({ character, conversation, history: GROUP_HISTORY, newMessages, participantContext: GROUP_CONTEXT });
+
+    const sys = result[0].content;
+    assert.ok(sys.includes('Present participants in this conversation: Doug, Monica'));
+    assert.ok(!sys.includes('[object Object]'));
+
+    const monicaLine = result.find(m => m.content === "Hi, I'm Monica");
+    assert.ok(monicaLine, 'Monica line must be present');
+    assert.equal(monicaLine.role, 'assistant');
+
+    const dougLine = result.find(m => m.content.includes("I'm Doug"));
+    assert.ok(dougLine, 'Doug line must be present');
+    assert.equal(dougLine.role, 'user');
+    assert.ok(dougLine.content.includes('Doug'), 'Doug line must be attributed to Doug');
+    assert.ok(!result.some(m => m.role === 'assistant' && m.content.includes("I'm Doug")),
+        'Doug line must not be an anonymous assistant message');
+
+    assert.equal(result.filter(m => m.content === 'Hello everyone').length, 1);
+    const userTurn = result.filter(m => m.content === 'What are you working on today?');
+    assert.equal(userTurn.length, 1, 'newest user turn must appear exactly once');
+    assert.equal(result[result.length - 1].content, 'What are you working on today?');
+});
+
+test('group prompt for Doug keeps his own line as assistant and labels Monica\'s line', () => {
+    const character = { id: 'char-doug', name: 'Doug', system_prompt: 'You are Doug.' };
+    const conversation = {};
+    const newMessages = [{ role: 'user', content: 'What are you working on today?' }];
+    const result = buildPrompt({ character, conversation, history: GROUP_HISTORY, newMessages, participantContext: GROUP_CONTEXT });
+
+    const sys = result[0].content;
+    assert.ok(sys.includes('Present participants in this conversation: Doug, Monica'));
+
+    const dougLine = result.find(m => m.content === "Hi, I'm Doug");
+    assert.ok(dougLine, 'Doug line must be present');
+    assert.equal(dougLine.role, 'assistant');
+
+    const monicaLine = result.find(m => m.content.includes("I'm Monica"));
+    assert.ok(monicaLine, 'Monica line must be present');
+    assert.equal(monicaLine.role, 'user');
+    assert.ok(monicaLine.content.includes('Monica'), 'Monica line must be attributed to Monica');
+    assert.ok(!result.some(m => m.role === 'assistant' && m.content.includes("I'm Monica")),
+        'Monica line must not be an anonymous assistant message');
+});
+
+test('participantContext names take precedence over raw participant records', () => {
+    const character = { id: 'char-monica', name: 'Monica', system_prompt: '' };
+    const conversation = { participants: [{ participant_id: 'part-doug', character_id: 'char-doug', role: 'character' }] };
+    const result = buildPrompt({ character, conversation, history: [], newMessages: [], participantContext: GROUP_CONTEXT });
+    const sys = result[0].content;
+    assert.ok(sys.includes('Present participants in this conversation: Doug, Monica'));
+    assert.ok(!sys.includes('[object Object]'));
+});
+
+test('participant records with name fields render readable names', () => {
+    const character = { name: 'Doug', system_prompt: '' };
+    const conversation = { participants: [{ name: 'Doug' }, { name: 'Monica' }] };
+    const result = buildPrompt({ character, conversation, history: [], newMessages: [] });
+    const sys = result[0].content;
+    assert.ok(sys.includes('Present participants in this conversation: Doug, Monica'));
+    assert.ok(!sys.includes('[object Object]'));
+});
+
+test('character history without participant_id stays assistant when context present (legacy data)', () => {
+    const character = { id: 'char-monica', name: 'Monica', system_prompt: '' };
+    const history = [
+        { role: 'user', content: 'hi' },
+        { role: 'character', content: 'legacy line' },
+    ];
+    const result = buildPrompt({ character, conversation: {}, history, newMessages: [], participantContext: GROUP_CONTEXT });
+    const line = result.find(m => m.content === 'legacy line');
+    assert.equal(line.role, 'assistant');
+});
+
+test('single-character prompt without participantContext is unchanged', () => {
+    const character = { name: 'Alice', system_prompt: 'You are Alice.' };
+    const history = [
+        { role: 'user', content: 'hi' },
+        { role: 'character', content: 'hello' },
+    ];
+    const result = buildPrompt({ character, conversation: {}, history, newMessages: [] });
+    const sys = result[0].content;
+    assert.ok(!sys.includes('Present participants'));
+    assert.ok(!sys.includes('said to the group'));
+    assert.equal(result[1].role, 'user');
+    assert.equal(result[2].role, 'assistant');
+});

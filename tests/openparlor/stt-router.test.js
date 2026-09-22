@@ -1,7 +1,11 @@
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import http from 'node:http';
 import express from 'express';
+import { createAvatarUploadMiddleware } from '../../src/middleware/avatarUpload.js';
 import { createOpenParlorSttRouter } from '../../src/openparlor/stt-router.js';
 
 const sttConfig = { provider: 'faster-whisper', pythonExecutable: '/safe/python', runnerPath: '/safe/runner.py', modelPath: '/safe/model', modelCacheDir: '/safe/cache', maxAudioBytes: 1024, timeoutMs: 1000 };
@@ -76,5 +80,63 @@ describe('OpenParlor STT router', () => {
             assert.equal(body.error, 'Transcription is unavailable');
             assert.ok(!body.error.includes('private'));
         });
+    });
+});
+
+describe('global avatar upload middleware', () => {
+    /**
+     * Builds an app that mirrors the server-main.js middleware order: authentication,
+     * the global avatar upload middleware, then the OpenParlor STT router.
+     * @param {{ directories: object } | null} user
+     * @param {object} [dependencies]
+     * @param {string} uploadsPath
+     * @returns {import('express').Express}
+     */
+    function appWithAvatarMiddleware(user, dependencies = {}, uploadsPath) {
+        const app = express();
+        app.use((req, _res, next) => { req.user = user; next(); });
+        app.use(createAvatarUploadMiddleware(uploadsPath));
+        app.use('/api/openparlor/stt', createOpenParlorSttRouter(dependencies));
+        return app;
+    }
+
+    it('lets OpenParlor STT audio uploads bypass the global avatar parser', async () => {
+        const uploadsPath = fs.mkdtempSync(path.join(os.tmpdir(), 'openparlor-avatar-'));
+        const user = { directories: { root: '/private/alice' } };
+        const dependencies = {
+            loadConfig: async () => ({ stt: sttConfig }),
+            createProvider: () => ({ transcribe: async () => ({ text: 'bypassed', language: 'en' }) }),
+        };
+        try {
+            await withServer(appWithAvatarMiddleware(user, dependencies, uploadsPath), async baseUrl => {
+                const result = await fetch(`${baseUrl}/api/openparlor/stt/transcribe`, { method: 'POST', body: audioForm() });
+                assert.equal(result.status, 200);
+                assert.deepEqual(await result.json(), { text: 'bypassed', language: 'en' });
+            });
+        } finally {
+            fs.rmSync(uploadsPath, { recursive: true, force: true });
+        }
+    });
+
+    it('still parses and stores SillyTavern avatar uploads on non-STT routes', async () => {
+        const uploadsPath = fs.mkdtempSync(path.join(os.tmpdir(), 'openparlor-avatar-'));
+        try {
+            const app = express();
+            app.use((req, _res, next) => { req.user = { directories: { root: '/private/alice' } }; next(); });
+            app.use(createAvatarUploadMiddleware(uploadsPath));
+            app.post('/api/avatar', (req, res) => { res.json({ filename: req.file ? req.file.filename : null, destination: req.file ? req.file.destination : null }); });
+            await withServer(app, async baseUrl => {
+                const form = new FormData();
+                form.append('avatar', new Blob([Buffer.from('png-bytes')], { type: 'image/png' }), 'avatar.png');
+                const result = await fetch(`${baseUrl}/api/avatar`, { method: 'POST', body: form });
+                const body = await result.json();
+                assert.equal(result.status, 200);
+                assert.ok(body.filename);
+                assert.equal(body.destination, uploadsPath);
+            });
+            assert.equal(fs.readdirSync(uploadsPath).length, 1);
+        } finally {
+            fs.rmSync(uploadsPath, { recursive: true, force: true });
+        }
     });
 });

@@ -140,7 +140,8 @@ export function createOpenParlorCharacterRouter({ persistence: persistenceModule
     router.get('/', (request, response) => {
         const auth = withAuth(request, response);
         if (!auth) return;
-        return response.json(persistenceModule.listCharacters(auth.directories, auth.handle));
+        const includeArchived = request.query.include_archived === 'true';
+        return response.json(persistenceModule.listCharacters(auth.directories, auth.handle, { includeArchived }));
     });
 
     router.post('/', async (request, response) => {
@@ -165,7 +166,7 @@ export function createOpenParlorCharacterRouter({ persistence: persistenceModule
         return character ? response.json(character) : undefined;
     });
 
-    router.patch('/:id', async (request, response) => {
+    async function updateCharacterHandler(request, response) {
         const auth = withAuth(request, response);
         if (!auth) return;
         if (!getOwnedCharacter(request, response, auth)) return;
@@ -179,13 +180,34 @@ export function createOpenParlorCharacterRouter({ persistence: persistenceModule
             }
         }
         return response.json(persistenceModule.updateCharacter(auth.directories, request.params.id, validated.value));
-    });
+    }
+
+    // PUT /:id and PATCH /:id share the same canonical, validated update path.
+    // (PUT is preserved for backwards compatibility with the legacy monolith
+    // route, which previously applied no field validation.)
+    router.put('/:id', updateCharacterHandler);
+    router.patch('/:id', updateCharacterHandler);
 
     router.delete('/:id', (request, response) => {
         const auth = withAuth(request, response);
         if (!auth) return;
-        if (!getOwnedCharacter(request, response, auth)) return;
-        persistenceModule.deleteCharacter(auth.directories, request.params.id);
+        const character = getOwnedCharacter(request, response, auth);
+        if (!character) return;
+        // Safe deletion policy: characters still referenced by conversations
+        // or memories are archived (soft delete) so history stays resolvable;
+        // only unreferenced characters are hard-deleted.
+        if (typeof persistenceModule.characterHasHistory === 'function'
+            && persistenceModule.characterHasHistory(auth.directories, character.owner_id, character.id)) {
+            const archived = persistenceModule.archiveCharacter(auth.directories, character.id);
+            if (!archived) {
+                return response.status(404).json({ error: 'Character not found' });
+            }
+            return response.json({ archived: true, deleted: false, character: archived });
+        }
+        if (typeof persistenceModule.removeCharacterAvatarFile === 'function') {
+            persistenceModule.removeCharacterAvatarFile(auth.directories, character);
+        }
+        persistenceModule.deleteCharacter(auth.directories, character.id);
         return response.status(204).end();
     });
 

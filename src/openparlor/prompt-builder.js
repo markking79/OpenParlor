@@ -10,6 +10,38 @@ function participantsRule(names) {
     return `Present participants in this conversation: ${names.join(', ')}. Address them by name when appropriate.`;
 }
 
+function groupContextRule() {
+    return 'Earlier speech from other participants is shown as labeled context lines such as "[Doug said to the group]: ...". Those labeled lines are not your own words; only assistant messages without such a label are your previous speech.';
+}
+
+/**
+ * Normalizes participant entries into readable display names.
+ * Accepts plain strings or objects with a string `name` field (e.g. stored
+ * participant records). Entries without a readable name are dropped so that
+ * raw records can never leak into the prompt as "[object Object]".
+ *
+ * @param {Array<string | {name?: string}>} entries
+ * @returns {string[]} Readable names, in input order
+ */
+function normalizeParticipantNames(entries) {
+    if (!Array.isArray(entries)) {
+        return [];
+    }
+    const names = [];
+    for (const entry of entries) {
+        let name = '';
+        if (typeof entry === 'string') {
+            name = entry;
+        } else if (entry && typeof entry === 'object' && typeof entry.name === 'string') {
+            name = entry.name;
+        }
+        if (name.trim() !== '') {
+            names.push(name.trim());
+        }
+    }
+    return names;
+}
+
 /**
  * Builds the authoritative model prompt from server-side character and
  * conversation data. Browser-supplied system prompts and character identity
@@ -22,9 +54,13 @@ function participantsRule(names) {
  * @param {Array<{role: string, content: string}>} params.newMessages - New messages from the request (only 'user' role is used)
  * @param {string[]} [params.memories] Pre-formatted memory lines to inject into the system prompt
  * @param {string} [params.currentTime] Server-derived ISO 8601 timestamp; only used when character.time_aware is true
+ * @param {Array<{participant_id: string, character_id: string, name: string}>} [params.participantContext]
+ *   Server-resolved character participants in participant order. When provided,
+ *   the participant list in the system prompt uses these names and history is
+ *   rendered speaker-relative to the target character.
  * @returns {Array<{role: string, content: string}>} Assembled model messages
  */
-export function buildPrompt({ character, conversation, history, newMessages, memories, currentTime }) {
+export function buildPrompt({ character, conversation, history, newMessages, memories, currentTime, participantContext }) {
     const messages = [];
 
     // System prompt: global behavior + identity + persona + scenario + participants
@@ -38,8 +74,15 @@ export function buildPrompt({ character, conversation, history, newMessages, mem
     if (character && typeof character.scenario === 'string' && character.scenario) {
         systemParts.push(`Scenario: ${character.scenario}`);
     }
-    if (conversation && Array.isArray(conversation.participants) && conversation.participants.length > 0) {
-        systemParts.push(participantsRule(conversation.participants));
+    let participantNames = normalizeParticipantNames(participantContext);
+    if (participantNames.length === 0 && conversation && Array.isArray(conversation.participants)) {
+        participantNames = normalizeParticipantNames(conversation.participants);
+    }
+    if (participantNames.length > 0) {
+        systemParts.push(participantsRule(participantNames));
+    }
+    if (participantNames.length > 1) {
+        systemParts.push(groupContextRule());
     }
     if (character && character.time_aware === true && typeof currentTime === 'string' && currentTime) {
         systemParts.push(`Current server time: ${currentTime}`);
@@ -54,11 +97,37 @@ export function buildPrompt({ character, conversation, history, newMessages, mem
     }
     messages.push({ role: 'system', content: systemParts.join('\n\n') });
 
-    // Bounded history with role conversion (character → assistant)
+    // Speaker-relative history. When a participant context is provided, each
+    // stored character message is mapped by participant_id: the target
+    // character's own speech stays an assistant message while every other
+    // character's speech becomes a labeled user context line, so the model
+    // can distinguish its own previous words from other characters' words.
+    // Without a context, the legacy mapping (character → assistant) applies.
+    let contextById = null;
+    if (Array.isArray(participantContext) && participantContext.length > 0) {
+        contextById = new Map();
+        for (const entry of participantContext) {
+            if (entry && typeof entry === 'object' && typeof entry.participant_id === 'string') {
+                contextById.set(entry.participant_id, entry);
+            }
+        }
+    }
+    const targetCharacterId = character && typeof character.id === 'string' ? character.id : null;
+
     const bounded = (history || []).filter(msg => msg && (msg.role === 'user' || msg.role === 'character')).slice(-MAX_HISTORY_MESSAGES);
     for (const msg of bounded) {
-        const role = msg.role === 'character' ? 'assistant' : 'user';
-        messages.push({ role, content: msg.content });
+        if (msg.role === 'user') {
+            messages.push({ role: 'user', content: msg.content });
+            continue;
+        }
+        const entry = (contextById && typeof msg.participant_id === 'string') ? contextById.get(msg.participant_id) : undefined;
+        if (entry && targetCharacterId && entry.character_id === targetCharacterId) {
+            messages.push({ role: 'assistant', content: msg.content });
+        } else if (entry && entry.character_id !== targetCharacterId && typeof entry.name === 'string' && entry.name.trim() !== '') {
+            messages.push({ role: 'user', content: `[${entry.name} said to the group]: ${msg.content}` });
+        } else {
+            messages.push({ role: 'assistant', content: msg.content });
+        }
     }
 
     // New user messages (only 'user' role; system/assistant from browser are ignored)

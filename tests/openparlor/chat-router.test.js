@@ -1989,3 +1989,205 @@ test('memory extraction is NOT triggered on stream error', async () => {
         tmp.cleanup();
     }
 });
+
+// ─── QWEN-GROUP-001: group chat correctness ──────────────────────────────────
+
+test('group stream with whole-group cue: each speaker prompted, user persisted once, done record', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const doug = persistence.createCharacter(dirs, 'alice', { name: 'Doug', system_prompt: 'You are Doug.' });
+        const monica = persistence.createCharacter(dirs, 'alice', { name: 'Monica', system_prompt: 'You are Monica.' });
+        const conv = persistence.createConversation(dirs, 'alice', doug.id, 'Group');
+        const storedConversation = findAndModifyConversation(dirs, conv.id, data => {
+            data.participants.push({ id: 'part-monica', character_id: monica.id, role: 'character' });
+        });
+        const dougParticipant = storedConversation.participants.find(p => p.character_id === doug.id);
+        const monicaParticipant = storedConversation.participants.find(p => p.character_id === monica.id);
+
+        let callCount = 0;
+        const encoder = new TextEncoder();
+        const mock = {
+            calls: [],
+            provider: {
+                chatCompletion: async () => { throw new Error('not expected'); },
+                streamChatCompletion: async (messages) => {
+                    callCount++;
+                    mock.calls.push(messages);
+                    const text = callCount === 1 ? 'Doug says hello' : 'Monica says hello';
+                    return (async function* () {
+                        yield encoder.encode(sseDelta(text));
+                        yield encoder.encode('data: [DONE]\n\n');
+                    })();
+                },
+            },
+        };
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+            runMemoryExtraction: async () => [],
+        }, user, async baseUrl => {
+            const result = await postChatStream(baseUrl, {
+                messages: [{ role: 'user', content: 'Hey, how is everyone doing?' }],
+                stream: true,
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+            assert.deepEqual(result.records, [
+                { type: 'speaker_start', character_id: doug.id, participant_id: dougParticipant.id },
+                { type: 'delta', text: 'Doug says hello' },
+                { type: 'speaker_end', character_id: doug.id, participant_id: dougParticipant.id },
+                { type: 'speaker_start', character_id: monica.id, participant_id: monicaParticipant.id },
+                { type: 'delta', text: 'Monica says hello' },
+                { type: 'speaker_end', character_id: monica.id, participant_id: monicaParticipant.id },
+                { type: 'done', conversation_id: conv.id },
+            ]);
+        });
+
+        assert.equal(mock.calls.length, 2, 'provider should be called once per selected speaker');
+        assert.ok(mock.calls[0][0].content.includes('You are Doug.'));
+        assert.ok(!mock.calls[0][0].content.includes('You are Monica.'), 'Doug prompt must not carry Monica persona');
+        assert.ok(mock.calls[1][0].content.includes('You are Monica.'));
+        assert.ok(!mock.calls[1][0].content.includes('You are Doug.'), 'Monica prompt must not carry Doug persona');
+
+        const messages = persistence.getMessages(dirs, conv.id);
+        assert.equal(messages.filter(m => m.role === 'user').length, 1, 'user message must be persisted exactly once');
+        assert.equal(messages[0].role, 'user');
+        assert.equal(messages[0].content, 'Hey, how is everyone doing?');
+        assert.equal(messages.length, 3);
+        assert.equal(messages[1].participant_id, dougParticipant.id);
+        assert.equal(messages[2].participant_id, monicaParticipant.id);
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('group prompt lists actual participant names instead of raw records', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const doug = persistence.createCharacter(dirs, 'alice', { name: 'Doug', system_prompt: 'You are Doug.' });
+        const monica = persistence.createCharacter(dirs, 'alice', { name: 'Monica', system_prompt: 'You are Monica.' });
+        const conv = persistence.createConversation(dirs, 'alice', doug.id, 'Group');
+        findAndModifyConversation(dirs, conv.id, data => {
+            data.participants.push({ id: 'part-monica', character_id: monica.id, role: 'character' });
+        });
+        const mock = mockProvider(() => completion);
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+            runMemoryExtraction: async () => [],
+        }, user, async baseUrl => {
+            const result = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'Doug and Monica, answer' }],
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+        });
+
+        assert.equal(mock.calls.length, 2);
+        const sys = mock.calls[0][0].content;
+        assert.ok(sys.includes('Present participants in this conversation: Doug, Monica'),
+            'system prompt must contain readable participant names');
+        assert.ok(!sys.includes('[object Object]'), 'system prompt must not stringify raw participant records');
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('provider prompt contains persisted history and new question exactly once each', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const doug = persistence.createCharacter(dirs, 'alice', { name: 'Doug', system_prompt: 'You are Doug.' });
+        const conv = persistence.createConversation(dirs, 'alice', doug.id, 'Chat');
+        const storedConversation = persistence.getConversation(dirs, conv.id);
+        const dougParticipant = storedConversation.participants.find(p => p.character_id === doug.id);
+        // Pre-persisted history from an earlier turn.
+        persistence.appendMessage(dirs, conv.id, dougParticipant.id, 'old question', 'user');
+        persistence.appendMessage(dirs, conv.id, dougParticipant.id, 'old response', 'character');
+        const mock = mockProvider(() => completion);
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+            runMemoryExtraction: async () => [],
+        }, user, async baseUrl => {
+            const result = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'new question' }],
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+        });
+
+        const prompt = mock.calls[0];
+        const count = text => prompt.filter(m => m.content === text).length;
+        assert.equal(count('old question'), 1, 'persisted user turn must appear exactly once');
+        assert.equal(count('old response'), 1, 'persisted character turn must appear exactly once');
+        assert.equal(count('new question'), 1, 'new user turn must appear exactly once');
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('group prompt keeps speaker identity of persisted history for the selected speaker', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const doug = persistence.createCharacter(dirs, 'alice', { name: 'Doug', system_prompt: 'You are Doug.' });
+        const monica = persistence.createCharacter(dirs, 'alice', { name: 'Monica', system_prompt: 'You are Monica.' });
+        const conv = persistence.createConversation(dirs, 'alice', doug.id, 'Group');
+        findAndModifyConversation(dirs, conv.id, data => {
+            data.participants.push({ id: 'part-monica', character_id: monica.id, role: 'character' });
+        });
+        const conversation = persistence.getConversation(dirs, conv.id);
+        const dougParticipant = conversation.participants.find(p => p.character_id === doug.id);
+        const monicaParticipant = conversation.participants.find(p => p.character_id === monica.id);
+        // Pre-persisted history from an earlier group turn.
+        persistence.appendMessage(dirs, conv.id, dougParticipant.id, 'Hello everyone', 'user');
+        persistence.appendMessage(dirs, conv.id, dougParticipant.id, "Hi, I am Doug", 'character');
+        persistence.appendMessage(dirs, conv.id, monicaParticipant.id, "Hi, I am Monica", 'character');
+        const mock = mockProvider(() => completion);
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+            runMemoryExtraction: async () => [],
+        }, user, async baseUrl => {
+            const result = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'Monica, what are you working on today?' }],
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+        });
+
+        assert.equal(mock.calls.length, 1, 'only Monica should be selected');
+        const prompt = mock.calls[0];
+        const system = prompt[0].content;
+        assert.ok(system.includes('You are Monica.'));
+        assert.ok(system.includes('Present participants in this conversation: Doug, Monica'));
+        assert.ok(!system.includes('[object Object]'));
+
+        const monicaLine = prompt.find(m => m.content === "Hi, I am Monica");
+        assert.ok(monicaLine, 'Monica line must be present');
+        assert.equal(monicaLine.role, 'assistant', 'the target character\'s own line must be an assistant message');
+
+        const dougLine = prompt.find(m => m.content.includes("Hi, I am Doug"));
+        assert.ok(dougLine, 'Doug line must be present');
+        assert.equal(dougLine.role, 'user', 'another character\'s line must not be an assistant message');
+        assert.ok(dougLine.content.includes('[Doug said to the group]'), 'Doug line must be attributed to Doug');
+        assert.ok(!prompt.some(m => m.role === 'assistant' && m.content.includes("Hi, I am Doug")));
+    } finally {
+        tmp.cleanup();
+    }
+});

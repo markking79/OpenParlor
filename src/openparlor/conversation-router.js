@@ -11,6 +11,9 @@ function isValidId(id) {
     return typeof id === 'string' && id.length > 0 && !id.includes('/') && !id.includes('\\') && !id.includes('..');
 }
 
+/** Roles accepted by the manual message-append endpoint. */
+const MESSAGE_ROLES = new Set(['user', 'character', 'system']);
+
 /**
  * Creates the OpenParlor conversation router.
  * @param {{ persistence?: typeof persistence }} [dependencies] Injectable dependencies for tests
@@ -117,8 +120,10 @@ export function createOpenParlorConversationRouter({
         return response.json({ ...result.conversation, messages });
     });
 
-    // PATCH /:id — Rename and/or archive
-    router.patch('/:id', (request, response) => {
+    // PATCH /:id and PUT /:id — Rename and/or archive.
+    // Both verbs share the same canonical, validated update path. (PUT is
+    // preserved for backwards compatibility with the legacy monolith route.)
+    function updateConversationHandler(request, response) {
         const auth = getAuthContext(request);
         if (!auth) {
             return response.status(401).json({ error: 'Authentication is required' });
@@ -150,7 +155,9 @@ export function createOpenParlorConversationRouter({
             return response.status(404).json({ error: 'Conversation not found' });
         }
         return response.json(updated);
-    });
+    }
+    router.put('/:id', updateConversationHandler);
+    router.patch('/:id', updateConversationHandler);
 
     // PUT /:id/participants — Set conversation participants
     router.put('/:id/participants', (request, response) => {
@@ -229,6 +236,44 @@ export function createOpenParlorConversationRouter({
         }
         persistenceModule.deleteConversation(auth.directories, request.params.id);
         return response.status(204).end();
+    });
+
+    // POST /:id/messages — Append a message to a conversation
+    router.post('/:id/messages', (request, response) => {
+        const auth = getAuthContext(request);
+        if (!auth) {
+            return response.status(401).json({ error: 'Authentication is required' });
+        }
+        const result = getOwnedConversation(auth.directories, request.params.id, auth.handle);
+        if (result.error) {
+            return response.status(result.status).json({ error: result.error });
+        }
+        const { participant_id, content, role } = request.body ?? {};
+        if (typeof participant_id !== 'string' || participant_id === '') {
+            return response.status(400).json({ error: '"participant_id" must be a non-empty string' });
+        }
+        if (typeof content !== 'string' || content === '') {
+            return response.status(400).json({ error: '"content" must be a non-empty string' });
+        }
+        if (typeof role !== 'string' || !MESSAGE_ROLES.has(role)) {
+            return response.status(400).json({ error: '"role" must be "user", "character", or "system"' });
+        }
+        const message = persistenceModule.appendMessage(auth.directories, request.params.id, participant_id, content, role);
+        return response.status(201).json(message);
+    });
+
+    // GET /:id/messages — List a conversation's messages
+    router.get('/:id/messages', (request, response) => {
+        const auth = getAuthContext(request);
+        if (!auth) {
+            return response.status(401).json({ error: 'Authentication is required' });
+        }
+        const result = getOwnedConversation(auth.directories, request.params.id, auth.handle);
+        if (result.error) {
+            return response.status(result.status).json({ error: result.error });
+        }
+        const messages = persistenceModule.getMessages(auth.directories, request.params.id);
+        return response.json(messages);
     });
 
     return router;

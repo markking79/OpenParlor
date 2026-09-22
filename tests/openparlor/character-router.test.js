@@ -2,15 +2,22 @@ import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import express from 'express';
 import { createOpenParlorCharacterRouter } from '../../src/openparlor/character-router.js';
+import { createOpenParlorConversationRouter } from '../../src/openparlor/conversation-router.js';
+import * as realPersistence from '../../src/openparlor/persistence.js';
 
 // ─── Mock persistence ────────────────────────────────────────────────────────
 
 function createMockPersistence() {
     const characters = new Map();
-    return {
+    const mock = {
         characters,
+        conversations: [],
+        memories: [],
         createCharacter(_directories, owner_id, data) {
             const now = new Date().toISOString();
             const character = {
@@ -29,6 +36,7 @@ function createMockPersistence() {
                 ...(typeof data.temperature === 'number' ? { temperature: data.temperature } : {}),
                 ...(typeof data.max_tokens === 'number' ? { max_tokens: data.max_tokens } : {}),
                 ...(typeof data.time_aware === 'boolean' ? { time_aware: data.time_aware } : {}),
+                archived: false,
                 owner_id,
                 created_at: now,
                 updated_at: now,
@@ -39,8 +47,10 @@ function createMockPersistence() {
         getCharacter(_directories, id) {
             return characters.get(id) ?? null;
         },
-        listCharacters(_directories, owner_id) {
-            return [...characters.values()].filter(c => c.owner_id === owner_id);
+        listCharacters(_directories, owner_id, { includeArchived = false } = {}) {
+            return [...characters.values()]
+                .filter(c => c.owner_id === owner_id)
+                .filter(c => includeArchived || !c.archived);
         },
         updateCharacter(_directories, id, updates) {
             const existing = characters.get(id);
@@ -59,7 +69,34 @@ function createMockPersistence() {
         deleteCharacter(_directories, id) {
             return characters.delete(id);
         },
+        archiveCharacter(_directories, id) {
+            return mock.updateCharacter(_directories, id, { archived: true });
+        },
+        characterHasHistory(_directories, owner_id, character_id) {
+            for (const conversation of mock.conversations) {
+                if (conversation.owner_id !== owner_id) continue;
+                if (conversation.character_id === character_id) return true;
+                const participants = Array.isArray(conversation.participants) ? conversation.participants : [];
+                if (participants.some(p => p && p.character_id === character_id)) return true;
+            }
+            for (const memory of mock.memories) {
+                if (memory.owner_id !== owner_id) continue;
+                if (memory.character_id === character_id) return true;
+                if ((memory.known_by_character_ids ?? []).includes(character_id)) return true;
+            }
+            return false;
+        },
+        removeCharacterAvatarFile() {
+            return false;
+        },
+        addConversationReference(conversation) {
+            mock.conversations.push(conversation);
+        },
+        addMemoryReference(memory) {
+            mock.memories.push(memory);
+        },
     };
+    return mock;
 }
 
 // ─── Test helpers ────────────────────────────────────────────────────────────
@@ -188,6 +225,102 @@ describe('OpenParlor Character Router', () => {
             assert.equal(body.id, created.id);
         });
 
+        it('updates a character via PUT (legacy verb, same validation)', async () => {
+            const created = await (await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'Original' }),
+            })).json();
+
+            const res = await fetch(`${baseUrl}/api/openparlor/characters/${created.id}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'PUT-updated', temperature: 0.7 }),
+            });
+            assert.equal(res.status, 200);
+            const body = await res.json();
+            assert.equal(body.name, 'PUT-updated');
+            assert.equal(body.temperature, 0.7);
+            assert.equal(body.id, created.id);
+        });
+
+        it('applies field validation to PUT (rejects an unsupported field)', async () => {
+            const created = await (await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'Guarded' }),
+            })).json();
+
+            // The legacy monolith PUT had no validation and would have stored
+            // arbitrary fields. The canonical router must reject them.
+            const res = await fetch(`${baseUrl}/api/openparlor/characters/${created.id}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'ok', owner_id: 'hacker', evil: true }),
+            });
+            assert.equal(res.status, 400);
+        });
+
+        it('applies length validation to PUT (rejects an oversized name)', async () => {
+            const created = await (await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'Guarded' }),
+            })).json();
+
+            const res = await fetch(`${baseUrl}/api/openparlor/characters/${created.id}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'x'.repeat(20_001) }),
+            });
+            assert.equal(res.status, 400);
+        });
+
+        it('rejects an empty PUT body', async () => {
+            const created = await (await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'Guarded' }),
+            })).json();
+
+            const res = await fetch(`${baseUrl}/api/openparlor/characters/${created.id}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({}),
+            });
+            assert.equal(res.status, 400);
+        });
+
+        it('returns 404 for PUT on a non-existent character', async () => {
+            const res = await fetch(`${baseUrl}/api/openparlor/characters/nonexistent`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'nope' }),
+            });
+            assert.equal(res.status, 404);
+        });
+
+        it('returns 403 for PUT on a non-owned character', async () => {
+            const created = await (await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'Alice Secret' }),
+            })).json();
+
+            const bobApp = createTestApp(persistence, makeUser('bob'));
+            const { server: bobServer, baseUrl: bobUrl } = await startServer(bobApp);
+            try {
+                const res = await fetch(`${bobUrl}/api/openparlor/characters/${created.id}`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: 'hacked' }),
+                });
+                assert.equal(res.status, 403);
+            } finally {
+                await stopServer(bobServer);
+            }
+        });
+
         it('deletes a character', async () => {
             const created = await (await fetch(`${baseUrl}/api/openparlor/characters`, {
                 method: 'POST',
@@ -237,6 +370,181 @@ describe('OpenParlor Character Router', () => {
             assert.equal(res.status, 201);
             const clone = await res.json();
             assert.equal(clone.name, 'My Clone');
+        });
+    });
+
+    // ─── Safe deletion policy ───────────────────────────────────────────────
+
+    describe('safe deletion policy', () => {
+        it('archives a referenced character instead of deleting it', async () => {
+            const created = await (await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'Referenced' }),
+            })).json();
+
+            persistence.addConversationReference({
+                id: 'conv-1',
+                owner_id: 'alice',
+                character_id: created.id,
+                participants: [],
+                archived: false,
+            });
+
+            const delRes = await fetch(`${baseUrl}/api/openparlor/characters/${created.id}`, { method: 'DELETE' });
+            assert.equal(delRes.status, 200);
+            const body = await delRes.json();
+            assert.equal(body.deleted, false);
+            assert.equal(body.archived, true);
+            assert.equal(body.character.id, created.id);
+            assert.equal(body.character.archived, true);
+            assert.equal(body.character.name, 'Referenced');
+
+            // The record remains and stays resolvable by id…
+            const getRes = await fetch(`${baseUrl}/api/openparlor/characters/${created.id}`);
+            assert.equal(getRes.status, 200);
+            assert.equal((await getRes.json()).archived, true);
+
+            // …is hidden from the default list…
+            const defaultList = await (await fetch(`${baseUrl}/api/openparlor/characters`)).json();
+            assert.equal(defaultList.length, 0);
+
+            // …but included when archived characters are requested.
+            const fullList = await (await fetch(`${baseUrl}/api/openparlor/characters?include_archived=true`)).json();
+            assert.equal(fullList.length, 1);
+            assert.equal(fullList[0].id, created.id);
+            assert.equal(fullList[0].archived, true);
+        });
+
+        it('does not purge an archived character that is still referenced', async () => {
+            const created = await (await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'Still Referenced' }),
+            })).json();
+            persistence.addConversationReference({
+                id: 'conv-2',
+                owner_id: 'alice',
+                character_id: created.id,
+                participants: [],
+                archived: false,
+            });
+
+            const first = await fetch(`${baseUrl}/api/openparlor/characters/${created.id}`, { method: 'DELETE' });
+            assert.equal(first.status, 200);
+            await first.json();
+
+            const second = await fetch(`${baseUrl}/api/openparlor/characters/${created.id}`, { method: 'DELETE' });
+            assert.equal(second.status, 200);
+            const secondBody = await second.json();
+            assert.equal(secondBody.deleted, false);
+            assert.equal(secondBody.archived, true);
+
+            const getRes = await fetch(`${baseUrl}/api/openparlor/characters/${created.id}`);
+            assert.equal(getRes.status, 200);
+        });
+
+        it('archives a character referenced only as a participant', async () => {
+            const primary = await (await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'Primary' }),
+            })).json();
+            const sidekick = await (await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'Sidekick' }),
+            })).json();
+            persistence.addConversationReference({
+                id: 'conv-3',
+                owner_id: 'alice',
+                character_id: primary.id,
+                participants: [{ id: 'p1', character_id: sidekick.id, role: 'character' }],
+                archived: false,
+            });
+
+            const delRes = await fetch(`${baseUrl}/api/openparlor/characters/${sidekick.id}`, { method: 'DELETE' });
+            assert.equal(delRes.status, 200);
+            const body = await delRes.json();
+            assert.equal(body.archived, true);
+            assert.equal(body.character.id, sidekick.id);
+        });
+
+        it('archives a character referenced only by a memory', async () => {
+            const created = await (await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'Memored' }),
+            })).json();
+            persistence.addMemoryReference({
+                id: 'mem-1',
+                owner_id: 'alice',
+                character_id: created.id,
+                known_by_character_ids: [created.id],
+            });
+
+            const delRes = await fetch(`${baseUrl}/api/openparlor/characters/${created.id}`, { method: 'DELETE' });
+            assert.equal(delRes.status, 200);
+            const body = await delRes.json();
+            assert.equal(body.archived, true);
+            assert.equal(body.deleted, false);
+        });
+
+        it('hard-deletes an archived character once its references are gone', async () => {
+            const created = await (await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'Outlived' }),
+            })).json();
+            persistence.addConversationReference({
+                id: 'conv-4',
+                owner_id: 'alice',
+                character_id: created.id,
+                participants: [],
+                archived: false,
+            });
+
+            const first = await fetch(`${baseUrl}/api/openparlor/characters/${created.id}`, { method: 'DELETE' });
+            assert.equal(first.status, 200);
+            await first.json();
+
+            // The conversation is deleted, leaving the character unreferenced.
+            persistence.conversations.length = 0;
+            const delRes = await fetch(`${baseUrl}/api/openparlor/characters/${created.id}`, { method: 'DELETE' });
+            assert.equal(delRes.status, 204);
+
+            const getRes = await fetch(`${baseUrl}/api/openparlor/characters/${created.id}`);
+            assert.equal(getRes.status, 404);
+        });
+
+        it('hides archived characters from the default list only', async () => {
+            const kept = await (await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'Kept' }),
+            })).json();
+            const archived = await (await fetch(`${baseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'Archived One' }),
+            })).json();
+            persistence.addConversationReference({
+                id: 'conv-5',
+                owner_id: 'alice',
+                character_id: archived.id,
+                participants: [],
+                archived: false,
+            });
+            const delRes = await fetch(`${baseUrl}/api/openparlor/characters/${archived.id}`, { method: 'DELETE' });
+            assert.equal(delRes.status, 200);
+            await delRes.json();
+
+            const defaultList = await (await fetch(`${baseUrl}/api/openparlor/characters`)).json();
+            assert.deepEqual(defaultList.map(c => c.id), [kept.id]);
+
+            const fullList = await (await fetch(`${baseUrl}/api/openparlor/characters?include_archived=true`)).json();
+            assert.equal(fullList.length, 2);
+            assert.ok(fullList.some(c => c.id === archived.id && c.archived === true));
         });
     });
 
@@ -906,6 +1214,141 @@ describe('OpenParlor Character Router', () => {
             } finally {
                 await stopServer(srv);
             }
+        });
+    });
+
+    // ─── Acceptance (real persistence) ──────────────────────────────────────
+    // Plan acceptance: create character → chat → memory → delete/archive →
+    // the old conversation still loads and remains understandable.
+
+    describe('acceptance with real persistence', () => {
+        let tmpRoot;
+        let realDirs;
+        let app;
+        let realServer;
+        let realBaseUrl;
+
+        beforeEach(async () => {
+            tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'openparlor-acceptance-'));
+            realDirs = { root: tmpRoot };
+            app = express();
+            app.use(express.json());
+            app.use((req, _res, next) => {
+                req.user = { directories: realDirs, profile: { handle: 'alice' } };
+                next();
+            });
+            app.use('/api/openparlor/characters', createOpenParlorCharacterRouter({ ttsProvider: mockTtsProvider }));
+            app.use('/api/openparlor/conversations', createOpenParlorConversationRouter());
+            ({ server: realServer, baseUrl: realBaseUrl } = await startServer(app));
+        });
+
+        afterEach(async () => {
+            if (realServer) await stopServer(realServer);
+            if (tmpRoot) fs.rmSync(tmpRoot, { recursive: true, force: true });
+        });
+
+        it('archived character keeps its conversation and memory readable', async () => {
+            // 1. Create character
+            const character = await (await fetch(`${realBaseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'Monica', avatar_url: '/img/alice/openparlor-avatar-111.png' }),
+            })).json();
+
+            // 2. Chat: create conversation and append user + character messages
+            const conversation = await (await fetch(`${realBaseUrl}/api/openparlor/conversations`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ character_id: character.id, title: 'Coffee chat' }),
+            })).json();
+            const participant = conversation.participants.find(p => p.character_id === character.id);
+            realPersistence.appendMessage(realDirs, conversation.id, 'user', 'Hi Monica!', 'user');
+            realPersistence.appendMessage(realDirs, conversation.id, participant.id, 'Hey! How are you?', 'character');
+
+            // 3. Memory attributed to the character
+            realPersistence.createMemory(realDirs, 'alice', {
+                character_id: character.id,
+                conversation_id: conversation.id,
+                content: 'User likes coffee',
+                type: 'preference',
+                known_by_character_ids: [character.id],
+            });
+
+            // 4. Delete → server archives (character is referenced)
+            const delRes = await fetch(`${realBaseUrl}/api/openparlor/characters/${character.id}`, { method: 'DELETE' });
+            assert.equal(delRes.status, 200);
+            const delBody = await delRes.json();
+            assert.equal(delBody.archived, true);
+            assert.equal(delBody.deleted, false);
+
+            // 5. Old conversation still loads with intact speaker references
+            const convRes = await fetch(`${realBaseUrl}/api/openparlor/conversations/${conversation.id}`);
+            assert.equal(convRes.status, 200);
+            const convBody = await convRes.json();
+            assert.equal(convBody.title, 'Coffee chat');
+            assert.equal(convBody.messages.length, 2);
+            assert.equal(convBody.messages[1].content, 'Hey! How are you?');
+            // No dangling participant IDs: the archived record still resolves.
+            const archived = realPersistence.getCharacter(realDirs, character.id);
+            assert.ok(archived);
+            assert.equal(archived.archived, true);
+            assert.equal(archived.name, 'Monica');
+            assert.equal(archived.avatar_url, '/img/alice/openparlor-avatar-111.png');
+            for (const p of convBody.participants) {
+                const resolved = realPersistence.getCharacter(realDirs, p.character_id);
+                assert.ok(resolved, `participant reference ${p.character_id} must still resolve`);
+            }
+
+            // 6. Memory provenance remains readable
+            const memories = realPersistence.listMemories(realDirs, 'alice', character.id);
+            assert.equal(memories.length, 1);
+            assert.equal(memories[0].content, 'User likes coffee');
+            assert.equal(memories[0].character_id, character.id);
+
+            // 7. Hidden from the default character list, present when asked
+            const defaultList = await (await fetch(`${realBaseUrl}/api/openparlor/characters`)).json();
+            assert.equal(defaultList.length, 0);
+            const fullList = await (await fetch(`${realBaseUrl}/api/openparlor/characters?include_archived=true`)).json();
+            assert.equal(fullList.length, 1);
+            assert.equal(fullList[0].id, character.id);
+            assert.equal(fullList[0].archived, true);
+
+            // 8. Conversation list still shows the conversation (renderable)
+            const convList = await (await fetch(`${realBaseUrl}/api/openparlor/conversations`)).json();
+            assert.equal(convList.length, 1);
+            assert.equal(convList[0].id, conversation.id);
+        });
+
+        it('hard-deletes an unreferenced character and leaves everything else intact', async () => {
+            const keptChar = await (await fetch(`${realBaseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'Kept' }),
+            })).json();
+            const keptConv = await (await fetch(`${realBaseUrl}/api/openparlor/conversations`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ character_id: keptChar.id, title: 'Kept chat' }),
+            })).json();
+            realPersistence.appendMessage(realDirs, keptConv.id, 'user', 'Hello', 'user');
+
+            const doomed = await (await fetch(`${realBaseUrl}/api/openparlor/characters`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'Doomed' }),
+            })).json();
+
+            const delRes = await fetch(`${realBaseUrl}/api/openparlor/characters/${doomed.id}`, { method: 'DELETE' });
+            assert.equal(delRes.status, 204);
+            assert.equal(realPersistence.getCharacter(realDirs, doomed.id), null);
+
+            // Unrelated conversation history is untouched
+            const convRes = await fetch(`${realBaseUrl}/api/openparlor/conversations/${keptConv.id}`);
+            assert.equal(convRes.status, 200);
+            const convBody = await convRes.json();
+            assert.equal(convBody.messages.length, 1);
+            assert.equal(convBody.messages[0].content, 'Hello');
+            assert.ok(realPersistence.getCharacter(realDirs, keptChar.id));
         });
     });
 });

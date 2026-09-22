@@ -394,3 +394,137 @@ test('extractAndPersistMemories: handles malformed model response gracefully', a
         tmp.cleanup();
     }
 });
+
+// ─── QWEN-STAB-004: meta-memory rejection ────────────────────────────────────
+
+test('parseCandidates: rejects meta-memories about the conversation itself', () => {
+    const raw = JSON.stringify([
+        { content: 'The user is in a group chat that includes Monica.', type: 'fact', importance: 0.8, confidence: 0.9 },
+        { content: 'The user is chatting with Monica and Emma', type: 'event', importance: 0.7, confidence: 0.8 },
+        { content: 'The conversation is about the user job', type: 'fact', importance: 0.6, confidence: 0.7 },
+        { content: 'This chat is between Alice and the user', type: 'fact', importance: 0.6, confidence: 0.7 },
+        { content: 'Monica works in catering', type: 'fact', importance: 0.7, confidence: 0.9 },
+    ]);
+    const result = parseCandidates(raw);
+    assert.equal(result.length, 1);
+    assert.equal(result[0].content, 'Monica works in catering');
+});
+
+test('parseCandidates: keeps durable relationship facts that mention chat participants', () => {
+    const raw = JSON.stringify([
+        { content: 'Monica is the sister of the user', type: 'relationship', importance: 0.8, confidence: 0.9 },
+        { content: 'The user knows Monica from catering', type: 'relationship', importance: 0.7, confidence: 0.8 },
+    ]);
+    const result = parseCandidates(raw);
+    assert.equal(result.length, 2);
+});
+
+// ─── QWEN-STAB-004: fuzzy deduplication ──────────────────────────────────────
+
+test('deduplicate: removes near-duplicates that differ by stemming and filler words', () => {
+    const candidates = [
+        { content: 'The user was born in 1990', type: 'fact', importance: 0.7, confidence: 0.9 },
+        { content: 'Monica works as a catering manager', type: 'fact', importance: 0.7, confidence: 0.9 },
+    ];
+    const existing = [
+        { content: 'user born in 1990', active: true },
+        { content: 'monica works catering manager', active: true },
+    ];
+    assert.deepEqual(deduplicate(candidates, existing), []);
+});
+
+test('deduplicate: keeps distinct facts that share a common subject', () => {
+    const candidates = [
+        { content: 'The user likes tea', type: 'preference', importance: 0.7, confidence: 0.9 },
+        { content: 'Monica works in catering', type: 'fact', importance: 0.7, confidence: 0.9 },
+    ];
+    const existing = [
+        { content: 'the user likes coffee', active: true },
+    ];
+    const result = deduplicate(candidates, existing);
+    assert.equal(result.length, 2);
+});
+
+test('deduplicate: removes near-duplicates within a single candidate batch', () => {
+    const candidates = [
+        { content: 'User likes coffee in the morning', type: 'preference', importance: 0.7, confidence: 0.9 },
+        { content: 'user likes coffees in the morning', type: 'preference', importance: 0.8, confidence: 0.9 },
+    ];
+    const result = deduplicate(candidates, []);
+    assert.equal(result.length, 1);
+});
+
+// ─── QWEN-STAB-004: extraction prompt attribution ────────────────────────────
+
+test('buildExtractionPrompt: always instructs meta-fact rejection in the system prompt', () => {
+    const character = { name: 'Alice', scenario: '' };
+    const conversation = { id: 'conv-1', title: 'Test' };
+    const messages = [{ role: 'user', content: 'hi' }];
+    const prompt = buildExtractionPrompt({ character, conversation, messages });
+    assert.ok(prompt[0].content.includes('Do not extract meta-facts'));
+});
+
+test('buildExtractionPrompt: lists characters present when a group context is provided', () => {
+    const character = { name: 'Alice', scenario: 'Tavern' };
+    const conversation = { id: 'conv-1', title: 'Test' };
+    const messages = [
+        { role: 'user', content: 'Monica told me she works in catering' },
+        { role: 'character', content: 'Nice!' },
+    ];
+    const prompt = buildExtractionPrompt({
+        character,
+        conversation,
+        messages,
+        participants: [{ name: 'Alice' }, { name: 'Monica' }],
+    });
+    assert.ok(prompt[1].content.includes('Characters present: Alice, Monica'));
+});
+
+test('buildExtractionPrompt: omits the group line for a single participant', () => {
+    const character = { name: 'Alice', scenario: '' };
+    const conversation = { id: 'conv-1', title: 'Test' };
+    const messages = [{ role: 'user', content: 'hi' }, { role: 'character', content: 'hello' }];
+    const prompt = buildExtractionPrompt({
+        character,
+        conversation,
+        messages,
+        participants: [{ name: 'Alice' }],
+    });
+    assert.ok(!prompt[1].content.includes('Characters present'));
+});
+
+test('extractAndPersistMemories: forwards participant context to the extraction prompt', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'Alice' });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'Test');
+        const participant = conv.participants.find(p => p.role === 'character');
+        const assistantMsg = persistence.appendMessage(dirs, conv.id, participant.id, 'hi', 'character');
+
+        let capturedPrompt;
+        const mockProvider = {
+            chatCompletion: async (messages) => {
+                capturedPrompt = messages;
+                return { choices: [{ message: { content: '[]' } }] };
+            },
+        };
+
+        await extractAndPersistMemories({
+            directories: dirs,
+            owner_id: 'alice',
+            character: char,
+            conversation: conv,
+            messages: [{ role: 'user', content: 'hi' }, { role: 'character', content: 'hi' }],
+            source_message_id: assistantMsg.id,
+            known_by_character_ids: [char.id],
+            participants: [{ name: 'Alice' }, { name: 'Monica' }],
+            provider: mockProvider,
+        });
+
+        assert.ok(capturedPrompt[1].content.includes('Characters present: Alice, Monica'));
+    } finally {
+        tmp.cleanup();
+    }
+});

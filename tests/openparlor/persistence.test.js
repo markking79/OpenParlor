@@ -11,6 +11,9 @@ import {
     listCharacters,
     updateCharacter,
     deleteCharacter,
+    archiveCharacter,
+    characterHasHistory,
+    removeCharacterAvatarFile,
     createConversation,
     getConversation,
     listConversations,
@@ -582,6 +585,16 @@ describe('OpenParlor persistence', () => {
             assert.equal(mem.source_conversation_id, null);
             assert.equal(mem.source_message_id, null);
         });
+
+        it('defaults pinned to false and honors an explicit pinned flag', () => {
+            const char = createCharacter(dirs, 'alice', { name: 'C' });
+            const unpinned = createMemory(dirs, 'alice', { character_id: char.id, content: 'not pinned' });
+            assert.equal(unpinned.pinned, false);
+            const pinned = createMemory(dirs, 'alice', { character_id: char.id, content: 'pinned', pinned: true });
+            assert.equal(pinned.pinned, true);
+            assert.equal(getMemory(dirs, pinned.id).pinned, true);
+            assert.equal(getMemory(dirs, unpinned.id).pinned, false);
+        });
     });
 
     // ─── Memory visibility ─────────────────────────────────────────────────
@@ -779,6 +792,225 @@ describe('OpenParlor persistence', () => {
             const mems = listMemories(dirs, 'alice');
             assert.equal(mems.length, 1);
             assert.equal(mems[0].content, 'valid');
+        });
+    });
+
+    // ─── Character archive (soft delete) ────────────────────────────────────
+
+    describe('character archive field', () => {
+        it('new characters default to archived: false', () => {
+            const created = createCharacter(dirs, 'alice', { name: 'Fresh' });
+            assert.equal(created.archived, false);
+            assert.equal(getCharacter(dirs, created.id).archived, false);
+        });
+
+        it('normalizes legacy records without the field to archived: false', () => {
+            const legacyId = 'legacy-archived-check';
+            const legacy = {
+                id: legacyId,
+                name: 'Legacy',
+                description: '',
+                personality: '',
+                scenario: '',
+                first_message: '',
+                system_prompt: '',
+                example_dialogue: '',
+                tags: [],
+                tts_provider: '',
+                tts_voice: '',
+                owner_id: 'alice',
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+            };
+            fs.writeFileSync(path.join(getOpenParlorRoot(dirs), 'characters', `${legacyId}.json`), JSON.stringify(legacy));
+            assert.equal(getCharacter(dirs, legacyId).archived, false);
+        });
+
+        it('archiveCharacter sets archived: true and keeps the record resolvable', () => {
+            const created = createCharacter(dirs, 'alice', { name: 'Old Friend' });
+            const archived = archiveCharacter(dirs, created.id);
+            assert.ok(archived);
+            assert.equal(archived.archived, true);
+            assert.equal(archived.id, created.id);
+            assert.equal(archived.name, 'Old Friend');
+            const fetched = getCharacter(dirs, created.id);
+            assert.equal(fetched.archived, true);
+        });
+
+        it('listCharacters hides archived by default and includes them with includeArchived', () => {
+            const active = createCharacter(dirs, 'alice', { name: 'Active' });
+            const retired = createCharacter(dirs, 'alice', { name: 'Retired' });
+            archiveCharacter(dirs, retired.id);
+
+            const defaults = listCharacters(dirs, 'alice');
+            assert.deepEqual(defaults.map(c => c.id), [active.id]);
+
+            const all = listCharacters(dirs, 'alice', { includeArchived: true });
+            assert.equal(all.length, 2);
+            assert.ok(all.some(c => c.id === active.id && c.archived === false));
+            assert.ok(all.some(c => c.id === retired.id && c.archived === true));
+        });
+
+        it('listCharacters includeArchived still filters by owner', () => {
+            const aliceRetired = createCharacter(dirs, 'alice', { name: 'Alice Retired' });
+            createCharacter(dirs, 'bob', { name: 'Bob Active' });
+            archiveCharacter(dirs, aliceRetired.id);
+
+            const allAlice = listCharacters(dirs, 'alice', { includeArchived: true });
+            assert.deepEqual(allAlice.map(c => c.id), [aliceRetired.id]);
+        });
+    });
+
+    describe('characterHasHistory', () => {
+        it('is false for a character with no conversations or memories', () => {
+            const char = createCharacter(dirs, 'alice', { name: 'Nobody Knows' });
+            assert.equal(characterHasHistory(dirs, 'alice', char.id), false);
+        });
+
+        it('is true when the character is the primary character of a conversation', () => {
+            const char = createCharacter(dirs, 'alice', { name: 'Primary' });
+            createConversation(dirs, 'alice', char.id, 'Chat');
+            assert.equal(characterHasHistory(dirs, 'alice', char.id), true);
+        });
+
+        it('is true when the character is only a participant', () => {
+            const primary = createCharacter(dirs, 'alice', { name: 'Primary' });
+            const sidekick = createCharacter(dirs, 'alice', { name: 'Sidekick' });
+            createConversation(dirs, 'alice', primary.id, 'Group', [
+                { character_id: sidekick.id, role: 'character' },
+            ]);
+            assert.equal(characterHasHistory(dirs, 'alice', sidekick.id), true);
+        });
+
+        it('is true for references inside archived conversations', () => {
+            const char = createCharacter(dirs, 'alice', { name: 'Archived Conv' });
+            const conv = createConversation(dirs, 'alice', char.id, 'Old Chat');
+            updateConversation(dirs, conv.id, { archived: true });
+            assert.equal(characterHasHistory(dirs, 'alice', char.id), true);
+        });
+
+        it('is true when the character owns a memory', () => {
+            const char = createCharacter(dirs, 'alice', { name: 'Memored' });
+            createMemory(dirs, 'alice', { character_id: char.id, content: 'User likes tea', known_by_character_ids: [char.id] });
+            assert.equal(characterHasHistory(dirs, 'alice', char.id), true);
+        });
+
+        it('is true when the character is in known_by_character_ids', () => {
+            const primary = createCharacter(dirs, 'alice', { name: 'Primary' });
+            const other = createCharacter(dirs, 'alice', { name: 'Other' });
+            createMemory(dirs, 'alice', { character_id: primary.id, content: 'Group fact', known_by_character_ids: [primary.id, other.id] });
+            assert.equal(characterHasHistory(dirs, 'alice', other.id), true);
+        });
+
+        it('ignores conversations and memories owned by other users', () => {
+            const char = createCharacter(dirs, 'alice', { name: 'Alice Only' });
+            createConversation(dirs, 'bob', char.id, 'Bobs Chat');
+            createMemory(dirs, 'bob', { character_id: char.id, content: 'Bobs memory', known_by_character_ids: [char.id] });
+            assert.equal(characterHasHistory(dirs, 'alice', char.id), false);
+        });
+    });
+
+    describe('removeCharacterAvatarFile', () => {
+        /**
+         * Creates a temp user with a root-relative images directory and a file
+         * in it.
+         * @param {string} [fileName]
+         * @returns {{ dirs: object, root: string, cleanup: () => void, filePath: string, avatarUrl: string }}
+         */
+        function makeAvatarFixture(fileName = 'openparlor-avatar-1234.png') {
+            const root = fs.mkdtempSync(path.join(os.tmpdir(), 'openparlor-avatar-'));
+            const userImages = path.join(root, 'img', 'alice');
+            fs.mkdirSync(userImages, { recursive: true });
+            const filePath = path.join(userImages, fileName);
+            fs.writeFileSync(filePath, 'fake-image-bytes');
+            const avatarUrl = `/img/alice/${fileName}`;
+            return {
+                root,
+                dirs: { root, userImages },
+                filePath,
+                avatarUrl,
+                cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
+            };
+        }
+
+        it('removes an unreferenced OpenParlor avatar file', () => {
+            const fixture = makeAvatarFixture();
+            try {
+                const char = createCharacter(fixture.dirs, 'alice', { name: 'Solo', avatar_url: fixture.avatarUrl });
+                assert.equal(removeCharacterAvatarFile(fixture.dirs, char), true);
+                assert.equal(fs.existsSync(fixture.filePath), false);
+            } finally {
+                fixture.cleanup();
+            }
+        });
+
+        it('keeps an avatar still referenced by another character of the same owner', () => {
+            const fixture = makeAvatarFixture();
+            try {
+                const first = createCharacter(fixture.dirs, 'alice', { name: 'First', avatar_url: fixture.avatarUrl });
+                createCharacter(fixture.dirs, 'alice', { name: 'Second', avatar_url: fixture.avatarUrl });
+                assert.equal(removeCharacterAvatarFile(fixture.dirs, first), false);
+                assert.equal(fs.existsSync(fixture.filePath), true);
+            } finally {
+                fixture.cleanup();
+            }
+        });
+
+        it('does not touch files that are not OpenParlor uploads', () => {
+            const fixture = makeAvatarFixture('sillytavern-card.png');
+            try {
+                const char = createCharacter(fixture.dirs, 'alice', { name: 'ST', avatar_url: fixture.avatarUrl });
+                assert.equal(removeCharacterAvatarFile(fixture.dirs, char), false);
+                assert.equal(fs.existsSync(fixture.filePath), true);
+            } finally {
+                fixture.cleanup();
+            }
+        });
+
+        it('does nothing when avatar_url is missing or not browser-relative', () => {
+            const fixture = makeAvatarFixture();
+            try {
+                const noAvatar = createCharacter(fixture.dirs, 'alice', { name: 'No Avatar' });
+                assert.equal(removeCharacterAvatarFile(fixture.dirs, noAvatar), false);
+                const bad = createCharacter(fixture.dirs, 'alice', { name: 'Bad', avatar_url: 'openparlor-avatar-1.png' });
+                assert.equal(removeCharacterAvatarFile(fixture.dirs, bad), false);
+                assert.equal(fs.existsSync(fixture.filePath), true);
+            } finally {
+                fixture.cleanup();
+            }
+        });
+
+        it('does not remove files outside the user images directory', () => {
+            const root = fs.mkdtempSync(path.join(os.tmpdir(), 'openparlor-avatar-out-'));
+            const outside = path.join(root, 'elsewhere');
+            fs.mkdirSync(outside, { recursive: true });
+            const filePath = path.join(outside, 'openparlor-avatar-999.png');
+            fs.writeFileSync(filePath, 'do-not-touch');
+            const dirs = { root, userImages: path.join(root, 'img', 'alice') };
+            try {
+                const char = createCharacter(dirs, 'alice', {
+                    name: 'Outside',
+                    avatar_url: '/elsewhere/openparlor-avatar-999.png',
+                });
+                assert.equal(removeCharacterAvatarFile(dirs, char), false);
+                assert.equal(fs.existsSync(filePath), true);
+            } finally {
+                fs.rmSync(root, { recursive: true, force: true });
+            }
+        });
+
+        it('does nothing when the avatar file does not exist', () => {
+            const root = fs.mkdtempSync(path.join(os.tmpdir(), 'openparlor-avatar-missing-'));
+            const dirs = { root, userImages: path.join(root, 'img', 'alice') };
+            try {
+                const char = createCharacter(dirs, 'alice', {
+                    name: 'Missing',
+                    avatar_url: '/img/alice/openparlor-avatar-42.png',
+                });
+                assert.equal(removeCharacterAvatarFile(dirs, char), false);
+            } finally {
+                fs.rmSync(root, { recursive: true, force: true });
+            }
         });
     });
 });

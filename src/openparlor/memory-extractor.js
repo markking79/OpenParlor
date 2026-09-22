@@ -1,8 +1,11 @@
 import * as persistence from './persistence.js';
+import { uniqueSignificantSequence } from './memory-text.js';
 
 const MAX_CONTENT_LENGTH = 500;
 const MAX_CANDIDATES = 5;
 const VALID_TYPES = new Set(['fact', 'preference', 'event', 'relationship', 'other']);
+// Near-duplicate threshold on Jaccard similarity of significant token sets.
+const DEDUP_SIMILARITY_THRESHOLD = 0.85;
 
 const TRIVIAL_PATTERNS = [
     /^(hi|hello|hey|ok|okay|thanks|thank you|bye|goodbye|cool|nice|great|sure|yes|no|maybe|lol|haha|wow|oh|um|uh|right|got it|i see|sounds good|no problem|youre welcome|welcome|sure thing|alright|k|kk|ty|thx|np|gm|gn|brb|idk|lmao|rofl|omg|wtf|yep|nah|yeah|yup|nope|uhh|hmm|mm|mmh|mmhm|mmhmm)\.?$/i,
@@ -17,6 +20,15 @@ const INSTRUCTION_PATTERNS = [
     /ignore (?:all\s+)?(?:previous|prior)?\s*(instructions|prompts)/i,
     /act as (a|an|the)\s/i,
     /your role is to/i,
+];
+
+// Patterns for memories that describe the conversation itself (meta-memories)
+// instead of durable facts about people or the world.
+const META_MEMORY_PATTERNS = [
+    /group (chat|conversation|thread)/i,
+    /is chatting/i,
+    /the (conversation|chat|dialogue) (is|was)/i,
+    /this (conversation|chat)/i,
 ];
 
 /**
@@ -49,6 +61,16 @@ function isInstruction(content) {
 }
 
 /**
+ * Checks if a candidate fact describes the conversation itself (a meta-memory)
+ * rather than a durable fact. These are rejected at extraction time.
+ * @param {string} content
+ * @returns {boolean}
+ */
+function isMetaMemory(content) {
+    return META_MEMORY_PATTERNS.some(p => p.test(content));
+}
+
+/**
  * Validates a single candidate fact from the model output.
  * @param {unknown} candidate
  * @returns {{content: string, type: string, importance: number, confidence: number} | null}
@@ -61,6 +83,7 @@ function validateCandidate(candidate) {
     if (content.length > MAX_CONTENT_LENGTH) return null;
     if (isTrivial(content)) return null;
     if (isInstruction(content)) return null;
+    if (isMetaMemory(content)) return null;
     const type = typeof c.type === 'string' && VALID_TYPES.has(c.type) ? c.type : 'other';
     const importance = typeof c.importance === 'number' && Number.isFinite(c.importance)
         ? Math.max(0, Math.min(1, c.importance)) : 0.5;
@@ -98,31 +121,57 @@ export function parseCandidates(raw) {
 }
 
 /**
- * Deduplicates candidates against existing active memories.
+ * Deduplicates candidates against existing active memories and against each
+ * other. Exact (normalized) matches are dropped, as are near-duplicates whose
+ * significant token sets are at least DEDUP_SIMILARITY_THRESHOLD similar
+ * (stemming- and filler-word-insensitive comparison).
  * @param {Array<{content: string, type: string, importance: number, confidence: number}>} candidates
  * @param {Array<{content: string, active: boolean}>} existingMemories
  * @returns {Array<{content: string, type: string, importance: number, confidence: number}>}
  */
 export function deduplicate(candidates, existingMemories) {
-    const existingSet = new Set(
-        existingMemories.filter(m => m.active).map(m => normalizeForDedup(m.content)),
-    );
-    const seen = new Set();
-    return candidates.filter(c => {
-        const key = normalizeForDedup(c.content);
-        if (existingSet.has(key) || seen.has(key)) return false;
-        seen.add(key);
+    const existing = existingMemories
+        .filter(m => m.active)
+        .map(m => ({ key: normalizeForDedup(m.content), tokens: uniqueSignificantSequence(m.content) }));
+    const kept = [];
+    return candidates.filter(candidate => {
+        const key = normalizeForDedup(candidate.content);
+        const tokens = uniqueSignificantSequence(candidate.content);
+        for (const item of [...existing, ...kept]) {
+            if (item.key === key || sequenceSimilarity(tokens, item.tokens) >= DEDUP_SIMILARITY_THRESHOLD) {
+                return false;
+            }
+        }
+        kept.push({ key, tokens });
         return true;
     });
 }
 
 /**
+ * Computes the Jaccard similarity between two significant-token sequences.
+ * @param {string[]} a
+ * @param {string[]} b
+ * @returns {number}
+ */
+function sequenceSimilarity(a, b) {
+    if (a.length === 0 || b.length === 0) return 0;
+    const setA = new Set(a);
+    const setB = new Set(b);
+    let intersection = 0;
+    for (const token of setA) {
+        if (setB.has(token)) intersection++;
+    }
+    const union = setA.size + setB.size - intersection;
+    return union === 0 ? 0 : intersection / union;
+}
+
+/**
  * Builds the extraction prompt for the model.
- * @param {{character: object, conversation: object, messages: Array<{role: string, content: string}>}} context
+ * @param {{character: object, conversation: object, messages: Array<{role: string, content: string}>, participants?: Array<{name: string}>}} context
  * @returns {Array<{role: string, content: string}>}
  */
 export function buildExtractionPrompt(context) {
-    const { character, messages } = context;
+    const { character, messages, participants } = context;
     const dialogue = messages
         .map(m => `${m.role === 'user' ? 'User' : character.name}: ${m.content}`)
         .join('\n');
@@ -134,6 +183,8 @@ export function buildExtractionPrompt(context) {
         '- Only extract information that is explicitly stated or strongly implied by the user.',
         '- Do NOT extract trivial greetings, farewells, or small talk.',
         '- Do NOT extract instructions or meta-commentary about the AI.',
+        '- Do not extract meta-facts about this conversation itself (e.g. who is in the group chat, that a chat is happening). Only extract durable facts about people, relationships, or the world.',
+        '- If the same person is mentioned alongside other characters, attribute the fact to the correct person.',
         '- Each fact should be a single, self-contained sentence.',
         '- Assign a type: "fact", "preference", "event", "relationship", or "other".',
         '- Assign importance (0-1) and confidence (0-1) for each.',
@@ -143,9 +194,14 @@ export function buildExtractionPrompt(context) {
         'Respond with a JSON array of objects: [{"content": "...", "type": "...", "importance": 0.0, "confidence": 0.0}]',
     ].join('\n');
 
+    const participantLine = Array.isArray(participants) && participants.length > 1
+        ? `\nCharacters present: ${participants.map(p => p.name).join(', ')}`
+        : '';
+    const userPrompt = `Character: ${character.name}\nScenario: ${character.scenario || 'None'}${participantLine}\n\nDialogue:\n${dialogue}`;
+
     return [
         { role: 'system', content: systemPrompt },
-        { role: 'user', content: `Character: ${character.name}\nScenario: ${character.scenario || 'None'}\n\nDialogue:\n${dialogue}` },
+        { role: 'user', content: userPrompt },
     ];
 }
 
@@ -162,6 +218,7 @@ export function buildExtractionPrompt(context) {
  * @param {Array<{role: string, content: string}>} params.messages
  * @param {string} params.source_message_id
  * @param {string[]} params.known_by_character_ids
+ * @param {Array<{name: string}>} [params.participants] Character names present in group context
  * @param {{ chatCompletion: (messages: Array<{role: string, content: string}>) => Promise<{choices: Array<{message: {content: string}}>} } }} params.provider
  * @returns {Promise<Array<object>>} Persisted memories
  */
@@ -173,9 +230,10 @@ export async function extractAndPersistMemories({
     messages,
     source_message_id,
     known_by_character_ids,
+    participants,
     provider,
 }) {
-    const prompt = buildExtractionPrompt({ character, conversation, messages });
+    const prompt = buildExtractionPrompt({ character, conversation, messages, participants });
     const completion = await provider.chatCompletion(prompt);
     const raw = typeof completion?.choices?.[0]?.message?.content === 'string'
         ? completion.choices[0].message.content

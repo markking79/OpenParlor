@@ -5,6 +5,7 @@ import {
     normalizeConversation,
     normalizeCharacter,
     createNdjsonParser,
+    createStreamMessageCollector,
     mapChatRole,
     validateCharacterForm,
     sanitizeCharacterInput,
@@ -138,7 +139,14 @@ describe('normalizeCharacter', () => {
             name: 'Emma',
             avatarUrl: '/avatars/emma.png',
             ttsVoice: 'af_heart',
+            archived: false,
         });
+    });
+
+    test('maps archived characters and defaults archived to false', () => {
+        assert.equal(normalizeCharacter({ id: 'c2', name: 'Old', archived: true }).archived, true);
+        assert.equal(normalizeCharacter({ id: 'c3', name: 'New' }).archived, false);
+        assert.equal(normalizeCharacter({ id: 'c4', name: 'Weird', archived: 'true' }).archived, false);
     });
 
     test('provides defaults for missing fields', () => {
@@ -147,6 +155,7 @@ describe('normalizeCharacter', () => {
         assert.equal(result.name, 'Unknown');
         assert.equal(result.avatarUrl, '');
         assert.equal(result.ttsVoice, '');
+        assert.equal(result.archived, false);
     });
 });
 
@@ -1396,5 +1405,81 @@ describe('createTranscriptionController', () => {
         assert.equal(controller.error, 'Transcription failed. Please try again.');
         assert.equal(await controller.transcribe(blob), 'retry worked');
         assert.equal(controller.state, 'ready');
+    });
+});
+
+// ─── createStreamMessageCollector (QWEN-GROUP-001) ───────────────────────────
+
+describe('createStreamMessageCollector', () => {
+    test('first speaker_start determines the pending message identity', () => {
+        const collector = createStreamMessageCollector();
+        assert.equal(collector.getMessages().length, 1, 'a pending message exists before any record');
+        collector.handleRecord({ type: 'speaker_start', character_id: 'char-monica', participant_id: 'part-monica' });
+        collector.handleRecord({ type: 'delta', text: 'Hello' });
+        collector.handleRecord({ type: 'speaker_end', character_id: 'char-monica', participant_id: 'part-monica' });
+        collector.handleRecord({ type: 'done' });
+        const messages = collector.getMessages();
+        assert.equal(messages.length, 1);
+        assert.equal(messages[0].role, 'assistant');
+        assert.equal(messages[0].character_id, 'char-monica');
+        assert.equal(messages[0].content, 'Hello');
+    });
+
+    test('two streamed speakers produce two distinct messages with distinct identities', () => {
+        const collector = createStreamMessageCollector();
+        const start1 = collector.handleRecord({ type: 'speaker_start', character_id: 'char-doug' });
+        collector.handleRecord({ type: 'delta', text: 'Hello from Doug' });
+        collector.handleRecord({ type: 'speaker_end', character_id: 'char-doug' });
+        const start2 = collector.handleRecord({ type: 'speaker_start', character_id: 'char-monica' });
+        collector.handleRecord({ type: 'delta', text: 'Hello from Monica' });
+        collector.handleRecord({ type: 'speaker_end', character_id: 'char-monica' });
+        collector.handleRecord({ type: 'done' });
+        assert.equal(start1.isNewMessage, false);
+        assert.equal(start2.isNewMessage, true);
+        const messages = collector.getMessages();
+        assert.equal(messages.length, 2);
+        assert.equal(messages[0].character_id, 'char-doug');
+        assert.equal(messages[0].content, 'Hello from Doug');
+        assert.equal(messages[1].character_id, 'char-monica');
+        assert.equal(messages[1].content, 'Hello from Monica');
+    });
+
+    test('deltas before any speaker_start attach to the pending message', () => {
+        const collector = createStreamMessageCollector();
+        const pending = collector.getPendingMessage();
+        collector.handleRecord({ type: 'delta', text: 'standalone ' });
+        collector.handleRecord({ type: 'delta', text: 'reply' });
+        const messages = collector.getMessages();
+        assert.equal(messages.length, 1);
+        assert.equal(messages[0], pending);
+        assert.equal(messages[0].content, 'standalone reply');
+        assert.ok(!('character_id' in messages[0]), 'identity stays unset until speaker_start');
+    });
+
+    test('error record appends a safe error line to the current message', () => {
+        const collector = createStreamMessageCollector();
+        collector.handleRecord({ type: 'speaker_start', character_id: 'char-doug' });
+        collector.handleRecord({ type: 'delta', text: 'partial ' });
+        collector.handleRecord({ type: 'error', error: 'upstream failed' });
+        const messages = collector.getMessages();
+        assert.equal(messages.length, 1);
+        assert.equal(messages[0].content, 'partial \nupstream failed');
+    });
+
+    test('error record without message falls back to a generic line', () => {
+        const collector = createStreamMessageCollector();
+        collector.handleRecord({ type: 'error', error: '' });
+        const messages = collector.getMessages();
+        assert.equal(messages[0].content, '\nStream error');
+    });
+
+    test('unknown or malformed records are ignored', () => {
+        const collector = createStreamMessageCollector();
+        assert.equal(collector.handleRecord({ type: 'unknown' }), null);
+        assert.equal(collector.handleRecord(null), null);
+        assert.equal(collector.handleRecord('text'), null);
+        const messages = collector.getMessages();
+        assert.equal(messages.length, 1);
+        assert.equal(messages[0].content, '');
     });
 });

@@ -135,6 +135,7 @@ export function createOpenParlorChatRouter({
 
         // Validate conversation, build server-side prompt, and persist the user's message
         let speakerContexts = null;
+        let participantContext = null;
         let conversation = null;
         if (conversationId) {
             conversation = persistence.getConversation(user.directories, conversationId);
@@ -148,6 +149,19 @@ export function createOpenParlorChatRouter({
             const lastUserMsg = [...safeMessages].reverse().find(m => m.role === 'user');
             const participantCharacters = characterParticipants.map(participant => persistence.getCharacter(user.directories, participant.character_id))
                 .filter(Boolean);
+            // Server-resolved participant context: real display names keyed by
+            // participant record, so prompts can attribute speech and list
+            // participants readably (stored records carry no name field).
+            const characterNameById = new Map(participantCharacters.map(c => [c.id, c.name]));
+            participantContext = characterParticipants
+                .map(participant => ({
+                    participant_id: participant.id,
+                    character_id: participant.character_id,
+                    name: typeof characterNameById.get(participant.character_id) === 'string'
+                        ? characterNameById.get(participant.character_id)
+                        : '',
+                }))
+                .filter(entry => entry.name !== '');
             const selectedSpeakers = selectSpeaker(characterParticipants, participantCharacters, lastUserMsg?.content ?? '');
             if (selectedSpeakers.length === 0) {
                 return response.status(400).json({ error: 'Conversation has no character participant' });
@@ -161,7 +175,7 @@ export function createOpenParlorChatRouter({
                 const memoryLines = lastUserMsg
                     ? retrieveMemories(user.directories, handle, character.id, lastUserMsg.content)
                     : [];
-                const prompt = buildPrompt({ character, conversation, history, newMessages: safeMessages, memories: memoryLines });
+                const prompt = buildPrompt({ character, conversation, history, newMessages: safeMessages, memories: memoryLines, participantContext });
                 speakerContexts.push({ participant: speaker, character, prompt });
             }
             if (speakerContexts.length === 0) {
@@ -209,6 +223,7 @@ export function createOpenParlorChatRouter({
                         messages: extractionMessages,
                         source_message_id: assistantMsg.id,
                         known_by_character_ids: knownBy,
+                        participants: participantContext?.map(p => ({ name: p.name })),
                         provider,
                     }).catch(err => {
                         console.error('OpenParlor: memory extraction failed', err);
@@ -250,6 +265,7 @@ export function createOpenParlorChatRouter({
                         messages: extractionMessages,
                         source_message_id: resp.message_id,
                         known_by_character_ids: knownBy,
+                        participants: participantContext?.map(p => ({ name: p.name })),
                         provider,
                     }).catch(err => {
                         console.error('OpenParlor: memory extraction failed', err);
@@ -364,6 +380,7 @@ export function createOpenParlorChatRouter({
                     messages: extractionMessages,
                     source_message_id: messageId,
                     known_by_character_ids: knownBy,
+                    participants: participantContext?.map(p => ({ name: p.name })),
                     provider,
                 }).catch(err => {
                     console.error('OpenParlor: memory extraction failed', err);
