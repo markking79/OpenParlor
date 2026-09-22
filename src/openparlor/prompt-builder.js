@@ -2,6 +2,14 @@ const MAX_HISTORY_MESSAGES = 20;
 
 const GLOBAL_BEHAVIOR = 'You are a character in a roleplay conversation. Stay in character at all times. Respond only as your character would.';
 
+function identityRule(name) {
+    return `Your name is ${name}. You are ${name}. Always speak in first person as ${name}. Never refer to yourself in third person or break character.`;
+}
+
+function participantsRule(names) {
+    return `Present participants in this conversation: ${names.join(', ')}. Address them by name when appropriate.`;
+}
+
 /**
  * Builds the authoritative model prompt from server-side character and
  * conversation data. Browser-supplied system prompts and character identity
@@ -18,13 +26,19 @@ const GLOBAL_BEHAVIOR = 'You are a character in a roleplay conversation. Stay in
 export function buildPrompt({ character, conversation, history, newMessages, memories }) {
     const messages = [];
 
-    // System prompt: global behavior + server-owned character persona + scenario
+    // System prompt: global behavior + identity + persona + scenario + participants
     const systemParts = [GLOBAL_BEHAVIOR];
+    if (character && typeof character.name === 'string' && character.name) {
+        systemParts.push(identityRule(character.name));
+    }
     if (character && typeof character.system_prompt === 'string' && character.system_prompt) {
         systemParts.push(character.system_prompt);
     }
     if (character && typeof character.scenario === 'string' && character.scenario) {
         systemParts.push(`Scenario: ${character.scenario}`);
+    }
+    if (conversation && Array.isArray(conversation.participants) && conversation.participants.length > 0) {
+        systemParts.push(participantsRule(conversation.participants));
     }
     if (Array.isArray(memories) && memories.length > 0) {
         systemParts.push([
