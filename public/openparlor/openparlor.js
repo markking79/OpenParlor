@@ -1693,11 +1693,12 @@ if (typeof document !== 'undefined') {
         renderMessages();
 
         // Create assistant bubble placeholder
-        const assistantMsg = { role: 'assistant', content: '' };
-        currentMessages.push(assistantMsg);
+        let currentAssistantMsg = { role: 'assistant', content: '' };
+        currentMessages.push(currentAssistantMsg);
         renderMessages();
 
-        const lastBubble = messagesEl.querySelector('.message:last-child .bubble');
+        let lastBubble = messagesEl.querySelector('.message:last-child .bubble');
+        let speakerCount = 0;
 
         try {
             const token = await getCsrfToken();
@@ -1716,8 +1717,8 @@ if (typeof document !== 'undefined') {
 
             if (!response.ok) {
                 const err = await response.json().catch(() => ({ error: 'Request failed' }));
-                assistantMsg.content = err.error || 'Request failed';
-                if (lastBubble) lastBubble.textContent = assistantMsg.content;
+                currentAssistantMsg.content = err.error || 'Request failed';
+                if (lastBubble) lastBubble.textContent = currentAssistantMsg.content;
                 scrollMessages();
                 if (isDev) voiceTurnTimer.log();
                 voiceTurnTimer.cancel();
@@ -1733,15 +1734,27 @@ if (typeof document !== 'undefined') {
             function processNewRecords() {
                 for (let i = processedCount; i < parser.records.length; i++) {
                     const record = parser.records[i];
-                    if (record.type === 'delta') {
+                    if (record.type === 'speaker_start') {
+                        speakerCount++;
+                        if (speakerCount === 1) {
+                            currentAssistantMsg.character_id = record.character_id;
+                        } else {
+                            currentAssistantMsg = { role: 'assistant', content: '', character_id: record.character_id };
+                            currentMessages.push(currentAssistantMsg);
+                            renderMessages();
+                            lastBubble = messagesEl.querySelector('.message:last-child .bubble');
+                        }
+                    } else if (record.type === 'delta') {
                         voiceTurnTimer.markFirstToken();
-                        assistantMsg.content += record.text;
-                        if (lastBubble) lastBubble.textContent = assistantMsg.content;
+                        currentAssistantMsg.content += record.text;
+                        if (lastBubble) lastBubble.textContent = currentAssistantMsg.content;
                         scrollMessages();
+                    } else if (record.type === 'speaker_end') {
+                        // Speaker finished; next speaker_start will create a new message
                     } else if (record.type === 'error') {
                         hadStreamError = true;
-                        assistantMsg.content += '\n' + (record.error || 'Stream error');
-                        if (lastBubble) lastBubble.textContent = assistantMsg.content;
+                        currentAssistantMsg.content += '\n' + (record.error || 'Stream error');
+                        if (lastBubble) lastBubble.textContent = currentAssistantMsg.content;
                         scrollMessages();
                     } else if (record.type === 'done') {
                         streamDone = true;
@@ -1773,15 +1786,16 @@ if (typeof document !== 'undefined') {
                     streamDone,
                     hadStreamError,
                     autoSpeakEnabled: getAutoSpeakState(sendConversationId) || getVoiceModeState(sendConversationId),
-                    hasContent: !!assistantMsg.content,
+                    hasContent: !!currentAssistantMsg?.content,
                     recordingActive: recorder.state === 'recording' || recordingInterruptionPending,
                 })
             ) {
-                const char = characters.find(c => c.id === currentConversation.characterId);
+                const speakerCharId = currentAssistantMsg?.character_id || currentConversation.characterId;
+                const char = characters.find(c => c.id === speakerCharId);
                 const voice = char ? char.ttsVoice : '';
                 if (voice) {
                     ttsHandled = true;
-                    playback.play(assistantMsg.content, voice).then((url) => {
+                    playback.play(currentAssistantMsg.content, voice).then((url) => {
                         if (url) voiceTurnTimer.markTtsReady();
                     }).catch(() => {}).finally(() => {
                         if (isDev) voiceTurnTimer.log();
@@ -1795,8 +1809,8 @@ if (typeof document !== 'undefined') {
                 voiceTurnTimer.cancel();
             }
         } catch {
-            assistantMsg.content = 'Connection error';
-            if (lastBubble) lastBubble.textContent = assistantMsg.content;
+            currentAssistantMsg.content = 'Connection error';
+            if (lastBubble) lastBubble.textContent = currentAssistantMsg.content;
             scrollMessages();
             if (isDev) voiceTurnTimer.log();
             voiceTurnTimer.cancel();

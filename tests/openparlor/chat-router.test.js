@@ -540,8 +540,11 @@ test('group chat directs an addressed character without changing one-on-one flow
         persistence.ensureOpenParlorDirs(dirs);
         const emma = persistence.createCharacter(dirs, 'alice', { name: 'Emma', system_prompt: 'You are Emma.' });
         const rachel = persistence.createCharacter(dirs, 'alice', { name: 'Rachel', system_prompt: 'You are Rachel.' });
-        const conv = persistence.createConversation(dirs, 'alice', emma.id, 'Group', [{ character_id: rachel.id, role: 'character' }]);
-        const rachelParticipant = conv.participants.find(p => p.character_id === rachel.id);
+        const conv = persistence.createConversation(dirs, 'alice', emma.id, 'Group');
+        const storedConversation = findAndModifyConversation(dirs, conv.id, data => {
+            data.participants.push({ id: 'part-rachel', character_id: rachel.id, role: 'character' });
+        });
+        const rachelParticipant = storedConversation.participants.find(p => p.character_id === rachel.id);
         const mock = mockProvider(() => completion);
         const user = { profile: { handle: 'alice' }, directories: dirs };
 
@@ -587,7 +590,11 @@ test('stream success with conversation_id persists assistant exactly once', asyn
                 conversation_id: conv.id,
             });
             assert.equal(result.status, 200);
-            assert.deepEqual(result.records[2], { type: 'done', conversation_id: conv.id });
+            assert.deepEqual(result.records[0], { type: 'speaker_start', character_id: char.id, participant_id: participant.id });
+            assert.deepEqual(result.records[1], { type: 'delta', text: 'hello ' });
+            assert.deepEqual(result.records[2], { type: 'delta', text: 'world' });
+            assert.deepEqual(result.records[3], { type: 'speaker_end', character_id: char.id, participant_id: participant.id });
+            assert.deepEqual(result.records[4], { type: 'done', conversation_id: conv.id });
         });
 
         const messages = persistence.getMessages(dirs, conv.id);
@@ -627,7 +634,11 @@ test('stream error with conversation_id persists user message but NOT assistant'
                 conversation_id: conv.id,
             });
             assert.equal(result.status, 200);
-            assert.equal(result.records[1].type, 'error');
+            assert.equal(result.records[0].type, 'speaker_start');
+            assert.equal(result.records[1].type, 'delta');
+            assert.equal(result.records[2].type, 'error');
+            assert.equal(result.records[2].character_id, char.id);
+            assert.equal(result.records[3].type, 'done');
         });
 
         const messages = persistence.getMessages(dirs, conv.id);
@@ -1259,6 +1270,323 @@ test('multi-character conversation: safe no-speaker behavior when character reco
     }
 });
 
+// ─── Multi-speaker sequential generation tests ───────────────────────────────
+
+test('multi-speaker non-stream: each speaker gets independent prompt and persisted message', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const emma = persistence.createCharacter(dirs, 'alice', { name: 'Emma', system_prompt: 'You are Emma.' });
+        const rachel = persistence.createCharacter(dirs, 'alice', { name: 'Rachel', system_prompt: 'You are Rachel.' });
+        const conv = persistence.createConversation(dirs, 'alice', emma.id, 'Group');
+        const storedConversation = findAndModifyConversation(dirs, conv.id, data => {
+            data.participants.push({ id: 'part-rachel', character_id: rachel.id, role: 'character' });
+        });
+        const emmaParticipant = storedConversation.participants.find(p => p.character_id === emma.id);
+        const rachelParticipant = storedConversation.participants.find(p => p.character_id === rachel.id);
+
+        const mock = mockProvider(() => completion);
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+            runMemoryExtraction: async () => [],
+        }, user, async baseUrl => {
+            const result = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'Emma and Rachel, what do you both think?' }],
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+            assert.equal(result.body.conversation_id, conv.id);
+            assert.equal(result.body.responses.length, 2);
+            assert.equal(result.body.responses[0].character_id, emma.id);
+            assert.equal(result.body.responses[0].participant_id, emmaParticipant.id);
+            assert.equal(result.body.responses[0].content, 'hi there');
+            assert.equal(result.body.responses[1].character_id, rachel.id);
+            assert.equal(result.body.responses[1].participant_id, rachelParticipant.id);
+            assert.equal(result.body.responses[1].content, 'hi there');
+        });
+
+        // Each speaker got their own prompt with their own character
+        assert.equal(mock.calls.length, 2);
+        assert.ok(mock.calls[0][0].content.includes('You are Emma.'));
+        assert.ok(!mock.calls[0][0].content.includes('You are Rachel.'));
+        assert.ok(mock.calls[1][0].content.includes('You are Rachel.'));
+        assert.ok(!mock.calls[1][0].content.includes('You are Emma.'));
+
+        // Messages persisted under correct participants
+        const messages = persistence.getMessages(dirs, conv.id);
+        assert.equal(messages.length, 3);
+        assert.equal(messages[0].role, 'user');
+        assert.equal(messages[1].role, 'character');
+        assert.equal(messages[1].participant_id, emmaParticipant.id);
+        assert.equal(messages[2].role, 'character');
+        assert.equal(messages[2].participant_id, rachelParticipant.id);
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('multi-speaker non-stream: error for one speaker does not prevent others', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const emma = persistence.createCharacter(dirs, 'alice', { name: 'Emma', system_prompt: 'You are Emma.' });
+        const rachel = persistence.createCharacter(dirs, 'alice', { name: 'Rachel', system_prompt: 'You are Rachel.' });
+        const conv = persistence.createConversation(dirs, 'alice', emma.id, 'Group');
+        const storedConversation = findAndModifyConversation(dirs, conv.id, data => {
+            data.participants.push({ id: 'part-rachel', character_id: rachel.id, role: 'character' });
+        });
+        const rachelParticipant = storedConversation.participants.find(p => p.character_id === rachel.id);
+
+        let callCount = 0;
+        const mock = mockProvider(() => {
+            callCount++;
+            if (callCount === 1) {
+                throw new ModelProviderError('upstream failed', { status: 503 });
+            }
+            return completion;
+        });
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+            runMemoryExtraction: async () => [],
+        }, user, async baseUrl => {
+            const result = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'Emma and Rachel, hello' }],
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+            assert.equal(result.body.responses.length, 2);
+            // First speaker failed
+            assert.equal(result.body.responses[0].character_id, emma.id);
+            assert.equal(result.body.responses[0].error, 'Chat completion failed');
+            // Second speaker succeeded
+            assert.equal(result.body.responses[1].character_id, rachel.id);
+            assert.equal(result.body.responses[1].content, 'hi there');
+        });
+
+        // Only Rachel's message persisted (plus user)
+        const messages = persistence.getMessages(dirs, conv.id);
+        assert.equal(messages.length, 2);
+        assert.equal(messages[0].role, 'user');
+        assert.equal(messages[1].role, 'character');
+        assert.equal(messages[1].participant_id, rachelParticipant.id);
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('multi-speaker stream: sequential speaker_start/delta/speaker_end framing', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const emma = persistence.createCharacter(dirs, 'alice', { name: 'Emma', system_prompt: 'You are Emma.' });
+        const rachel = persistence.createCharacter(dirs, 'alice', { name: 'Rachel', system_prompt: 'You are Rachel.' });
+        const conv = persistence.createConversation(dirs, 'alice', emma.id, 'Group');
+        const storedConversation = findAndModifyConversation(dirs, conv.id, data => {
+            data.participants.push({ id: 'part-rachel', character_id: rachel.id, role: 'character' });
+        });
+        const emmaParticipant = storedConversation.participants.find(p => p.character_id === emma.id);
+        const rachelParticipant = storedConversation.participants.find(p => p.character_id === rachel.id);
+
+        let callCount = 0;
+        const encoder = new TextEncoder();
+        const mock = {
+            calls: [],
+            provider: {
+                chatCompletion: async () => { throw new Error('not expected'); },
+                streamChatCompletion: async (messages, options) => {
+                    callCount++;
+                    mock.calls.push({ messages, options });
+                    const text = callCount === 1 ? 'Emma says hi' : 'Rachel waves';
+                    return (async function* () {
+                        yield encoder.encode(sseDelta(text));
+                        yield encoder.encode('data: [DONE]\n\n');
+                    })();
+                },
+            },
+        };
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+            runMemoryExtraction: async () => [],
+        }, user, async baseUrl => {
+            const result = await postChatStream(baseUrl, {
+                messages: [{ role: 'user', content: 'Emma and Rachel, hello everyone' }],
+                stream: true,
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+            assert.deepEqual(result.records, [
+                { type: 'speaker_start', character_id: emma.id, participant_id: emmaParticipant.id },
+                { type: 'delta', text: 'Emma says hi' },
+                { type: 'speaker_end', character_id: emma.id, participant_id: emmaParticipant.id },
+                { type: 'speaker_start', character_id: rachel.id, participant_id: rachelParticipant.id },
+                { type: 'delta', text: 'Rachel waves' },
+                { type: 'speaker_end', character_id: rachel.id, participant_id: rachelParticipant.id },
+                { type: 'done', conversation_id: conv.id },
+            ]);
+        });
+
+        // Each speaker got their own prompt
+        assert.equal(mock.calls.length, 2);
+        assert.ok(mock.calls[0].messages[0].content.includes('You are Emma.'));
+        assert.ok(mock.calls[1].messages[0].content.includes('You are Rachel.'));
+
+        // Both messages persisted
+        const messages = persistence.getMessages(dirs, conv.id);
+        assert.equal(messages.length, 3);
+        assert.equal(messages[1].participant_id, emmaParticipant.id);
+        assert.equal(messages[1].content, 'Emma says hi');
+        assert.equal(messages[2].participant_id, rachelParticipant.id);
+        assert.equal(messages[2].content, 'Rachel waves');
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('multi-speaker stream: error for one speaker does not corrupt earlier output', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const emma = persistence.createCharacter(dirs, 'alice', { name: 'Emma', system_prompt: 'You are Emma.' });
+        const rachel = persistence.createCharacter(dirs, 'alice', { name: 'Rachel', system_prompt: 'You are Rachel.' });
+        const conv = persistence.createConversation(dirs, 'alice', emma.id, 'Group');
+        const storedConversation = findAndModifyConversation(dirs, conv.id, data => {
+            data.participants.push({ id: 'part-rachel', character_id: rachel.id, role: 'character' });
+        });
+        const emmaParticipant = storedConversation.participants.find(p => p.character_id === emma.id);
+        const rachelParticipant = storedConversation.participants.find(p => p.character_id === rachel.id);
+
+        let callCount = 0;
+        const encoder = new TextEncoder();
+        const mock = {
+            calls: [],
+            provider: {
+                chatCompletion: async () => { throw new Error('not expected'); },
+                streamChatCompletion: async (messages, options) => {
+                    callCount++;
+                    mock.calls.push({ messages, options });
+                    if (callCount === 1) {
+                        return (async function* () {
+                            yield encoder.encode(sseDelta('Emma responds'));
+                            yield encoder.encode('data: [DONE]\n\n');
+                        })();
+                    }
+                    // Second speaker fails
+                    return (async function* () {
+                        yield encoder.encode(sseDelta('partial'));
+                        throw new ModelProviderError('upstream timeout', { status: 503 });
+                    })();
+                },
+            },
+        };
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+            runMemoryExtraction: async () => [],
+        }, user, async baseUrl => {
+            const result = await postChatStream(baseUrl, {
+                messages: [{ role: 'user', content: 'Emma and Rachel, hello' }],
+                stream: true,
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+            // Emma's output is intact
+            assert.deepEqual(result.records[0], { type: 'speaker_start', character_id: emma.id, participant_id: emmaParticipant.id });
+            assert.deepEqual(result.records[1], { type: 'delta', text: 'Emma responds' });
+            assert.deepEqual(result.records[2], { type: 'speaker_end', character_id: emma.id, participant_id: emmaParticipant.id });
+            // Rachel's error is isolated
+            assert.deepEqual(result.records[3], { type: 'speaker_start', character_id: rachel.id, participant_id: rachelParticipant.id });
+            assert.deepEqual(result.records[4], { type: 'delta', text: 'partial' });
+            assert.equal(result.records[5].type, 'error');
+            assert.equal(result.records[5].error, 'upstream timeout');
+            assert.equal(result.records[5].character_id, rachel.id);
+            assert.deepEqual(result.records[6], { type: 'done', conversation_id: conv.id });
+        });
+
+        // Emma's message persisted, Rachel's is not
+        const messages = persistence.getMessages(dirs, conv.id);
+        assert.equal(messages.length, 2);
+        assert.equal(messages[0].role, 'user');
+        assert.equal(messages[1].role, 'character');
+        assert.equal(messages[1].participant_id, emmaParticipant.id);
+        assert.equal(messages[1].content, 'Emma responds');
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('single-speaker stream: speaker_start and speaker_end frame the single response', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'Alice', system_prompt: 'You are Alice.' });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'Solo');
+        const participant = conv.participants.find(p => p.role === 'character');
+        const chunks = [sseDelta('hello '), sseDelta('world'), 'data: [DONE]\n\n'];
+        const mock = mockStreamProvider(chunks);
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+            runMemoryExtraction: async () => [],
+        }, user, async baseUrl => {
+            const result = await postChatStream(baseUrl, {
+                messages: [{ role: 'user', content: 'hi' }],
+                stream: true,
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+            assert.deepEqual(result.records, [
+                { type: 'speaker_start', character_id: char.id, participant_id: participant.id },
+                { type: 'delta', text: 'hello ' },
+                { type: 'delta', text: 'world' },
+                { type: 'speaker_end', character_id: char.id, participant_id: participant.id },
+                { type: 'done', conversation_id: conv.id },
+            ]);
+        });
+
+        const messages = persistence.getMessages(dirs, conv.id);
+        assert.equal(messages.length, 2);
+        assert.equal(messages[1].participant_id, participant.id);
+        assert.equal(messages[1].content, 'hello world');
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('stream without conversation_id: no speaker_start or speaker_end records', async () => {
+    const chunks = [sseDelta('hello '), sseDelta('world'), 'data: [DONE]\n\n'];
+    const mock = mockStreamProvider(chunks);
+    await withChatServer({
+        loadConfig: async () => configuredConfig,
+        createProvider: () => mock.provider,
+    }, { profile: { handle: 'alice' }, directories }, async baseUrl => {
+        const result = await postChatStream(baseUrl, { messages: [{ role: 'user', content: 'hi' }], stream: true });
+        assert.equal(result.status, 200);
+        assert.deepEqual(result.records, [
+            { type: 'delta', text: 'hello ' },
+            { type: 'delta', text: 'world' },
+            { type: 'done' },
+        ]);
+    });
+});
+
 test('memory extraction is NOT triggered on stream error', async () => {
     const tmp = makeTempDirs();
     try {
@@ -1289,7 +1617,8 @@ test('memory extraction is NOT triggered on stream error', async () => {
                 conversation_id: conv.id,
             });
             assert.equal(result.status, 200);
-            assert.equal(result.records[1].type, 'error');
+            const errorRecord = result.records.find(r => r.type === 'error');
+            assert.ok(errorRecord, 'should have an error record');
         });
         await new Promise(r => setImmediate(r));
         assert.equal(extractionCalled, false);

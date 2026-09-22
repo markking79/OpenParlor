@@ -116,10 +116,8 @@ export function createOpenParlorChatRouter({
         const handle = user.profile?.handle ?? 'unknown';
 
         // Validate conversation, build server-side prompt, and persist the user's message
-        let participantId = null;
-        let modelMessages = safeMessages;
+        let speakerContexts = null;
         let conversation = null;
-        let character = null;
         if (conversationId) {
             conversation = persistence.getConversation(user.directories, conversationId);
             if (!conversation) {
@@ -132,25 +130,28 @@ export function createOpenParlorChatRouter({
             const lastUserMsg = [...safeMessages].reverse().find(m => m.role === 'user');
             const participantCharacters = characterParticipants.map(participant => persistence.getCharacter(user.directories, participant.character_id))
                 .filter(Boolean);
-            const characterParticipant = selectSpeaker(characterParticipants, participantCharacters, lastUserMsg?.content ?? '')[0];
-            if (!characterParticipant) {
+            const selectedSpeakers = selectSpeaker(characterParticipants, participantCharacters, lastUserMsg?.content ?? '');
+            if (selectedSpeakers.length === 0) {
                 return response.status(400).json({ error: 'Conversation has no character participant' });
-            }
-            participantId = characterParticipant.id;
-
-            character = persistence.getCharacter(user.directories, characterParticipant.character_id);
-            if (!character) {
-                return response.status(400).json({ error: 'Character not found' });
             }
 
             const history = persistence.getMessages(user.directories, conversationId);
-            const memoryLines = lastUserMsg
-                ? retrieveMemories(user.directories, handle, character.id, lastUserMsg.content)
-                : [];
-            modelMessages = buildPrompt({ character, conversation, history, newMessages: safeMessages, memories: memoryLines });
+            speakerContexts = [];
+            for (const speaker of selectedSpeakers) {
+                const character = persistence.getCharacter(user.directories, speaker.character_id);
+                if (!character) continue;
+                const memoryLines = lastUserMsg
+                    ? retrieveMemories(user.directories, handle, character.id, lastUserMsg.content)
+                    : [];
+                const prompt = buildPrompt({ character, conversation, history, newMessages: safeMessages, memories: memoryLines });
+                speakerContexts.push({ participant: speaker, character, prompt });
+            }
+            if (speakerContexts.length === 0) {
+                return response.status(400).json({ error: 'Conversation has no character participant' });
+            }
 
             if (lastUserMsg) {
-                persistence.appendMessage(user.directories, conversationId, participantId, lastUserMsg.content, 'user');
+                persistence.appendMessage(user.directories, conversationId, speakerContexts[0].participant.id, lastUserMsg.content, 'user');
             }
         }
 
@@ -159,18 +160,20 @@ export function createOpenParlorChatRouter({
             const provider = createProvider(config.model);
 
             if (!stream) {
-                const completion = await provider.chatCompletion(modelMessages);
-                let assistantMessageId = null;
-                let assistantContent = null;
-                if (conversationId && participantId) {
-                    assistantContent = typeof completion?.choices?.[0]?.message?.content === 'string'
+                if (!speakerContexts) {
+                    const completion = await provider.chatCompletion(safeMessages);
+                    response.json(completion);
+                    return;
+                }
+
+                if (speakerContexts.length === 1) {
+                    const { participant, character, prompt } = speakerContexts[0];
+                    const completion = await provider.chatCompletion(prompt);
+                    const assistantContent = typeof completion?.choices?.[0]?.message?.content === 'string'
                         ? completion.choices[0].message.content
                         : JSON.stringify(completion);
-                    const assistantMsg = persistence.appendMessage(user.directories, conversationId, participantId, assistantContent, 'character');
-                    assistantMessageId = assistantMsg.id;
-                }
-                response.json(conversationId ? { ...completion, conversation_id: conversationId } : completion);
-                if (conversationId && participantId && assistantMessageId && character) {
+                    const assistantMsg = persistence.appendMessage(user.directories, conversationId, participant.id, assistantContent, 'character');
+                    response.json({ ...completion, conversation_id: conversationId });
                     const knownBy = conversation.participants
                         .map(p => p.character_id)
                         .filter((id, idx, arr) => arr.indexOf(id) === idx);
@@ -184,7 +187,46 @@ export function createOpenParlorChatRouter({
                         character,
                         conversation,
                         messages: extractionMessages,
-                        source_message_id: assistantMessageId,
+                        source_message_id: assistantMsg.id,
+                        known_by_character_ids: knownBy,
+                        provider,
+                    }).catch(err => {
+                        console.error('OpenParlor: memory extraction failed', err);
+                    });
+                    return;
+                }
+
+                const responses = [];
+                for (const { participant, character, prompt } of speakerContexts) {
+                    try {
+                        const completion = await provider.chatCompletion(prompt);
+                        const content = typeof completion?.choices?.[0]?.message?.content === 'string'
+                            ? completion.choices[0].message.content
+                            : JSON.stringify(completion);
+                        const msg = persistence.appendMessage(user.directories, conversationId, participant.id, content, 'character');
+                        responses.push({ character_id: character.id, participant_id: participant.id, content, message_id: msg.id });
+                    } catch {
+                        responses.push({ character_id: character.id, participant_id: participant.id, error: 'Chat completion failed' });
+                    }
+                }
+                response.json({ conversation_id: conversationId, responses });
+                const knownBy = conversation.participants
+                    .map(p => p.character_id)
+                    .filter((id, idx, arr) => arr.indexOf(id) === idx);
+                for (const { character } of speakerContexts) {
+                    const resp = responses.find(r => r.character_id === character.id && !r.error);
+                    if (!resp) continue;
+                    const extractionMessages = [
+                        ...safeMessages.filter(m => m.role === 'user').map(m => ({ role: 'user', content: m.content })),
+                        { role: 'character', content: resp.content },
+                    ];
+                    runMemoryExtraction({
+                        directories: user.directories,
+                        owner_id: handle,
+                        character,
+                        conversation,
+                        messages: extractionMessages,
+                        source_message_id: resp.message_id,
                         known_by_character_ids: knownBy,
                         provider,
                     }).catch(err => {
@@ -200,10 +242,6 @@ export function createOpenParlorChatRouter({
                 'X-Accel-Buffering': 'no',
             });
 
-            const decoder = new TextDecoder('utf-8', { stream: true });
-            let buffer = '';
-            let assistantText = '';
-            let assistantMessageId = null;
             const abortController = new AbortController();
             const abortStream = () => abortController.abort();
             request.once('aborted', abortStream);
@@ -213,55 +251,85 @@ export function createOpenParlorChatRouter({
                 response.write(JSON.stringify(record) + '\n');
             };
 
+            const contexts = speakerContexts || [{ participant: null, character: null, prompt: safeMessages }];
+            const extractionResults = [];
+            let hadStreamError = false;
+
             try {
-                const result = await provider.streamChatCompletion(modelMessages, { signal: abortController.signal });
-                for await (const chunk of result) {
-                    buffer += decoder.decode(chunk, { stream: true });
-                    const lines = buffer.split('\n');
-                    buffer = lines.pop();
-                    for (const line of lines) {
-                        const delta = extractSseDelta(line);
-                        if (delta !== null) {
-                            assistantText += delta;
-                            writeRecord({ type: 'delta', text: delta });
+                for (const { participant, character, prompt } of contexts) {
+                    if (character) {
+                        writeRecord({ type: 'speaker_start', character_id: character.id, participant_id: participant.id });
+                    }
+
+                    const decoder = new TextDecoder('utf-8', { stream: true });
+                    let buffer = '';
+                    let speakerText = '';
+                    let speakerMessageId = null;
+
+                    try {
+                        const result = await provider.streamChatCompletion(prompt, { signal: abortController.signal });
+                        for await (const chunk of result) {
+                            buffer += decoder.decode(chunk, { stream: true });
+                            const lines = buffer.split('\n');
+                            buffer = lines.pop();
+                            for (const line of lines) {
+                                const delta = extractSseDelta(line);
+                                if (delta !== null) {
+                                    speakerText += delta;
+                                    writeRecord({ type: 'delta', text: delta });
+                                }
+                            }
+                        }
+                        buffer += decoder.decode();
+                        if (buffer) {
+                            const delta = extractSseDelta(buffer);
+                            if (delta !== null) {
+                                speakerText += delta;
+                                writeRecord({ type: 'delta', text: delta });
+                            }
+                        }
+                        if (participant && speakerText) {
+                            try {
+                                const msg = persistence.appendMessage(user.directories, conversationId, participant.id, speakerText, 'character');
+                                speakerMessageId = msg.id;
+                            } catch (persistErr) {
+                                console.error('OpenParlor: failed to persist assistant message', persistErr);
+                            }
+                        }
+                        if (character) {
+                            writeRecord({ type: 'speaker_end', character_id: character.id, participant_id: participant.id });
+                        }
+                        if (character && speakerMessageId && speakerText) {
+                            extractionResults.push({ character, content: speakerText, messageId: speakerMessageId });
+                        }
+                    } catch (streamError) {
+                        hadStreamError = true;
+                        if (streamError instanceof ModelProviderError) {
+                            writeRecord({ type: 'error', error: streamError.message, ...(character ? { character_id: character.id } : {}) });
+                        } else {
+                            writeRecord({ type: 'error', error: 'Chat completion failed', ...(character ? { character_id: character.id } : {}) });
                         }
                     }
                 }
-                buffer += decoder.decode();
-                if (buffer) {
-                    const delta = extractSseDelta(buffer);
-                    if (delta !== null) {
-                        assistantText += delta;
-                        writeRecord({ type: 'delta', text: delta });
-                    }
-                }
-                if (conversationId && participantId && assistantText) {
-                    try {
-                        const assistantMsg = persistence.appendMessage(user.directories, conversationId, participantId, assistantText, 'character');
-                        assistantMessageId = assistantMsg.id;
-                    } catch (persistErr) {
-                        console.error('OpenParlor: failed to persist assistant message', persistErr);
-                    }
-                }
-                writeRecord(conversationId ? { type: 'done', conversation_id: conversationId } : { type: 'done' });
-            } catch (streamError) {
-                if (streamError instanceof ModelProviderError) {
-                    writeRecord({ type: 'error', error: streamError.message });
-                } else {
-                    writeRecord({ type: 'error', error: 'Chat completion failed' });
+                // Preserve the established standalone stream contract: an error
+                // terminates that stream without a done record. Conversation
+                // streams still complete after an isolated speaker failure so
+                // the browser can release its sequential group state.
+                if (!hadStreamError || conversationId) {
+                    writeRecord(conversationId ? { type: 'done', conversation_id: conversationId } : { type: 'done' });
                 }
             } finally {
                 request.off('aborted', abortStream);
                 response.off('close', abortStream);
             }
             response.end();
-            if (conversationId && participantId && assistantMessageId && character) {
+            for (const { character, content, messageId } of extractionResults) {
                 const knownBy = conversation.participants
                     .map(p => p.character_id)
                     .filter((id, idx, arr) => arr.indexOf(id) === idx);
                 const extractionMessages = [
                     ...safeMessages.filter(m => m.role === 'user').map(m => ({ role: 'user', content: m.content })),
-                    { role: 'character', content: assistantText },
+                    { role: 'character', content },
                 ];
                 runMemoryExtraction({
                     directories: user.directories,
@@ -269,7 +337,7 @@ export function createOpenParlorChatRouter({
                     character,
                     conversation,
                     messages: extractionMessages,
-                    source_message_id: assistantMessageId,
+                    source_message_id: messageId,
                     known_by_character_ids: knownBy,
                     provider,
                 }).catch(err => {
