@@ -2226,3 +2226,47 @@ describe('HTML/message rendering safety', () => {
         assert.equal(result.model.label, '<b>safe</b>');
     });
 });
+
+describe('backend-future decision', () => {
+    it('harness requires CSRF for all mutations without weakening production', async () => {
+        const fetchCalls = [];
+        const controller = createTranscriptionController({
+            fetchFn: async (url, opts) => {
+                fetchCalls.push({ url, opts });
+                return { ok: true, json: async () => ({ text: 'ok' }) };
+            },
+            getCsrfToken: async () => 'production-token',
+        });
+        await controller.transcribe(new Blob(['audio']));
+        assert.equal(fetchCalls[0].opts.headers['X-CSRF-Token'], 'production-token');
+    });
+
+    it('missing developer storage state is deferred, not fatal', () => {
+        const result = checkLocalReadiness({
+            modelStatus: { provider: 'ollama', model: 'llama3', endpointLabel: 'Local', models: ['llama3'], connected: true },
+            healthStatus: { model: { available: true, label: 'llama3' }, tts: { available: true, label: 'Piper' }, stt: { available: true, label: 'Whisper' } },
+            prerequisite: null,
+        });
+        assert.equal(result.ready, false);
+        assert.equal(result.prerequisite.deferred, true);
+        assert.ok(result.blockers.includes('Prerequisite not met'));
+    });
+
+    it('configuration discovery exposes only safe fields', () => {
+        const model = normalizeModelStatus({
+            provider: 'ollama', model: 'llama3', endpointLabel: 'Local',
+            models: ['llama3'], connected: true,
+            api_key: 'secret', base_url: 'http://localhost:11434',
+        });
+        assert.deepEqual(Object.keys(model).sort(), ['connected', 'endpointLabel', 'model', 'models', 'provider']);
+
+        const health = normalizeHealthStatus({
+            model: { available: true, label: 'llama3', endpoint: 'http://localhost:11434' },
+            tts: { available: true, label: 'Piper', model_path: '/opt/piper' },
+            stt: { available: true, label: 'Whisper', file_path: '/opt/whisper' },
+        });
+        assert.deepEqual(Object.keys(health.model).sort(), ['available', 'label']);
+        assert.deepEqual(Object.keys(health.tts).sort(), ['available', 'label']);
+        assert.deepEqual(Object.keys(health.stt).sort(), ['available', 'label']);
+    });
+});
