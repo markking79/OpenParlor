@@ -135,6 +135,7 @@ export function createOpenParlorChatRouter({
 
         // Validate conversation, build server-side prompt, and persist the user's message
         let speakerContexts = null;
+        let participantContext = null;
         let conversation = null;
         if (conversationId) {
             conversation = persistence.getConversation(user.directories, conversationId);
@@ -152,7 +153,7 @@ export function createOpenParlorChatRouter({
             // participant record, so prompts can attribute speech and list
             // participants readably (stored records carry no name field).
             const characterNameById = new Map(participantCharacters.map(c => [c.id, c.name]));
-            const participantContext = characterParticipants
+            participantContext = characterParticipants
                 .map(participant => ({
                     participant_id: participant.id,
                     character_id: participant.character_id,
@@ -222,6 +223,7 @@ export function createOpenParlorChatRouter({
                         messages: extractionMessages,
                         source_message_id: assistantMsg.id,
                         known_by_character_ids: knownBy,
+                        participants: participantContext?.map(p => ({ name: p.name })),
                         provider,
                     }).catch(err => {
                         console.error('OpenParlor: memory extraction failed', err);
@@ -263,6 +265,7 @@ export function createOpenParlorChatRouter({
                         messages: extractionMessages,
                         source_message_id: resp.message_id,
                         known_by_character_ids: knownBy,
+                        participants: participantContext?.map(p => ({ name: p.name })),
                         provider,
                     }).catch(err => {
                         console.error('OpenParlor: memory extraction failed', err);
@@ -377,6 +380,7 @@ export function createOpenParlorChatRouter({
                     messages: extractionMessages,
                     source_message_id: messageId,
                     known_by_character_ids: knownBy,
+                    participants: participantContext?.map(p => ({ name: p.name })),
                     provider,
                 }).catch(err => {
                     console.error('OpenParlor: memory extraction failed', err);

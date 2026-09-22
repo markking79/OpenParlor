@@ -585,6 +585,16 @@ describe('OpenParlor persistence', () => {
             assert.equal(mem.source_conversation_id, null);
             assert.equal(mem.source_message_id, null);
         });
+
+        it('defaults pinned to false and honors an explicit pinned flag', () => {
+            const char = createCharacter(dirs, 'alice', { name: 'C' });
+            const unpinned = createMemory(dirs, 'alice', { character_id: char.id, content: 'not pinned' });
+            assert.equal(unpinned.pinned, false);
+            const pinned = createMemory(dirs, 'alice', { character_id: char.id, content: 'pinned', pinned: true });
+            assert.equal(pinned.pinned, true);
+            assert.equal(getMemory(dirs, pinned.id).pinned, true);
+            assert.equal(getMemory(dirs, unpinned.id).pinned, false);
+        });
     });
 
     // ─── Memory visibility ─────────────────────────────────────────────────

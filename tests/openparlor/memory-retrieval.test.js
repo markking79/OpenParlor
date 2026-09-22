@@ -381,3 +381,177 @@ test('skips individually oversized memory without blocking lower-ranked memories
         tmp.cleanup();
     }
 });
+
+// ─── QWEN-STAB-004: retrieval quality ────────────────────────────────────────
+
+test('matches stemmed forms so semantic equivalents retrieve', () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        persistence.createMemory(dirs, 'alice', {
+            character_id: 'char-1',
+            content: 'the user enjoys cooking pasta',
+            type: 'preference',
+            known_by_character_ids: ['char-1'],
+        });
+
+        const result = retrieveMemories(dirs, 'alice', 'char-1', 'does the user cook pasta');
+        assert.equal(result.length, 1);
+        assert.ok(result[0].includes('cooking pasta'));
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('returns empty when the query has no significant tokens after stopword filtering', () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        persistence.createMemory(dirs, 'alice', {
+            character_id: 'char-1',
+            content: 'the and a of about',
+            type: 'fact',
+            known_by_character_ids: ['char-1'],
+        });
+
+        assert.deepEqual(retrieveMemories(dirs, 'alice', 'char-1', 'the and a of about'), []);
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('proper-noun matches are boosted above lowercase matches with equal importance', () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        persistence.createMemory(dirs, 'alice', {
+            character_id: 'char-1',
+            content: 'Monica works in catering',
+            type: 'fact',
+            importance: 0.3,
+            known_by_character_ids: ['char-1'],
+        });
+        persistence.createMemory(dirs, 'alice', {
+            character_id: 'char-1',
+            content: 'monica is the nickname the user gave the cat',
+            type: 'fact',
+            importance: 0.9,
+            known_by_character_ids: ['char-1'],
+        });
+
+        const result = retrieveMemories(dirs, 'alice', 'char-1', 'Monica catering');
+        assert.ok(result.length >= 2);
+        assert.ok(result[0].includes('Monica works in catering'));
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('pinned memory boost can outrank a higher-importance memory with equal token overlap', () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        persistence.createMemory(dirs, 'alice', {
+            character_id: 'char-1',
+            content: 'coffee is a hot drink',
+            type: 'fact',
+            importance: 0.5,
+            known_by_character_ids: ['char-1'],
+        });
+        persistence.createMemory(dirs, 'alice', {
+            character_id: 'char-1',
+            content: 'the user drinks coffee',
+            type: 'preference',
+            importance: 0.2,
+            pinned: true,
+            known_by_character_ids: ['char-1'],
+        });
+
+        const result = retrieveMemories(dirs, 'alice', 'char-1', 'coffee');
+        assert.equal(result.length, 2);
+        assert.ok(result[0].includes('the user drinks coffee'));
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('pinned memory with zero token overlap is still not retrieved', () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        persistence.createMemory(dirs, 'alice', {
+            character_id: 'char-1',
+            content: 'the moon is made of cheese',
+            type: 'fact',
+            pinned: true,
+            known_by_character_ids: ['char-1'],
+        });
+
+        assert.deepEqual(retrieveMemories(dirs, 'alice', 'char-1', 'zzz qqq xxx'), []);
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('confidence weights memories with equal importance and relevance', () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        persistence.createMemory(dirs, 'alice', {
+            character_id: 'char-1',
+            content: 'the user likes coffee',
+            type: 'preference',
+            importance: 0.5,
+            confidence: 0.2,
+            known_by_character_ids: ['char-1'],
+        });
+        persistence.createMemory(dirs, 'alice', {
+            character_id: 'char-1',
+            content: 'coffee is the user favorite drink',
+            type: 'fact',
+            importance: 0.5,
+            confidence: 0.9,
+            known_by_character_ids: ['char-1'],
+        });
+
+        const result = retrieveMemories(dirs, 'alice', 'char-1', 'coffee');
+        assert.equal(result.length, 2);
+        assert.ok(result[0].includes('favorite drink'));
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('phrase coverage boosts memories containing the full query', () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        persistence.createMemory(dirs, 'alice', {
+            character_id: 'char-1',
+            content: 'the user was born',
+            type: 'fact',
+            importance: 0.9,
+            known_by_character_ids: ['char-1'],
+        });
+        persistence.createMemory(dirs, 'alice', {
+            character_id: 'char-1',
+            content: 'the user was born in paris in 1990',
+            type: 'fact',
+            importance: 0.5,
+            known_by_character_ids: ['char-1'],
+        });
+
+        const result = retrieveMemories(dirs, 'alice', 'char-1', 'user born paris');
+        assert.ok(result.length >= 2);
+        assert.ok(result[0].includes('paris'));
+    } finally {
+        tmp.cleanup();
+    }
+});
