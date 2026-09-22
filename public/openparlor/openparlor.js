@@ -392,6 +392,28 @@ export function normalizeDeferredPrerequisite(raw) {
 }
 
 /**
+ * Fetches and normalizes a deferred prerequisite check from the server.
+ * Reports missing developer storage state as a deferred local prerequisite
+ * without leaking sensitive details. Uses the existing read-only endpoint
+ * (no CSRF required for GET).
+ * @param {{ fetchFn?: (url: string) => Promise<Response> }} [deps]
+ * @returns {Promise<{ deferred: boolean, label: string }>}
+ */
+export async function fetchDeferredPrerequisite(deps = {}) {
+    const { fetchFn = fetch } = deps;
+    try {
+        const res = await fetchFn('/api/openparlor/prerequisites');
+        if (!res.ok) {
+            return { deferred: true, label: 'Prerequisite not met' };
+        }
+        const data = await res.json();
+        return normalizeDeferredPrerequisite(data);
+    } catch {
+        return { deferred: true, label: 'Prerequisite not met' };
+    }
+}
+
+/**
  * Normalizes a raw service error into a safe, user-facing message.
  * If the error contains URLs, filesystem paths, or credential patterns,
  * returns the fallback to prevent leaking sensitive information.
@@ -1501,6 +1523,7 @@ if (typeof document !== 'undefined') {
     // ── Health status ──────────────────────────────────────────────────────
 
     const healthStatusList = document.getElementById('healthStatusList');
+    const prerequisiteStatus = document.getElementById('prerequisiteStatus');
 
     async function fetchHealthStatus() {
         try {
@@ -1543,6 +1566,17 @@ if (typeof document !== 'undefined') {
 
             item.append(dot, label);
             healthStatusList.appendChild(item);
+        }
+    }
+
+    function renderPrerequisiteStatus(status) {
+        if (!prerequisiteStatus) return;
+        prerequisiteStatus.innerHTML = '';
+        if (status.deferred) {
+            const el = document.createElement('div');
+            el.className = 'prerequisite-deferred';
+            el.textContent = status.label;
+            prerequisiteStatus.appendChild(el);
         }
     }
 
@@ -2357,6 +2391,9 @@ if (typeof document !== 'undefined') {
 
         const health = await fetchHealthStatus();
         renderHealthStatus(health);
+
+        const prereq = await fetchDeferredPrerequisite();
+        renderPrerequisiteStatus(prereq);
     }
 
     init();

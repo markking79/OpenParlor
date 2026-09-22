@@ -15,6 +15,7 @@ import {
     normalizeChatReadiness,
     normalizeAudioReadiness,
     normalizeDeferredPrerequisite,
+    fetchDeferredPrerequisite,
     selectSupportedMime,
     shouldAutoSendTranscription,
     shouldAutoSpeak,
@@ -729,6 +730,79 @@ describe('normalizeDeferredPrerequisite', () => {
         const result = normalizeDeferredPrerequisite({ satisfied: false, label: 42 });
         assert.equal(result.deferred, true);
         assert.equal(result.label, 'Prerequisite not met');
+    });
+});
+
+describe('fetchDeferredPrerequisite', () => {
+    it('should return normalized result on successful response', async () => {
+        const result = await fetchDeferredPrerequisite({
+            fetchFn: async () => ({
+                ok: true,
+                json: async () => ({ satisfied: false, label: 'Developer storage state not found' }),
+            }),
+        });
+        assert.equal(result.deferred, true);
+        assert.equal(result.label, 'Developer storage state not found');
+    });
+
+    it('should return non-deferred when satisfied is true', async () => {
+        const result = await fetchDeferredPrerequisite({
+            fetchFn: async () => ({
+                ok: true,
+                json: async () => ({ satisfied: true, label: 'Storage state found' }),
+            }),
+        });
+        assert.equal(result.deferred, false);
+        assert.equal(result.label, '');
+    });
+
+    it('should return fallback on non-ok response', async () => {
+        const result = await fetchDeferredPrerequisite({
+            fetchFn: async () => ({ ok: false, json: async () => ({}) }),
+        });
+        assert.equal(result.deferred, true);
+        assert.equal(result.label, 'Prerequisite not met');
+    });
+
+    it('should return fallback on network error', async () => {
+        const result = await fetchDeferredPrerequisite({
+            fetchFn: async () => { throw new Error('network down'); },
+        });
+        assert.equal(result.deferred, true);
+        assert.equal(result.label, 'Prerequisite not met');
+    });
+
+    it('should return fallback on non-object JSON response', async () => {
+        const result = await fetchDeferredPrerequisite({
+            fetchFn: async () => ({
+                ok: true,
+                json: async () => 'not-an-object',
+            }),
+        });
+        assert.equal(result.deferred, true);
+        assert.equal(result.label, 'Prerequisite not met');
+    });
+
+    it('should redact sensitive content from labels', async () => {
+        const result = await fetchDeferredPrerequisite({
+            fetchFn: async () => ({
+                ok: true,
+                json: async () => ({ satisfied: false, label: 'Missing state at /home/dev/.openparlor/storage-state.json' }),
+            }),
+        });
+        assert.equal(result.deferred, true);
+        assert.ok(!result.label.includes('/home/dev'));
+    });
+
+    it('should call the correct endpoint', async () => {
+        const urls = [];
+        await fetchDeferredPrerequisite({
+            fetchFn: async (url) => {
+                urls.push(url);
+                return { ok: true, json: async () => ({ satisfied: true }) };
+            },
+        });
+        assert.equal(urls[0], '/api/openparlor/prerequisites');
     });
 });
 
