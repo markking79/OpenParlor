@@ -16,7 +16,8 @@ prompts and UI, and history duplication) with a bounded, test-proven change.
 
 ## Final commit SHA
 
-- `QWEN_FINAL_COMMIT_SHA` (backfilled after commit; this report is part of that commit)
+- `0d67e99ed407daa73b8798222d43d86bd4c469e5` (this report is part of that commit;
+  the SHA was backfilled into the working copy after the commit)
 
 ## Root causes found (verified against the code before editing)
 
@@ -209,6 +210,7 @@ git diff --cached --check
 
 ## Worktree clean status
 
-- Clean: after the commit, only the untracked
+- Clean at commit time: after the commit only the untracked
   `OPENPARLOR_QWEN_ONLY_STABILIZATION_PLAN.md` (present before work began)
-  remains; no tracked task file is left modified.
+  remained. The only post-commit working-copy change is this report's final
+  commit SHA backfill (uncommitted, intentional).
