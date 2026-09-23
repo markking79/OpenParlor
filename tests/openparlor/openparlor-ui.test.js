@@ -1483,4 +1483,74 @@ describe('createStreamMessageCollector', () => {
         assert.equal(messages.length, 1);
         assert.equal(messages[0].content, '');
     });
+
+    // ─── DOGFOOD-002: pending identity and complete two-speaker sequence ───
+
+    test('pending message before speaker_start has no character_id (neutral rendering contract)', () => {
+        const collector = createStreamMessageCollector();
+        const pending = collector.getPendingMessage();
+        assert.equal(pending.role, 'assistant');
+        assert.equal(pending.content, '');
+        assert.ok(!('character_id' in pending), 'pending message must not carry a character_id');
+        assert.ok(!('participant_id' in pending), 'pending message must not carry a participant_id');
+    });
+
+    test('complete two-speaker sequence: A-start/A-delta/A-end/B-start/B-delta/B-end leaves two distinct completed messages', () => {
+        const collector = createStreamMessageCollector();
+
+        // Speaker A starts
+        const aStart = collector.handleRecord({ type: 'speaker_start', character_id: 'char-alpha' });
+        assert.equal(aStart.isNewMessage, false, 'first speaker_start assigns identity to pending message');
+
+        // Speaker A deltas
+        collector.handleRecord({ type: 'delta', text: 'Hello, ' });
+        collector.handleRecord({ type: 'delta', text: 'I am Alpha.' });
+
+        // Speaker A ends
+        const aEnd = collector.handleRecord({ type: 'speaker_end', character_id: 'char-alpha' });
+        assert.equal(aEnd.message.character_id, 'char-alpha');
+
+        // After A ends, A's content is intact
+        let messages = collector.getMessages();
+        assert.equal(messages.length, 1);
+        assert.equal(messages[0].character_id, 'char-alpha');
+        assert.equal(messages[0].content, 'Hello, I am Alpha.');
+
+        // Speaker B starts — must create a NEW message, not replace A
+        const bStart = collector.handleRecord({ type: 'speaker_start', character_id: 'char-beta' });
+        assert.equal(bStart.isNewMessage, true, 'second speaker_start creates a new message');
+
+        // A is still present and unchanged after B starts
+        messages = collector.getMessages();
+        assert.equal(messages.length, 2, 'B-start must not erase A');
+        assert.equal(messages[0].character_id, 'char-alpha');
+        assert.equal(messages[0].content, 'Hello, I am Alpha.', 'A content must be preserved after B starts');
+
+        // Speaker B deltas
+        collector.handleRecord({ type: 'delta', text: 'Hi, ' });
+        collector.handleRecord({ type: 'delta', text: 'I am Beta.' });
+
+        // A is still intact during B's deltas
+        messages = collector.getMessages();
+        assert.equal(messages[0].content, 'Hello, I am Alpha.', 'A content must be preserved during B deltas');
+
+        // Speaker B ends
+        const bEnd = collector.handleRecord({ type: 'speaker_end', character_id: 'char-beta' });
+        assert.equal(bEnd.message.character_id, 'char-beta');
+
+        // Done
+        collector.handleRecord({ type: 'done' });
+
+        // Final state: two distinct, completed messages
+        messages = collector.getMessages();
+        assert.equal(messages.length, 2);
+        assert.equal(messages[0].role, 'assistant');
+        assert.equal(messages[0].character_id, 'char-alpha');
+        assert.equal(messages[0].content, 'Hello, I am Alpha.');
+        assert.equal(messages[1].role, 'assistant');
+        assert.equal(messages[1].character_id, 'char-beta');
+        assert.equal(messages[1].content, 'Hi, I am Beta.');
+        // B never replaced or erased A
+        assert.notEqual(messages[0], messages[1], 'messages must be distinct objects');
+    });
 });

@@ -337,6 +337,28 @@ if (typeof document !== 'undefined') {
             const messageEl = document.createElement('div');
             messageEl.className = 'message' + (isUser ? ' user-message' : '');
 
+            // Neutral pending response: before speaker_start the stream
+            // placeholder has no identity; do not attribute it to the
+            // primary character.
+            const hasIdentity = !isUser && (
+                (typeof msg.character_id === 'string' && msg.character_id) ||
+                (typeof msg.participant_id === 'string' && msg.participant_id)
+            );
+            if (!isUser && !hasIdentity) {
+                const pendingContent = document.createElement('div');
+                pendingContent.className = 'message-content';
+                const pendingSpeaker = document.createElement('div');
+                pendingSpeaker.className = 'speaker';
+                pendingSpeaker.textContent = 'Preparing response…';
+                const pendingBubble = document.createElement('div');
+                pendingBubble.className = 'bubble';
+                pendingBubble.textContent = msg.content || 'Preparing response…';
+                pendingContent.append(pendingSpeaker, pendingBubble);
+                messageEl.appendChild(pendingContent);
+                messagesEl.appendChild(messageEl);
+                continue;
+            }
+
             const msgCharId = !isUser ? resolveMessageCharacterId(msg, currentConversation) : currentConversation.characterId;
             const char = findCharacter(msgCharId);
             const charName = char ? char.name : 'Assistant';
