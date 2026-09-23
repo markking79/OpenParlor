@@ -3,7 +3,7 @@ import path from 'node:path';
 
 /**
  * @typedef {Object} OpenParlorConfig
- * @property {{ provider: string, baseUrl: string, model: string }} model Model provider configuration
+ * @property {{ provider: string, baseUrl: string, model: string, maxContextTokens: number }} model Model provider configuration; `maxContextTokens` is the serving deployment context window used for prompt budgeting (0 means unconfigured, falling back to the documented default budget)
  * @property {{ provider: string, baseUrl: string, pythonExecutable: string, runnerPath: string, modelPath: string, modelCacheDir: string, maxAudioBytes: number, timeoutMs: number, language: string }} stt Speech-to-text provider configuration
  * @property {{ provider: string, baseUrl: string, voice: string }} tts Text-to-speech provider configuration
  */
@@ -14,10 +14,10 @@ import path from 'node:path';
  * defaults or secrets are ever supplied by this module.
  * The STT execution fields are a fixed server-owned whitelist for the local
  * faster-whisper adapter. They are deliberately not browser-editable.
- * @type {Readonly<{ model: Readonly<{ provider: string, baseUrl: string, model: string }>, stt: Readonly<{ provider: string, baseUrl: string, pythonExecutable: string, runnerPath: string, modelPath: string, modelCacheDir: string, maxAudioBytes: number, timeoutMs: number, language: string }>, tts: Readonly<{ provider: string, baseUrl: string, voice: string }> }>}
+ * @type {Readonly<{ model: Readonly<{ provider: string, baseUrl: string, model: string, maxContextTokens: number }>, stt: Readonly<{ provider: string, baseUrl: string, pythonExecutable: string, runnerPath: string, modelPath: string, modelCacheDir: string, maxAudioBytes: number, timeoutMs: number, language: string }>, tts: Readonly<{ provider: string, baseUrl: string, voice: string }> }>}
  */
 const OPENPARLOR_CONFIG_SCHEMA = Object.freeze({
-    model: Object.freeze({ provider: 'openai-compatible', baseUrl: '', model: '' }),
+    model: Object.freeze({ provider: 'openai-compatible', baseUrl: '', model: '', maxContextTokens: 0 }),
     stt: Object.freeze({ provider: '', baseUrl: '', pythonExecutable: '', runnerPath: '', modelPath: '', modelCacheDir: '', maxAudioBytes: 0, timeoutMs: 0, language: '' }),
     tts: Object.freeze({ provider: '', baseUrl: '', voice: '' }),
 });

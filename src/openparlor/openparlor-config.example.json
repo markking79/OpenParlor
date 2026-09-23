@@ -2,7 +2,8 @@
     "model": {
         "provider": "openai-compatible",
         "baseUrl": "http://127.0.0.1:PORT/v1",
-        "model": "MODEL_NAME"
+        "model": "MODEL_NAME",
+        "maxContextTokens": 0
     },
     "stt": {
         "provider": "PROVIDER_NAME",

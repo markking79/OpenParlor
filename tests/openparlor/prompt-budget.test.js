@@ -4,6 +4,7 @@ import {
     estimateTokens,
     estimatePromptTokens,
     applyPromptBudget,
+    resolvePromptBudget,
     DEFAULT_MAX_PROMPT_TOKENS,
     DEFAULT_GENERATION_RESERVE_TOKENS,
 } from '../../src/openparlor/prompt-budget.js';
@@ -99,4 +100,51 @@ test('defaults keep a full prompt plus reserve under a 4096-token context', () =
     ];
     const result = applyPromptBudget(messages);
     assert.ok(estimatePromptTokens(result) + DEFAULT_GENERATION_RESERVE_TOKENS <= DEFAULT_MAX_PROMPT_TOKENS);
+});
+
+test('resolvePromptBudget uses the configured model context when valid', () => {
+    assert.deepEqual(resolvePromptBudget({ maxContextTokens: 131072 }), {
+        maxPromptTokens: 131072,
+        generationReserveTokens: DEFAULT_GENERATION_RESERVE_TOKENS,
+    });
+    assert.equal(resolvePromptBudget({ maxContextTokens: 8192.9 }).maxPromptTokens, 8192);
+});
+
+test('resolvePromptBudget falls back to the documented default when unconfigured or invalid', () => {
+    for (const modelConfig of [
+        undefined,
+        null,
+        {},
+        { maxContextTokens: undefined },
+        { maxContextTokens: null },
+        { maxContextTokens: 0 },
+        { maxContextTokens: -4096 },
+        { maxContextTokens: Number.NaN },
+        { maxContextTokens: Number.POSITIVE_INFINITY },
+        { maxContextTokens: '32768' },
+        { maxContextTokens: ['32768'] },
+    ]) {
+        assert.deepEqual(resolvePromptBudget(modelConfig), {
+            maxPromptTokens: DEFAULT_MAX_PROMPT_TOKENS,
+            generationReserveTokens: DEFAULT_GENERATION_RESERVE_TOKENS,
+        }, `fallback expected for ${JSON.stringify(modelConfig)}`);
+    }
+});
+
+test('applyPromptBudget with a resolved configured budget stays inside the deployment context', () => {
+    const big = 'x'.repeat(40000); // 10004 tokens
+    const messages = [
+        { role: 'system', content: 's'.repeat(8000) },
+        { role: 'user', content: big },
+        { role: 'assistant', content: big },
+        { role: 'user', content: 'newest turn' },
+    ];
+    const budget = resolvePromptBudget({ maxContextTokens: 32768 });
+    const result = applyPromptBudget(messages, budget);
+    assert.equal(result[0].role, 'system');
+    assert.equal(result[result.length - 1].content, 'newest turn');
+    assert.ok(
+        estimatePromptTokens(result) + budget.generationReserveTokens <= budget.maxPromptTokens,
+        'prompt plus reserve must stay inside the configured context',
+    );
 });

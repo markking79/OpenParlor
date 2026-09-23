@@ -15,9 +15,11 @@ const TOKENS_PER_CHAR = 4;
 // Per-message overhead (role, separators, chat template tokens).
 const MESSAGE_OVERHEAD_TOKENS = 4;
 
-// A 4096-token context is the most common conservative llama.cpp default;
-// keeping the prompt at 4096 - 512 leaves a 512-token generation reserve so
-// a request can never unexpectedly exceed the context window.
+// Safe, documented fallback for deployments that do not configure
+// `model.maxContextTokens`: 4096 tokens is the most common conservative
+// llama.cpp default, so an unset budget keeps prompts (plus the generation
+// reserve) within the most conservative common context window. Configured
+// values take precedence — see resolvePromptBudget.
 const DEFAULT_MAX_PROMPT_TOKENS = 4096;
 const DEFAULT_GENERATION_RESERVE_TOKENS = 512;
 
@@ -104,6 +106,38 @@ export function applyPromptBudget(messages, {
         end = lastUser >= 0 ? lastUser : result.length;
     }
     return result;
+}
+
+/**
+ * Resolves the prompt budget for one model generation request from the
+ * server-side model configuration.
+ *
+ * The configured `model.maxContextTokens` (the `model` section of the
+ * OpenParlor server configuration) describes the context window of the
+ * serving deployment — for the local Qwen/llama.cpp setup, the llama.cpp
+ * `-c` context size — and takes precedence when it is a positive finite
+ * number. Absent or invalid values fall back to the safe, documented
+ * DEFAULT_MAX_PROMPT_TOKENS so an unconfigured deployment can never
+ * unexpectedly exceed the most conservative common context window.
+ *
+ * The returned generation reserve is subtracted by applyPromptBudget before
+ * history/summary content is bounded, so prompt plus reserved generation
+ * tokens always fit inside the model context.
+ *
+ * @param {{ maxContextTokens?: unknown }} [modelConfig] Model section of the OpenParlor server configuration
+ * @returns {{ maxPromptTokens: number, generationReserveTokens: number }} Resolved prompt budget
+ */
+export function resolvePromptBudget(modelConfig) {
+    const configured = modelConfig !== null && typeof modelConfig === 'object'
+        && typeof modelConfig.maxContextTokens === 'number'
+        && Number.isFinite(modelConfig.maxContextTokens)
+        && modelConfig.maxContextTokens > 0
+        ? Math.floor(modelConfig.maxContextTokens)
+        : DEFAULT_MAX_PROMPT_TOKENS;
+    return {
+        maxPromptTokens: configured,
+        generationReserveTokens: DEFAULT_GENERATION_RESERVE_TOKENS,
+    };
 }
 
 export { DEFAULT_MAX_PROMPT_TOKENS, DEFAULT_GENERATION_RESERVE_TOKENS };

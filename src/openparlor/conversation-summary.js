@@ -157,7 +157,12 @@ export async function updateConversationSummary({ directories, conversation_id, 
     const cutoff = total - RECENT_WINDOW_MESSAGES;
     if (cutoff - covered < SUMMARY_MIN_NEW_MESSAGES) return null;
 
-    const slice = messages.slice(covered, cutoff);
+    // A large backlog is drained in bounded steps: this step summarizes at
+    // most the next MAX_SLICE_MESSAGES messages, and the stored count
+    // advances only to what this step actually covered, so the remaining
+    // backlog is summarized by later steps instead of being silently skipped.
+    const stepEnd = Math.min(cutoff, covered + MAX_SLICE_MESSAGES);
+    const slice = messages.slice(covered, stepEnd);
     const participantNames = {};
     const participants = Array.isArray(conversation.participants) ? conversation.participants : [];
     for (const participant of participants) {
@@ -186,9 +191,9 @@ export async function updateConversationSummary({ directories, conversation_id, 
 
     return persistence.updateConversation(directories, conversation_id, {
         summary,
-        summary_message_count: cutoff,
+        summary_message_count: stepEnd,
     });
 }
 
-export { MAX_SUMMARY_CHARS, RECENT_WINDOW_MESSAGES, SUMMARY_TRIGGER_MIN_MESSAGES, SUMMARY_MIN_NEW_MESSAGES, SUMMARY_MAX_MODEL_TOKENS };
+export { MAX_SUMMARY_CHARS, RECENT_WINDOW_MESSAGES, SUMMARY_TRIGGER_MIN_MESSAGES, SUMMARY_MIN_NEW_MESSAGES, SUMMARY_MAX_MODEL_TOKENS, MAX_SLICE_MESSAGES };
 

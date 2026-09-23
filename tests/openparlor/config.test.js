@@ -25,7 +25,7 @@ describe('OpenParlor configuration loading', () => {
 
     function disabledConfig() {
         return {
-            model: { provider: 'openai-compatible', baseUrl: '', model: '' },
+            model: { provider: 'openai-compatible', baseUrl: '', model: '', maxContextTokens: 0 },
             stt: { provider: '', baseUrl: '', pythonExecutable: '', runnerPath: '', modelPath: '', modelCacheDir: '', maxAudioBytes: 0, timeoutMs: 0, language: '' },
             tts: { provider: '', baseUrl: '', voice: '' },
         };
@@ -64,13 +64,13 @@ describe('OpenParlor configuration loading', () => {
 
         test('normalizes a valid configuration', async () => {
             writeConfig(JSON.stringify({
-                model: { provider: 'openai-compatible', baseUrl: 'https://model.example.invalid/v1', model: 'llama3' },
+                model: { provider: 'openai-compatible', baseUrl: 'https://model.example.invalid/v1', model: 'llama3', maxContextTokens: 32768 },
                 stt: { provider: 'faster-whisper', baseUrl: '', pythonExecutable: '/usr/bin/python3', runnerPath: '/srv/runner.py', modelPath: '/srv/model', modelCacheDir: '/srv/cache', maxAudioBytes: 1024, timeoutMs: 5000, language: 'en' },
                 tts: { provider: 'kokoro', baseUrl: 'https://tts.example.invalid/v1', voice: 'af_heart' },
             }));
             const result = await loadOpenParlorConfig(directories);
             expect(result).toEqual({
-                model: { provider: 'openai-compatible', baseUrl: 'https://model.example.invalid/v1', model: 'llama3' },
+                model: { provider: 'openai-compatible', baseUrl: 'https://model.example.invalid/v1', model: 'llama3', maxContextTokens: 32768 },
                 stt: { provider: 'faster-whisper', baseUrl: '', pythonExecutable: '/usr/bin/python3', runnerPath: '/srv/runner.py', modelPath: '/srv/model', modelCacheDir: '/srv/cache', maxAudioBytes: 1024, timeoutMs: 5000, language: 'en' },
                 tts: { provider: 'kokoro', baseUrl: 'https://tts.example.invalid/v1', voice: 'af_heart' },
             });
@@ -104,10 +104,20 @@ describe('OpenParlor configuration loading', () => {
             }));
             const result = await loadOpenParlorConfig(directories);
             expect(result).toEqual({
-                model: { provider: 'openai-compatible', baseUrl: 'https://model.example.invalid/v1', model: '' },
+                model: { provider: 'openai-compatible', baseUrl: 'https://model.example.invalid/v1', model: '', maxContextTokens: 0 },
                 stt: { provider: '', baseUrl: '', pythonExecutable: '', runnerPath: '', modelPath: '', modelCacheDir: '', maxAudioBytes: 0, timeoutMs: 0, language: '' },
                 tts: { provider: '', baseUrl: '', voice: 'af_heart' },
             });
+        });
+
+        test('normalizes model.maxContextTokens to the unconfigured default when absent or malformed', async () => {
+            for (const maxContextTokens of [undefined, null, 0, -1, '32768', {}]) {
+                writeConfig(JSON.stringify({ model: { maxContextTokens } }));
+                const result = await loadOpenParlorConfig(directories);
+                expect(result.model.maxContextTokens).toBe(0);
+            }
+            writeConfig(JSON.stringify({ model: { maxContextTokens: 131072 } }));
+            expect((await loadOpenParlorConfig(directories)).model.maxContextTokens).toBe(131072);
         });
 
         test('rejects when the user directories argument is invalid', async () => {

@@ -4,6 +4,8 @@ import { loadOpenParlorConfig } from './config.js';
 import { createModelProvider, ModelProviderError } from './model-provider.js';
 import * as persistence from './persistence.js';
 import { buildPrompt } from './prompt-builder.js';
+import { applyPromptBudget, resolvePromptBudget } from './prompt-budget.js';
+import { sanitizeSummaryForPrompt, updateConversationSummary } from './conversation-summary.js';
 import { retrieveMemories } from './memory-retrieval.js';
 import { extractAndPersistMemories } from './memory-extractor.js';
 import { selectSpeakers } from './speaker-director.js';
@@ -115,6 +117,22 @@ export function createOpenParlorChatRouter({
 } = {}) {
     const router = express.Router();
 
+    /**
+     * Schedules a fire-and-forget rolling summary refresh for a completed
+     * conversation turn. The refresh runs against the provider resolved for
+     * this request, is never awaited by the chat response path, and contains
+     * all failures (a failed summary must never change a delivered response).
+     * @param {import('../users.js').UserDirectoryList} directories
+     * @param {string} conversationId
+     * @param {object} provider
+     */
+    const scheduleSummaryRefresh = (directories, conversationId, provider) => {
+        updateConversationSummary({ directories, conversation_id: conversationId, provider })
+            .catch(error => {
+                console.error('OpenParlor: conversation summarization failed', error);
+            });
+    };
+
     router.post('/chat', async (request, response) => {
         const messages = parseChatMessages(request.body);
         if (messages === null) {
@@ -138,6 +156,7 @@ export function createOpenParlorChatRouter({
         let participantContext = null;
         let conversation = null;
         let provider = null;
+        let modelConfig = null;
         if (conversationId) {
             conversation = persistence.getConversation(user.directories, conversationId);
             if (!conversation) {
@@ -152,6 +171,7 @@ export function createOpenParlorChatRouter({
             try {
                 const config = await loadConfig(user.directories);
                 provider = createProvider(config.model);
+                modelConfig = config.model;
             } catch (error) {
                 if (error instanceof ModelProviderError) {
                     const status = typeof error.status === 'number' ? error.status : 503;
@@ -193,6 +213,13 @@ export function createOpenParlorChatRouter({
                 return response.status(400).json({ error: 'Conversation has no character participant' });
             }
 
+            // STAB-005: rolling summary + prompt budget. The stored summary is
+            // sanitized before injection (delimiters and newlines neutralized so
+            // it can only ever act as context), and every assembled prompt is
+            // bounded to the model context resolved from the server
+            // configuration with the documented fallback.
+            const summary = sanitizeSummaryForPrompt(conversation.summary);
+            const promptBudget = resolvePromptBudget(modelConfig);
             speakerContexts = [];
             for (const speaker of selectedSpeakers) {
                 const character = persistence.getCharacter(user.directories, speaker.character_id);
@@ -200,7 +227,10 @@ export function createOpenParlorChatRouter({
                 const memoryLines = lastUserMsg
                     ? retrieveMemories(user.directories, handle, character.id, lastUserMsg.content)
                     : [];
-                const prompt = buildPrompt({ character, conversation, history, newMessages: safeMessages, memories: memoryLines, participantContext });
+                const prompt = applyPromptBudget(
+                    buildPrompt({ character, conversation, history, newMessages: safeMessages, memories: memoryLines, participantContext, summary }),
+                    promptBudget,
+                );
                 speakerContexts.push({ participant: speaker, character, prompt });
             }
             if (speakerContexts.length === 0) {
@@ -216,11 +246,14 @@ export function createOpenParlorChatRouter({
             if (!provider) {
                 const config = await loadConfig(user.directories);
                 provider = createProvider(config.model);
+                modelConfig = config.model;
             }
 
             if (!stream) {
                 if (!speakerContexts) {
-                    const completion = await provider.chatCompletion(safeMessages);
+                    const completion = await provider.chatCompletion(
+                        applyPromptBudget(safeMessages, resolvePromptBudget(modelConfig)),
+                    );
                     response.json(completion);
                     return;
                 }
@@ -255,6 +288,10 @@ export function createOpenParlorChatRouter({
                     }).catch(err => {
                         console.error('OpenParlor: memory extraction failed', err);
                     });
+                    // STAB-005: keep the rolling summary current after a
+                    // successful turn (fire-and-forget; never blocks or alters
+                    // the response).
+                    scheduleSummaryRefresh(user.directories, conversationId, provider);
                     return;
                 }
 
@@ -298,6 +335,11 @@ export function createOpenParlorChatRouter({
                         console.error('OpenParlor: memory extraction failed', err);
                     });
                 }
+                // STAB-005: refresh the rolling summary once at least one
+                // speaker produced a persisted reply for this turn.
+                if (responses.some(r => !r.error)) {
+                    scheduleSummaryRefresh(user.directories, conversationId, provider);
+                }
                 return;
             }
 
@@ -316,7 +358,8 @@ export function createOpenParlorChatRouter({
                 response.write(JSON.stringify(record) + '\n');
             };
 
-            const contexts = speakerContexts || [{ participant: null, character: null, prompt: safeMessages }];
+            const contexts = speakerContexts
+                || [{ participant: null, character: null, prompt: applyPromptBudget(safeMessages, resolvePromptBudget(modelConfig)) }];
             const extractionResults = [];
             let hadStreamError = false;
 
@@ -412,6 +455,11 @@ export function createOpenParlorChatRouter({
                 }).catch(err => {
                     console.error('OpenParlor: memory extraction failed', err);
                 });
+            }
+            // STAB-005: refresh the rolling summary after a streamed turn that
+            // produced at least one persisted reply.
+            if (extractionResults.length > 0) {
+                scheduleSummaryRefresh(user.directories, conversationId, provider);
             }
         } catch (error) {
             if (error instanceof ModelProviderError) {

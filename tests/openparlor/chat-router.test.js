@@ -4,6 +4,8 @@ import test from 'node:test';
 import express from 'express';
 import { createOpenParlorChatRouter } from '../../src/openparlor/chat-router.js';
 import { ModelProviderError } from '../../src/openparlor/model-provider.js';
+import { estimatePromptTokens, DEFAULT_GENERATION_RESERVE_TOKENS } from '../../src/openparlor/prompt-budget.js';
+import { RECENT_WINDOW_MESSAGES } from '../../src/openparlor/conversation-summary.js';
 
 const directories = { root: '/data/alice', user: '/data/alice/user' };
 const configuredConfig = {
@@ -2295,6 +2297,252 @@ test('group prompt keeps speaker identity of persisted history for the selected 
         assert.equal(dougLine.role, 'user', 'another character\'s line must not be an assistant message');
         assert.ok(dougLine.content.includes('[Doug said to the group]'), 'Doug line must be attributed to Doug');
         assert.ok(!prompt.some(m => m.role === 'assistant' && m.content.includes("Hi, I am Doug")));
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+// --- STAB-005: rolling summary + prompt budget integration ----------------
+
+test('POST /chat injects the stored rolling summary and drops the summarized prefix from raw history', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'C' });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'Test');
+        const participant = conv.participants.find(p => p.role === 'character');
+        // 26 stored messages; the first 16 are covered by the rolling summary.
+        for (let i = 0; i < 26; i++) {
+            const isUser = i % 2 === 0;
+            persistence.appendMessage(dirs, conv.id, participant.id, isUser ? `u${i}` : `c${i}`, isUser ? 'user' : 'character');
+        }
+        persistence.updateConversation(dirs, conv.id, {
+            summary: 'They met at the market and agreed to trade.',
+            summary_message_count: 16,
+        });
+        const mock = mockProvider(() => completion);
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+            runMemoryExtraction: async () => [],
+        }, user, async baseUrl => {
+            const result = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'new turn' }],
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+        });
+
+        const prompt = mock.calls[0];
+        const system = prompt[0].content;
+        assert.ok(system.includes('[Conversation Summary]'), 'summary section start delimiter');
+        assert.ok(system.includes('They met at the market and agreed to trade.'), 'summary text is injected');
+        assert.ok(system.includes('[/Conversation Summary]'), 'summary section end delimiter');
+
+        // System + recent raw window + the new user turn.
+        assert.equal(prompt.length, 1 + RECENT_WINDOW_MESSAGES + 1);
+        assert.equal(prompt[1].content, 'u16', 'window starts right after the summarized prefix');
+        assert.equal(prompt[1 + RECENT_WINDOW_MESSAGES - 1].content, 'c25');
+        assert.equal(prompt[prompt.length - 1].content, 'new turn');
+
+        const serialized = prompt.map(m => m.content).join('\n');
+        assert.ok(!serialized.includes('c15'), 'summarized prefix must not be resent raw');
+        assert.ok(!serialized.includes('u0'), 'summarized prefix must not be resent raw');
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('POST /chat trims the assembled prompt to the configured model context with the generation reserve', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'C' });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'Test');
+        const participant = conv.participants.find(p => p.role === 'character');
+        // 40 oversized history messages (~505 estimated tokens each); the
+        // legacy 20-message window would far exceed a 768-token context.
+        for (let i = 0; i < 40; i++) {
+            const isUser = i % 2 === 0;
+            persistence.appendMessage(dirs, conv.id, participant.id, `x${'x'.repeat(2000)}-${i}`, isUser ? 'user' : 'character');
+        }
+        const smallContextConfig = {
+            ...configuredConfig,
+            model: { ...configuredConfig.model, maxContextTokens: 768 },
+        };
+        const mock = mockProvider(() => completion);
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => smallContextConfig,
+            createProvider: () => mock.provider,
+            runMemoryExtraction: async () => [],
+        }, user, async baseUrl => {
+            const result = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'new turn' }],
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+        });
+
+        const prompt = mock.calls[0];
+        assert.ok(
+            estimatePromptTokens(prompt) + DEFAULT_GENERATION_RESERVE_TOKENS <= 768,
+            'prompt plus generation reserve must fit the configured context',
+        );
+        assert.equal(prompt[0].role, 'system', 'system prompt is never trimmed');
+        assert.equal(prompt[prompt.length - 1].content, 'new turn', 'the newest user turn is never trimmed');
+        // With the 4096-token fallback several oversized history messages would
+        // survive, so exactly [system, newest turn] proves the configured
+        // 768-token context took precedence.
+        assert.equal(prompt.length, 2, 'oversized history is trimmed away');
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('standalone POST /chat applies the configured prompt budget to browser messages', async () => {
+    const smallContextConfig = {
+        ...configuredConfig,
+        model: { ...configuredConfig.model, maxContextTokens: 768 },
+    };
+    const mock = mockProvider(() => completion);
+    await withChatServer({
+        loadConfig: async () => smallContextConfig,
+        createProvider: () => mock.provider,
+    }, { profile: { handle: 'alice' }, directories }, async baseUrl => {
+        const result = await postChat(baseUrl, {
+            messages: [
+                { role: 'user', content: 'y'.repeat(2000) },
+                { role: 'user', content: 'new turn' },
+            ],
+        });
+        assert.equal(result.status, 200);
+    });
+
+    const prompt = mock.calls[0];
+    assert.ok(estimatePromptTokens(prompt) + DEFAULT_GENERATION_RESERVE_TOKENS <= 768);
+    assert.equal(prompt.length, 1, 'the oversized older message is trimmed');
+    assert.equal(prompt[0].content, 'new turn');
+});
+
+test('POST /chat schedules a fire-and-forget rolling summary refresh after a completed turn', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'C' });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'Test');
+        const participant = conv.participants.find(p => p.role === 'character');
+        for (let i = 0; i < 26; i++) {
+            const isUser = i % 2 === 0;
+            persistence.appendMessage(dirs, conv.id, participant.id, isUser ? `u${i}` : `c${i}`, isUser ? 'user' : 'character');
+        }
+        persistence.updateConversation(dirs, conv.id, {
+            summary: 'Old rolling summary.',
+            summary_message_count: 10,
+        });
+        const mock = mockProvider(messages => {
+            if (messages[0] && typeof messages[0].content === 'string'
+                && messages[0].content.startsWith('You are a conversation summarizer')) {
+                return { choices: [{ message: { content: 'Fresh rolling summary.' } }] };
+            }
+            return completion;
+        });
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+            runMemoryExtraction: async () => [],
+        }, user, async baseUrl => {
+            const result = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'new turn' }],
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+        });
+
+        // The refresh is fire-and-forget: poll briefly until it settles.
+        let updated = persistence.getConversation(dirs, conv.id);
+        const deadline = Date.now() + 5000;
+        while (updated.summary !== 'Fresh rolling summary.' && Date.now() < deadline) {
+            await new Promise(resolve => setTimeout(resolve, 25));
+            updated = persistence.getConversation(dirs, conv.id);
+        }
+        assert.equal(updated.summary, 'Fresh rolling summary.', 'the rolling summary is refreshed after the turn');
+        // 28 stored messages after the turn; the recent window end is 28 - 10.
+        assert.equal(updated.summary_message_count, 18);
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('streaming conversation generation receives the stored summary and a budgeted prompt with the newest turn intact', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'C' });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'Test');
+        const participant = conv.participants.find(p => p.role === 'character');
+        // 40 oversized stored messages (~505 estimated tokens each); the first
+        // 30 are covered by the rolling summary, so even the recent raw window
+        // alone exceeds the 768-token deployment context.
+        for (let i = 0; i < 40; i++) {
+            const isUser = i % 2 === 0;
+            persistence.appendMessage(dirs, conv.id, participant.id, `x${'x'.repeat(2000)}-${i}`, isUser ? 'user' : 'character');
+        }
+        persistence.updateConversation(dirs, conv.id, {
+            summary: 'They met at the market and agreed to trade.',
+            summary_message_count: 30,
+        });
+        const smallContextConfig = {
+            ...configuredConfig,
+            model: { ...configuredConfig.model, maxContextTokens: 768 },
+        };
+        const mock = mockStreamProvider([sseDelta('hi'), 'data: [DONE]\n\n']);
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => smallContextConfig,
+            createProvider: () => mock.provider,
+            runMemoryExtraction: async () => [],
+        }, user, async baseUrl => {
+            const result = await postChatStream(baseUrl, {
+                messages: [{ role: 'user', content: 'new turn' }],
+                stream: true,
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+            assert.deepEqual(
+                result.records.filter(r => r.type === 'delta'),
+                [{ type: 'delta', text: 'hi' }],
+                'the streamed reply is relayed to the client',
+            );
+            assert.ok(result.records.some(r => r.type === 'done' && r.conversation_id === conv.id));
+        });
+
+        assert.equal(mock.calls.length, 1, 'the stream provider is called exactly once');
+        const prompt = mock.calls[0].messages;
+        const system = prompt[0].content;
+        assert.equal(prompt[0].role, 'system', 'the system prompt is never trimmed');
+        assert.ok(system.includes('[Conversation Summary]'), 'summary section start delimiter');
+        assert.ok(system.includes('They met at the market and agreed to trade.'), 'stored summary is injected');
+        assert.ok(system.includes('[/Conversation Summary]'), 'summary section end delimiter');
+        assert.equal(prompt[prompt.length - 1].content, 'new turn', 'the newest user turn is never trimmed');
+        assert.ok(
+            estimatePromptTokens(prompt) + DEFAULT_GENERATION_RESERVE_TOKENS <= 768,
+            'streamed prompt plus generation reserve fits the configured context',
+        );
+        // The 10 oversized recent-window messages would far exceed the budget,
+        // so only [system, newest turn] can remain — proving the budget ran on
+        // the streamed prompt.
+        assert.equal(prompt.length, 2, 'oversized history is trimmed away before streaming');
     } finally {
         tmp.cleanup();
     }
