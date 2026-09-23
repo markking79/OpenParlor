@@ -1800,7 +1800,7 @@ describe('createPlaybackController', () => {
 
     it('should call onEnded when audio ends naturally', async () => {
         const mockAudio = createMockAudio('blob:test');
-        let endedCalled = false;
+        let endedCalled = 0;
 
         const controller = createPlaybackController({
             fetchFn: async () => ({ ok: true, blob: async () => new Blob(['audio']) }),
@@ -1809,11 +1809,13 @@ describe('createPlaybackController', () => {
             audioFactory: () => mockAudio,
         });
 
-        controller.onEnded = () => { endedCalled = true; };
-        await controller.play('Hello', 'voice-a');
+        await controller.play('Hello', 'voice-a', () => { endedCalled++; });
+        assert.equal(endedCalled, 0, 'starting playback must not complete it');
         mockAudio._fire('ended');
-        assert.equal(endedCalled, true);
+        assert.equal(endedCalled, 1, 'callback fires exactly once on natural end');
         assert.equal(controller.isPlaying, false);
+        mockAudio._fire('ended');
+        assert.equal(endedCalled, 1, 'a duplicate end event must not re-fire');
     });
 
     it('should send CSRF token with TTS synthesis request when provider is configured', async () => {

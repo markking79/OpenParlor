@@ -19,7 +19,11 @@ import {
     handsFreeStatusText,
     normalizeHandsFreePreference,
 } from '../../public/openparlor/handsfree.js';
-import { createContinuousRecorder } from '../../public/openparlor/audio.js';
+import {
+    createContinuousRecorder,
+    createGroupPlaybackQueue,
+    createPlaybackController,
+} from '../../public/openparlor/audio.js';
 
 // ─── Frame helpers ───────────────────────────────────────────────────────────
 // 10 ms mono frames at 16 kHz: 20 loud frames = 200 ms (the default start
@@ -784,7 +788,7 @@ describe('createContinuousRecorder', () => {
         assert.equal(call, 2);
     });
 
-    it('maps a mic permission denial to a safe error', async () => {
+    it('rejects start on a mic permission denial, preserving the error name', async () => {
         const m = makeFakeMedia();
         const rec = createContinuousRecorder({
             getUserMedia: async () => {
@@ -794,29 +798,47 @@ describe('createContinuousRecorder', () => {
             },
             MediaRecorderCtor: m.Ctor,
         });
-        await rec.start();
+        await assert.rejects(rec.start(), (e) => {
+            assert.equal(e.name, 'NotAllowedError', 'name preserved so the controller maps permission-denied');
+            assert.equal(e.message, 'Microphone permission denied.');
+            return true;
+        });
         assert.equal(rec.state, 'error');
         assert.equal(rec.error, 'Microphone permission denied.');
     });
 
-    it('maps an unavailable mic to a safe error', async () => {
+    it('rejects start when the mic is unavailable', async () => {
         const rec = createContinuousRecorder({
             getUserMedia: async () => { throw new Error('no device'); },
             MediaRecorderCtor: makeFakeMedia().Ctor,
         });
-        await rec.start();
+        await assert.rejects(rec.start(), /Microphone unavailable\./);
         assert.equal(rec.state, 'error');
         assert.equal(rec.error, 'Microphone unavailable.');
     });
 
-    it('errors when MediaRecorder is unavailable', async () => {
+    it('rejects start when MediaRecorder is unavailable', async () => {
         const rec = createContinuousRecorder({
             getUserMedia: makeFakeMedia().getUserMedia,
             MediaRecorderCtor: null,
         });
-        await rec.start();
+        await assert.rejects(rec.start(), /MediaRecorder is not supported in this browser\./);
         assert.equal(rec.state, 'error');
         assert.equal(rec.error, 'MediaRecorder is not supported in this browser.');
+    });
+
+    it('rejects start when the MediaRecorder constructor or start() throws', async () => {
+        const m = makeFakeMedia();
+        class ThrowingRecorder extends m.Ctor {
+            start() { throw new Error('boom'); }
+        }
+        const rec = createContinuousRecorder({
+            getUserMedia: m.getUserMedia,
+            MediaRecorderCtor: ThrowingRecorder,
+        });
+        await assert.rejects(rec.start(), /Could not start the microphone\./);
+        assert.equal(rec.state, 'error');
+        assert.equal(rec.error, 'Could not start the microphone.');
     });
 
     it('borrows a shared stream without stopping its tracks', async () => {
@@ -841,5 +863,303 @@ describe('createContinuousRecorder', () => {
         });
         rec.stop();
         assert.equal(rec.state, 'idle');
+    });
+});
+
+// ─── Playback × Hands-Free integration (real controllers) ──────────────────
+// Regression tests for the playback completion lifecycle: the completion
+// callback of a new playback must be armed only after the previous playback
+// has been stopped, and must fire exactly once when the actual audio ends.
+// The real createPlaybackController, createGroupPlaybackQueue, and
+// createHandsFreeController are wired together exactly as app.js does; only
+// the TTS fetch and the audio element are fakes, and the fake audio "ends"
+// only when the test fires its 'ended' event.
+
+function makePlaybackHarness() {
+    const created = [];
+    const revoked = [];
+    let urlCount = 0;
+    const audioFactory = () => {
+        const audio = {
+            src: '',
+            played: false,
+            paused: false,
+            _onEnded: null,
+            async play() { this.played = true; },
+            pause() { this.paused = true; },
+            addEventListener(event, fn) {
+                if (event === 'ended') this._onEnded = fn;
+            },
+            // Simulate the browser firing 'ended' for this element.
+            end() {
+                const fn = this._onEnded;
+                this._onEnded = null;
+                if (fn) fn();
+            },
+        };
+        created.push(audio);
+        return audio;
+    };
+    const deps = {
+        fetchFn: async () => ({
+            ok: true,
+            blob: async () => new Blob(['fake-audio']),
+            json: async () => ({}),
+        }),
+        createObjectURL: () => {
+            urlCount += 1;
+            return `blob:int-${urlCount}`;
+        },
+        revokeObjectURL: (url) => { revoked.push(url); },
+        audioFactory,
+    };
+    return { deps, created, revoked };
+}
+
+function groupQueueFor(playback, onAllDone) {
+    // Same item wiring as app.js: an item settles only when the completion
+    // callback for its own playback fires.
+    return createGroupPlaybackQueue({
+        playItem: (text, voice) => new Promise((resolve, reject) => {
+            let settled = false;
+            playback.play(text, voice, () => {
+                if (!settled) { settled = true; resolve(); }
+            }).catch((e) => {
+                if (!settled) { settled = true; reject(e); }
+            });
+        }),
+        onAllDone,
+    });
+}
+
+describe('playback × hands-free integration (real controllers)', () => {
+    function makeHf() {
+        return createHandsFreeController({
+            getConversationId: () => 'conv-1',
+            startListening: async () => {},
+            stopListening: () => {},
+        });
+    }
+
+    it('starting or replacing playback does not fire the new completion callback', async () => {
+        const { deps, created } = makePlaybackHarness();
+        const playback = createPlaybackController(deps);
+        let firstCalls = 0;
+        let secondCalls = 0;
+        await playback.play('first', 'v', () => { firstCalls++; });
+        assert.equal(firstCalls, 0, 'the internal teardown must not consume the new callback');
+        await playback.play('second', 'v', () => { secondCalls++; });
+        assert.equal(secondCalls, 0, 'replacing playback must not fire the incoming callback');
+        assert.equal(firstCalls, 0, 'a replaced playback is cancelled silently, not completed');
+        created[0].end();
+        assert.equal(firstCalls, 0, 'a replaced element can no longer complete anything');
+        created[1].end();
+        assert.equal(secondCalls, 1, 'only the current playback completes');
+        assert.equal(firstCalls, 0);
+    });
+
+    it('an explicit stop during a pending start resolves its callback exactly once', async () => {
+        let resolveFetch;
+        const fetchPromise = new Promise((resolve) => { resolveFetch = resolve; });
+        const { deps, created } = makePlaybackHarness();
+        const slow = createPlaybackController({
+            ...deps,
+            fetchFn: () => fetchPromise.then(() => ({
+                ok: true,
+                blob: async () => new Blob(['fake-audio']),
+                json: async () => ({}),
+            })),
+        });
+        let calls = 0;
+        const pending = slow.play('msg', 'v', () => { calls++; });
+        slow.stop();
+        assert.equal(calls, 1, 'an explicit stop cancels the pending playback exactly once');
+        assert.equal(slow.isPlaying, false);
+        resolveFetch();
+        assert.equal(await pending, null, 'the superseded start resolves without playing');
+        assert.equal(created.length, 0, 'no audio element was created');
+        assert.equal(calls, 1, 'the superseded start must not fire the callback again');
+    });
+
+    it('fires the completion callback exactly once when the actual audio ends', async () => {
+        const { deps, created, revoked } = makePlaybackHarness();
+        const playback = createPlaybackController(deps);
+        let calls = 0;
+        await playback.play('msg', 'v', () => { calls++; });
+        assert.equal(calls, 0);
+        created[0].end();
+        assert.equal(calls, 1, 'callback fires exactly once on natural end');
+        assert.equal(playback.isPlaying, false);
+        assert.deepEqual(revoked, ['blob:int-1'], 'the object URL is released on natural end');
+        playback.stop();
+        assert.equal(calls, 1, 'a stop after completion must not fire again');
+    });
+
+    it('manual Play/Replay leave Hands-Free in SPEAKING until the actual audio completes', async () => {
+        const { deps, created } = makePlaybackHarness();
+        const playback = createPlaybackController(deps);
+        const hf = makeHf();
+        await hf.enable();
+        assert.equal(hf.state, HANDSFREE_STATES.LISTENING);
+
+        // Manual Play wiring as in app.js.
+        hf.markSpeakingStart();
+        assert.equal(hf.state, HANDSFREE_STATES.SPEAKING);
+        await playback.play('msg', 'v', () => { hf.markSpeakingEnd(); });
+        assert.equal(hf.state, HANDSFREE_STATES.SPEAKING, 'still speaking while the audio is playing');
+        created[0].end();
+        assert.equal(hf.state, HANDSFREE_STATES.LISTENING, 'listening resumes only after actual completion');
+
+        // Manual Replay wiring as in app.js.
+        hf.markSpeakingStart();
+        assert.equal(hf.state, HANDSFREE_STATES.SPEAKING);
+        await playback.replay('msg', 'v', () => { hf.markSpeakingEnd(); });
+        assert.equal(hf.state, HANDSFREE_STATES.SPEAKING, 'replay must not complete itself either');
+        created[1].end();
+        assert.equal(hf.state, HANDSFREE_STATES.LISTENING);
+    });
+
+    it('a two-item group queue does not start item 2 until item 1 actually ends', async () => {
+        const { deps, created } = makePlaybackHarness();
+        const playback = createPlaybackController(deps);
+        const queue = groupQueueFor(playback, null);
+        queue.enqueue('one', 'v1');
+        queue.enqueue('two', 'v2');
+        const running = queue.playAll();
+        await flush();
+        assert.equal(created.length, 1, 'item 2 must not start while item 1 is playing');
+        assert.equal(queue.isPlaying, true);
+        created[0].end();
+        await flush();
+        assert.equal(created.length, 2, 'item 2 starts only after item 1 ended');
+        const done = running.then(() => 'done');
+        assert.equal(await Promise.race([done, flush().then(() => 'pending')]), 'pending',
+            'the queue must not finish while item 2 is still playing');
+        created[1].end();
+        await running;
+        assert.equal(queue.isPlaying, false);
+        assert.equal(queue.pending, 0);
+    });
+
+    it('onAllDone does not fire until the final audio item ends', async () => {
+        const { deps, created } = makePlaybackHarness();
+        const playback = createPlaybackController(deps);
+        const hf = makeHf();
+        await hf.enable();
+        let allDone = 0;
+        const queue = groupQueueFor(playback, () => {
+            allDone += 1;
+            hf.markSpeakingEnd();
+        });
+        queue.enqueue('one', 'v1');
+        queue.enqueue('two', 'v2');
+        // Hands-free: one speaking phase covers the whole queued group reply.
+        hf.markSpeakingStart();
+        const running = queue.playAll();
+        await flush();
+        assert.equal(allDone, 0);
+        assert.equal(hf.state, HANDSFREE_STATES.SPEAKING);
+        created[0].end();
+        await flush();
+        assert.equal(allDone, 0, 'the queue is not done while item 2 plays');
+        assert.equal(hf.state, HANDSFREE_STATES.SPEAKING, 'listening must not resume mid-group');
+        created[1].end();
+        await running;
+        assert.equal(allDone, 1, 'onAllDone fires exactly once, after the final item ended');
+        assert.equal(hf.state, HANDSFREE_STATES.LISTENING);
+    });
+
+    it('an explicit stop resolves the callback exactly once without duplicates', async () => {
+        const { deps, created } = makePlaybackHarness();
+        const playback = createPlaybackController(deps);
+        let calls = 0;
+        await playback.play('msg', 'v', () => { calls++; });
+        playback.stop();
+        assert.equal(calls, 1, 'an explicit stop resolves the current playback exactly once');
+        assert.equal(playback.isPlaying, false);
+        assert.equal(created[0].paused, true);
+        playback.stop();
+        assert.equal(calls, 1, 'a second stop must not fire again');
+        created[0].end();
+        assert.equal(calls, 1, 'a late end event on the cleared element must not fire again');
+    });
+
+    it('a failed start rejects without ever firing its completion callback', async () => {
+        const { deps } = makePlaybackHarness();
+        const failing = createPlaybackController({
+            ...deps,
+            fetchFn: async () => ({ ok: false, status: 500, json: async () => ({ error: 'TTS down' }) }),
+        });
+        let calls = 0;
+        await assert.rejects(() => failing.play('msg', 'v', () => { calls++; }), /TTS down/);
+        assert.equal(calls, 0, 'a failed start must not complete itself');
+        failing.stop();
+        assert.equal(calls, 0, 'and a later stop must not fire the discarded callback');
+    });
+});
+
+// ─── Recorder startup failure × Hands-Free (integration) ───────────────────
+// A continuous-recorder startup failure must reject startListening so the
+// controller lands in a controlled error state — never LISTENING — while the
+// app-level teardown (mirrored here) stops the shared mic stream exactly
+// once so the microphone indicator goes off.
+
+describe('recorder startup failure × hands-free (integration)', () => {
+    function makeSharedMicWiring(getUserMedia, MediaRecorderCtor) {
+        const track = { stopped: 0, stop() { this.stopped += 1; } };
+        const sharedStream = { getTracks: () => [track] };
+        const recorder = createContinuousRecorder({
+            getUserMedia,
+            MediaRecorderCtor,
+            ownsStream: false,
+        });
+        const startListening = async () => {
+            try {
+                await recorder.start();
+            } catch (e) {
+                recorder.stop();
+                for (const t of sharedStream.getTracks()) t.stop();
+                throw e;
+            }
+        };
+        return { track, startListening, recorder };
+    }
+
+    it('never reports LISTENING when the continuous recorder fails to start', async () => {
+        const states = [];
+        const { track, startListening, recorder } = makeSharedMicWiring(
+            () => Promise.resolve({ getTracks: () => [track] }),
+            null, // unsupported MediaRecorder → start() must reject
+        );
+        const hf = createHandsFreeController({
+            getConversationId: () => 'conv-1',
+            startListening,
+            stopListening: () => {},
+            onStateChange: (s) => { states.push(s); },
+        });
+        await hf.enable();
+        assert.equal(hf.state, HANDSFREE_STATES.ERROR, 'a failed recorder must leave a controlled error state');
+        assert.equal(hf.stateInfo.error, 'microphone');
+        assert.equal(states[states.length - 1], HANDSFREE_STATES.ERROR, 'the final reported state is error, not listening');
+        assert.equal(track.stopped, 1, 'the shared mic track stops exactly once (indicator off)');
+        assert.equal(recorder.state, 'idle', 'the recorder is torn down');
+    });
+
+    it('maps a recorder permission denial to permission-denied', async () => {
+        const deny = new Error('denied');
+        deny.name = 'NotAllowedError';
+        const { track, startListening } = makeSharedMicWiring(
+            () => Promise.reject(deny),
+            makeFakeMedia().Ctor,
+        );
+        const hf = createHandsFreeController({
+            getConversationId: () => 'conv-1',
+            startListening,
+            stopListening: () => {},
+        });
+        await hf.enable();
+        assert.equal(hf.state, HANDSFREE_STATES.ERROR);
+        assert.equal(hf.stateInfo.error, 'permission-denied', 'the preserved error name selects the denial message');
+        assert.equal(track.stopped, 1, 'the shared mic track stops exactly once (indicator off)');
     });
 });

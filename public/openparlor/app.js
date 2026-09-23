@@ -186,12 +186,18 @@ if (typeof document !== 'undefined') {
                 const onEnd = () => {
                     if (!settled) { settled = true; resolve(); }
                 };
-                playback.onEnded = onEnd;
-                playback.play(text, voice).then(() => {
+                // The completion callback is armed inside play() only after
+                // any previous playback has been torn down, so it cannot be
+                // consumed by the internal teardown and the item resolves
+                // only when this item's audio actually ends (or is
+                // explicitly stopped). A superseded start resolves null
+                // instead; the item settles then so the queue can drain.
+                playback.play(text, voice, onEnd).then((url) => {
                     if (!ttsMarkedForTurn) {
                         ttsMarkedForTurn = true;
                         voiceTurnTimer.markTtsReady();
                     }
+                    if (url === null) onEnd();
                 }).catch((e) => {
                     if (!settled) { settled = true; reject(e); }
                 });
@@ -577,22 +583,22 @@ if (typeof document !== 'undefined') {
                 playBtn.addEventListener('click', async () => {
                     const hf = handsfree;
                     const willSpeak = !!(hf && hf.state !== HANDSFREE_STATES.OFF);
-                    let manualEndArmed = false;
-                    // play() calls stop() internally before starting, so the
-                    // onEnded hook is only armed after playback has begun.
-                    playback.onEnded = () => {
-                        if (willSpeak && manualEndArmed && hf) hf.markSpeakingEnd();
+                    // The completion callback is armed inside play() only
+                    // after any previous playback has been stopped, and
+                    // fires exactly once — on natural end or an explicit
+                    // stop. A failed start rejects without firing it; the
+                    // catch below ends the speaking phase instead.
+                    const endSpeaking = () => {
+                        if (willSpeak && hf) hf.markSpeakingEnd();
                     };
                     try {
                         groupQueue.clear();
                         if (willSpeak) hf.markSpeakingStart();
-                        await playback.play(msg.content, voice);
-                        manualEndArmed = true;
+                        await playback.play(msg.content, voice, endSpeaking);
                         updatePlaybackButtons();
                     } catch {
-                        manualEndArmed = true;
-                        playback.onEnded = null;
-                        if (willSpeak && hf) hf.markSpeakingEnd();
+                        endSpeaking();
+                        updatePlaybackButtons();
                     }
                 });
 
@@ -614,20 +620,20 @@ if (typeof document !== 'undefined') {
                 replayBtn.addEventListener('click', async () => {
                     const hf = handsfree;
                     const willSpeak = !!(hf && hf.state !== HANDSFREE_STATES.OFF);
-                    let manualEndArmed = false;
-                    playback.onEnded = () => {
-                        if (willSpeak && manualEndArmed && hf) hf.markSpeakingEnd();
+                    // Same completion-callback contract as Play: armed only
+                    // after the previous playback is stopped, fires exactly
+                    // once, and a failed start is handled by the catch.
+                    const endSpeaking = () => {
+                        if (willSpeak && hf) hf.markSpeakingEnd();
                     };
                     try {
                         groupQueue.clear();
                         if (willSpeak) hf.markSpeakingStart();
-                        await playback.replay(msg.content, voice);
-                        manualEndArmed = true;
+                        await playback.replay(msg.content, voice, endSpeaking);
                         updatePlaybackButtons();
                     } catch {
-                        manualEndArmed = true;
-                        playback.onEnded = null;
-                        if (willSpeak && hf) hf.markSpeakingEnd();
+                        endSpeaking();
+                        updatePlaybackButtons();
                     }
                 });
 
