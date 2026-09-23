@@ -9,6 +9,7 @@ import {
     detectImageFormat,
     normalizeCardCharacter,
     parseCardBuffer,
+    MAX_CARD_AVATAR_BYTES,
 } from './character-card.js';
 
 const CHARACTER_FIELDS = new Set([
@@ -177,8 +178,10 @@ export function createOpenParlorCharacterRouter({ persistence: persistenceModule
     });
 
     // Import a character card (JSON or PNG with embedded card metadata) as a
-    // new character owned by the authenticated user. Every field in the card
-    // is untrusted input and passes the allow-list validation in
+    // new character owned by the authenticated user. Handles legacy
+    // top-level (V1-style) cards as well as nested Tavern Card V2/V3
+    // payloads whose character fields live in `data`. Every field in the
+    // card is untrusted input and passes the allow-list validation in
     // normalizeCardCharacter; imported paths/URLs/config are never trusted.
     router.post('/import', (request, response, next) => {
         const auth = withAuth(request, response);
@@ -199,10 +202,12 @@ export function createOpenParlorCharacterRouter({ persistence: persistenceModule
         const parsed = parseCardBuffer(file.buffer);
         if ('error' in parsed) return response.status(400).json({ error: parsed.error });
 
-        const card = parsed.imageBytes !== null && parsed.card.name === undefined
-            ? { ...parsed.card, name: file.originalname.replace(/\.(json|png)$/i, '') }
-            : parsed.card;
-        const normalized = normalizeCardCharacter(card);
+        // PNG cards without a card-provided name fall back to the uploaded
+        // file name; JSON cards must carry a name.
+        const fallbackName = parsed.imageBytes !== null
+            ? file.originalname.replace(/\.(json|png)$/i, '')
+            : '';
+        const normalized = normalizeCardCharacter(parsed.card, fallbackName);
         if ('error' in normalized) return response.status(400).json({ error: normalized.error });
 
         const value = { ...normalized.value };
@@ -212,13 +217,21 @@ export function createOpenParlorCharacterRouter({ persistence: persistenceModule
                 return response.status(400).json({ error: '"tts_voice" must be a valid voice ID or empty' });
             }
         }
-        if (normalized.avatarBuffer !== null) {
-            const format = detectImageFormat(normalized.avatarBuffer);
+        // A verified `avatar` payload always wins when present; otherwise a
+        // PNG card preserves its own image as the character avatar. Imported
+        // avatar_url/path/URL fields are never trusted.
+        let avatarBytes = normalized.avatarBuffer;
+        if (avatarBytes === null && parsed.imageBytes !== null) avatarBytes = parsed.imageBytes;
+        if (avatarBytes !== null) {
+            if (avatarBytes.length > MAX_CARD_AVATAR_BYTES) {
+                return response.status(400).json({ error: '"avatar" is too large' });
+            }
+            const format = detectImageFormat(avatarBytes);
             if (!format) {
                 return response.status(400).json({ error: '"avatar" does not contain a supported image' });
             }
             try {
-                value.avatar_url = persistenceModule.storeCharacterAvatar(auth.directories, normalized.avatarBuffer, format);
+                value.avatar_url = persistenceModule.storeCharacterAvatar(auth.directories, avatarBytes, format);
             } catch {
                 return response.status(500).json({ error: 'Failed to store character avatar' });
             }
@@ -226,8 +239,10 @@ export function createOpenParlorCharacterRouter({ persistence: persistenceModule
         return response.status(201).json(persistenceModule.createCharacter(auth.directories, auth.handle, value));
     });
 
-    // Export the owned character as a v3 character card (JSON attachment) so
-    // it can be shared with, or round-tripped through, other chat tools.
+    // Export the owned character as a Tavern Card V3 JSON attachment
+    // (spec/spec_version/data, with OpenParlor metadata in
+    // data.extensions.openparlor) so it can be shared with, or round-tripped
+    // through, other chat tools.
     router.get('/:id/export', (request, response) => {
         const auth = withAuth(request, response);
         if (!auth) return;

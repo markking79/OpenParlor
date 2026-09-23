@@ -24,6 +24,7 @@ import {
     MAX_CARD_AVATAR_SOURCE_LENGTH,
 } from '../../src/openparlor/character-card.js';
 import { write as writePngCard } from '../../src/character-card-parser.js';
+import { TavernCardValidator } from '../../src/validator/TavernCardValidator.js';
 
 // Minimal 1x1 PNG.
 const PNG_1x1 = Buffer.from(
@@ -43,6 +44,67 @@ const mockTtsProvider = {
  */
 function pngCard(card, image = PNG_1x1) {
     return writePngCard(image, JSON.stringify(card));
+}
+
+/**
+ * A real nested Tavern Card V2 fixture, shaped exactly like the cards
+ * SillyTavern writes and imports: top-level spec/spec_version plus a nested
+ * `data` object carrying all character-facing fields.
+ * @param {Record<string, unknown>} [data] Overrides for the nested data object
+ * @returns {Record<string, unknown>}
+ */
+function v2Card(data = {}) {
+    return {
+        spec: 'chara_card_v2',
+        spec_version: '2.0',
+        data: {
+            name: 'V2 Hero',
+            description: 'a v2 character',
+            personality: 'brave',
+            scenario: 'a quest',
+            first_mes: 'Greetings, traveler!',
+            mes_example: 'Hero: onward\nGuide: stay close',
+            creator_notes: 'internal notes',
+            system_prompt: 'You are a hero.',
+            post_history_instructions: '',
+            alternate_greetings: ['A different greeting'],
+            tags: ['fantasy', 'hero'],
+            creator: 'card-tester',
+            character_version: '1.0',
+            extensions: {},
+            ...data,
+        },
+    };
+}
+
+/**
+ * A real nested Tavern Card V3 fixture (spec chara_card_v3, spec_version
+ * 3.0, character fields in `data`, example_dialogue instead of mes_example).
+ * @param {Record<string, unknown>} [data] Overrides for the nested data object
+ * @returns {Record<string, unknown>}
+ */
+function v3Card(data = {}) {
+    return {
+        spec: 'chara_card_v3',
+        spec_version: '3.0',
+        data: {
+            name: 'V3 Hero',
+            description: 'a v3 character',
+            personality: 'curious',
+            scenario: 'a tavern',
+            first_mes: 'Hello!',
+            system_prompt: 'You are a hero.',
+            post_history_instructions: '',
+            creator_notes: '',
+            creator: 'card-tester',
+            character_version: '1.0',
+            example_dialogue: 'Hero: hi\nGuide: hello',
+            alternate_greetings: [],
+            tags: ['fantasy'],
+            extensions: {},
+            ...data,
+        },
+    };
 }
 
 /**
@@ -283,6 +345,168 @@ describe('normalizeCardCharacter', () => {
         assert.deepEqual(value.tags, ['retro']);
     });
 
+    it('imports a real nested V2 card (spec chara_card_v2) from data', () => {
+        const card = v2Card({
+            extensions: { talkativeness: 0.9, openparlor: { temperature: 0.4, max_tokens: 256 } },
+        });
+        const result = normalizeCardCharacter(card);
+        assert.ok('value' in result);
+        const value = /** @type {{ value: Record<string, unknown> }} */ (result).value;
+        assert.equal(value.name, 'V2 Hero');
+        assert.equal(value.description, 'a v2 character');
+        assert.equal(value.personality, 'brave');
+        assert.equal(value.scenario, 'a quest');
+        assert.equal(value.first_message, 'Greetings, traveler!');
+        assert.equal(value.system_prompt, 'You are a hero.');
+        assert.equal(value.example_dialogue, 'Hero: onward\nGuide: stay close');
+        assert.deepEqual(value.tags, ['fantasy', 'hero']);
+        assert.equal(value.temperature, 0.4);
+        assert.equal(value.max_tokens, 256);
+        assert.equal(/** @type {{ avatarBuffer: Buffer | null }} */ (result).avatarBuffer, null);
+        // Spec-only fields that OpenParlor does not model are not imported.
+        assert.equal(value.creator, undefined);
+        assert.equal(value.creator_notes, undefined);
+        assert.equal(value.post_history_instructions, undefined);
+        assert.equal(value.alternate_greetings, undefined);
+        assert.equal(value.character_version, undefined);
+        assert.equal(value.talkativeness, undefined);
+    });
+
+    it('imports a real nested V3 card (spec chara_card_v3) from data', () => {
+        const card = v3Card({ example_dialogue: 'V3: hello', tags: 'a, b' });
+        const result = normalizeCardCharacter(card);
+        assert.ok('value' in result);
+        const value = /** @type {{ value: Record<string, unknown> }} */ (result).value;
+        assert.equal(value.name, 'V3 Hero');
+        assert.equal(value.description, 'a v3 character');
+        assert.equal(value.first_message, 'Hello!');
+        assert.equal(value.example_dialogue, 'V3: hello');
+        assert.deepEqual(value.tags, ['a', 'b']);
+    });
+
+    it('prefers nested data fields over duplicated top-level fields (hybrid ST files)', () => {
+        const card = v2Card({ name: 'Nested Name' });
+        card.name = 'Top Level Name';
+        card.description = 'top description';
+        const result = normalizeCardCharacter(card);
+        assert.ok('value' in result);
+        assert.equal(/** @type {{ value: object }} */ (result).value.name, 'Nested Name');
+        assert.equal(result.value.description, 'a v2 character');
+    });
+
+    it('reads OpenParlor metadata from the standard data.extensions.openparlor slot', () => {
+        const card = v3Card({
+            extensions: {
+                talkativeness: 0.9,
+                openparlor: { temperature: 1.1, time_aware: true, tts_voice: 'bf_emma' },
+            },
+        });
+        const result = normalizeCardCharacter(card);
+        assert.ok('value' in result);
+        const value = /** @type {{ value: Record<string, unknown> }} */ (result).value;
+        assert.equal(value.temperature, 1.1);
+        assert.equal(value.time_aware, true);
+        assert.equal(value.tts_voice, 'bf_emma');
+        assert.equal(value.talkativeness, undefined);
+    });
+
+    it('accepts the legacy top-level openparlor extension; the standard slot wins per key', () => {
+        const card = v2Card({ extensions: { openparlor: { temperature: 0.2, max_tokens: 128 } } });
+        card.openparlor = { temperature: 0.9, max_tokens: 128, tts_voice: 'af_heart' };
+        const result = normalizeCardCharacter(card);
+        assert.ok('value' in result);
+        const value = /** @type {{ value: Record<string, unknown> }} */ (result).value;
+        assert.equal(value.temperature, 0.2); // standard slot wins
+        assert.equal(value.max_tokens, 128); // both agree
+        assert.equal(value.tts_voice, 'af_heart'); // legacy-only key still read
+    });
+
+    it('ignores a non-standard data.openparlor object', () => {
+        const card = v3Card({ openparlor: { temperature: 0.1 } });
+        delete card.data.extensions; // no standard extension slot
+        const result = normalizeCardCharacter(card);
+        assert.ok('value' in result);
+        assert.equal(/** @type {{ value: Record<string, unknown> }} */ (result).value.temperature, undefined);
+    });
+
+    it('still imports legacy top-level (V1-style) cards with the legacy extension', () => {
+        const result = normalizeCardCharacter({
+            name: 'Legacy',
+            description: 'pre-spec',
+            first_mes: 'hi',
+            mes_example: 'L: yo',
+            openparlor: { time_aware: true },
+        });
+        assert.ok('value' in result);
+        const value = /** @type {{ value: Record<string, unknown> }} */ (result).value;
+        assert.equal(value.name, 'Legacy');
+        assert.equal(value.first_message, 'hi');
+        assert.equal(value.example_dialogue, 'L: yo');
+        assert.equal(value.time_aware, true);
+    });
+
+    it('still imports cards produced by the earlier OpenParlor export (003e04730 top-level shape)', () => {
+        const legacyExport = {
+            spec: 'chara_card_v3',
+            spec_version: '3.0',
+            name: 'Old Export',
+            description: 'legacy shape',
+            first_mes: 'hi',
+            example_dialogue: 'OE: yo',
+            tags: ['legacy'],
+            avatar: `data:image/png;base64,${PNG_1x1.toString('base64')}`,
+            openparlor: { temperature: 0.5, max_tokens: 64, time_aware: true, tts_voice: 'af_heart' },
+        };
+        const result = normalizeCardCharacter(legacyExport);
+        assert.ok('value' in result);
+        const value = /** @type {{ value: Record<string, unknown> }} */ (result).value;
+        assert.equal(value.name, 'Old Export');
+        assert.equal(value.description, 'legacy shape');
+        assert.equal(value.first_message, 'hi');
+        assert.equal(value.example_dialogue, 'OE: yo');
+        assert.deepEqual(value.tags, ['legacy']);
+        assert.equal(value.temperature, 0.5);
+        assert.equal(value.max_tokens, 64);
+        assert.equal(value.time_aware, true);
+        assert.equal(value.tts_voice, 'af_heart');
+        assert.deepEqual(/** @type {{ avatarBuffer: Buffer }} */ (result).avatarBuffer, PNG_1x1);
+    });
+
+    it('uses the fallback name only when the card carries no usable name', () => {
+        const named = normalizeCardCharacter({ name: '  Card Name  ' }, 'File Name');
+        assert.ok('value' in named);
+        assert.equal(/** @type {{ value: object }} */ (named).value.name, 'Card Name');
+        const unnamed = normalizeCardCharacter({ description: 'no name' }, ' File Name ');
+        assert.ok('value' in unnamed);
+        assert.equal(/** @type {{ value: object }} */ (unnamed).value.name, 'File Name');
+        const nestedUnnamed = normalizeCardCharacter(v3Card({ name: '   ' }), 'Png File');
+        assert.ok('value' in nestedUnnamed);
+        assert.equal(/** @type {{ value: object }} */ (nestedUnnamed).value.name, 'Png File');
+        assert.ok('error' in normalizeCardCharacter({ description: 'no name' }));
+        assert.ok('error' in normalizeCardCharacter({}, ''));
+    });
+
+    it('ignores privileged and path fields inside nested data (config poisoning)', () => {
+        const card = v2Card({
+            name: 'Poisoned',
+            avatar_url: '/user/images/../../etc/shadow',
+            baseUrl: 'http://attacker.example',
+            provider: 'evil-provider',
+            pythonExecutable: '/bin/sh',
+            system: 'SYSTEM OVERRIDE',
+            openparlor: { temperature: 0.1, provider: 'evil', apiKey: 'secret' },
+        });
+        const result = normalizeCardCharacter(card);
+        assert.ok('value' in result);
+        const value = /** @type {{ value: Record<string, unknown> }} */ (result).value;
+        assert.equal(value.name, 'Poisoned');
+        for (const key of ['avatar_url', 'baseUrl', 'provider', 'pythonExecutable', 'system', 'apiKey']) {
+            assert.equal(value[key], undefined, `unexpected field ${key}`);
+        }
+        assert.equal(value.temperature, undefined); // non-standard data.openparlor ignored
+        assert.equal(/** @type {{ avatarBuffer: Buffer | null }} */ (result).avatarBuffer, null);
+    });
+
     it('accepts v3 comma-separated tags, trimmed and de-duplicated', () => {
         const result = normalizeCardCharacter({ name: 'Taggy', tags: ' a , b , a ,, ' });
         assert.ok('value' in result);
@@ -385,7 +609,7 @@ describe('normalizeCardCharacter', () => {
 // ─── Unit: buildExportCard / buildCardFilename ───────────────────────────────
 
 describe('buildExportCard', () => {
-    it('builds a v3 card from a full character', () => {
+    it('builds a spec-valid nested V3 card from a full character', () => {
         const card = buildExportCard({
             name: 'Alice',
             description: 'desc',
@@ -402,36 +626,86 @@ describe('buildExportCard', () => {
         }, 'data:image/png;base64,AAA=');
         assert.equal(card.spec, 'chara_card_v3');
         assert.equal(card.spec_version, '3.0');
-        assert.equal(card.name, 'Alice');
-        assert.equal(card.description, 'desc');
-        assert.equal(card.personality, 'personality');
-        assert.equal(card.scenario, 'scenario');
-        assert.equal(card.first_mes, 'Hi!');
-        assert.equal(card.system_prompt, 'You are Alice.');
-        assert.equal(card.example_dialogue, 'Alice: Hello');
-        assert.deepEqual(card.tags, ['a', 'b']);
-        assert.equal(card.avatar, 'data:image/png;base64,AAA=');
-        assert.deepEqual(card.openparlor, { temperature: 0.7, max_tokens: 1024, time_aware: true, tts_voice: 'af_heart' });
-    });
-
-    it('omits optional fields and the openparlor extension when not set', () => {
-        const card = buildExportCard({ name: 'Minimal' });
-        assert.equal(card.name, 'Minimal');
-        assert.equal(card.description, '');
-        assert.equal(card.personality, '');
+        const data = /** @type {Record<string, unknown>} */ (card.data);
+        assert.equal(data.name, 'Alice');
+        assert.equal(data.description, 'desc');
+        assert.equal(data.personality, 'personality');
+        assert.equal(data.scenario, 'scenario');
+        assert.equal(data.first_mes, 'Hi!');
+        assert.equal(data.system_prompt, 'You are Alice.');
+        assert.equal(data.example_dialogue, 'Alice: Hello');
+        assert.deepEqual(data.tags, ['a', 'b']);
+        assert.equal(data.avatar, 'data:image/png;base64,AAA=');
+        // OpenParlor metadata lives in the standard extension slot, not in
+        // the character-facing data or at the card top level.
+        assert.deepEqual(data.extensions, {
+            openparlor: { temperature: 0.7, max_tokens: 1024, time_aware: true, tts_voice: 'af_heart' },
+        });
+        assert.equal(card.name, undefined);
         assert.equal(card.openparlor, undefined);
         assert.equal(card.avatar, undefined);
-        // The card must round-trip through parseCardBuffer/normalizeCardCharacter.
+        // Genuinely valid per the upstream SillyTavern validator.
+        assert.equal(new TavernCardValidator(card).validate(), 3);
+    });
+
+    it('populates safe V3 defaults for unset fields', () => {
+        const card = buildExportCard({ name: 'Minimal' });
+        const data = /** @type {Record<string, unknown>} */ (card.data);
+        assert.equal(data.name, 'Minimal');
+        assert.equal(data.description, '');
+        assert.equal(data.personality, '');
+        assert.equal(data.scenario, '');
+        assert.equal(data.first_mes, '');
+        assert.equal(data.system_prompt, '');
+        assert.equal(data.post_history_instructions, '');
+        assert.equal(data.creator_notes, '');
+        assert.equal(data.creator, '');
+        assert.equal(data.character_version, '');
+        assert.equal(data.example_dialogue, '');
+        assert.deepEqual(data.alternate_greetings, []);
+        assert.deepEqual(data.tags, []);
+        assert.deepEqual(data.extensions, {});
+        assert.equal(data.avatar, undefined);
+        assert.equal(new TavernCardValidator(card).validate(), 3);
+    });
+
+    it('round-trips the nested export through parseCardBuffer/normalizeCardCharacter', () => {
+        const card = buildExportCard({
+            name: 'Round Trip',
+            description: 'd',
+            personality: 'p',
+            scenario: 's',
+            first_message: 'Hi!',
+            system_prompt: 'sp',
+            example_dialogue: 'RT: hello',
+            tags: ['one', 'two'],
+            temperature: 0.3,
+            max_tokens: 512,
+            time_aware: false,
+            tts_voice: 'bf_emma',
+        });
         const parsed = parseCardBuffer(Buffer.from(JSON.stringify(card), 'utf8'));
         assert.ok('card' in parsed);
         const normalized = normalizeCardCharacter(/** @type {{ card: object }} */ (parsed).card);
         assert.ok('value' in normalized);
-        assert.equal(/** @type {{ value: object }} */ (normalized).value.name, 'Minimal');
+        const value = /** @type {{ value: Record<string, unknown> }} */ (normalized).value;
+        assert.equal(value.name, 'Round Trip');
+        assert.equal(value.description, 'd');
+        assert.equal(value.personality, 'p');
+        assert.equal(value.scenario, 's');
+        assert.equal(value.first_message, 'Hi!');
+        assert.equal(value.system_prompt, 'sp');
+        assert.equal(value.example_dialogue, 'RT: hello');
+        assert.deepEqual(value.tags, ['one', 'two']);
+        assert.equal(value.temperature, 0.3);
+        assert.equal(value.max_tokens, 512);
+        assert.equal(value.time_aware, false);
+        assert.equal(value.tts_voice, 'bf_emma');
     });
 
     it('filters non-string tags', () => {
         const card = buildExportCard({ name: 'X', tags: ['a', 1, 'b'] });
-        assert.deepEqual(card.tags, ['a', 'b']);
+        assert.deepEqual(/** @type {Record<string, unknown>} */ (card.data).tags, ['a', 'b']);
     });
 });
 
@@ -486,8 +760,8 @@ describe('character card import (HTTP)', () => {
         return fetch(`${baseUrl}/api/openparlor/characters/import`, { method: 'POST', body: form });
     }
 
-    it('imports a v3 JSON card with an avatar data URI', async () => {
-        const card = {
+    it('imports a real nested V3 JSON card (spec chara_card_v3) with an avatar data URI', async () => {
+        const card = v3Card({
             name: 'Imported Alice',
             description: 'from a card',
             personality: 'curious',
@@ -497,8 +771,8 @@ describe('character card import (HTTP)', () => {
             example_dialogue: 'Alice: hello',
             tags: 'friendly, witty',
             avatar: `data:image/png;base64,${PNG_1x1.toString('base64')}`,
-            openparlor: { temperature: 0.7, max_tokens: 1024, time_aware: true, tts_voice: 'af_heart' },
-        };
+            extensions: { openparlor: { temperature: 0.7, max_tokens: 1024, time_aware: true, tts_voice: 'af_heart' } },
+        });
         const res = await postImport(jsonUpload(card));
         assert.equal(res.status, 201);
         const character = await res.json();
@@ -513,8 +787,13 @@ describe('character card import (HTTP)', () => {
         assert.equal(detectImageFormat(fs.readFileSync(stored))?.mime, 'image/png');
     });
 
-    it('imports a v2 PNG card with embedded metadata', async () => {
-        const card = pngCard({ name: 'Png Hero', description: 'in a png', first_mes: 'yo', mes_example: 'A: hi' });
+    it('imports a real nested V2 PNG card and preserves the card image as the avatar', async () => {
+        const card = pngCard(v2Card({
+            name: 'Png Hero',
+            description: 'in a png',
+            first_mes: 'yo',
+            mes_example: 'A: hi',
+        }));
         const res = await postImport(cardUpload(card, 'hero.png', 'image/png'));
         assert.equal(res.status, 201);
         const character = await res.json();
@@ -522,11 +801,29 @@ describe('character card import (HTTP)', () => {
         assert.equal(character.description, 'in a png');
         assert.equal(character.first_message, 'yo');
         assert.equal(character.example_dialogue, 'A: hi');
-        // A bare PNG card (no avatar field in metadata) has no avatar.
-        assert.equal(character.avatar_url, undefined);
+        // The PNG card image itself becomes the character avatar.
+        assert.match(character.avatar_url, /^\/user\/images\/openparlor-avatar-\d+\.png$/);
+        const stored = path.join(tmpRoot, 'user', 'images', path.basename(character.avatar_url));
+        assert.ok(fs.existsSync(stored));
+        assert.equal(detectImageFormat(fs.readFileSync(stored))?.mime, 'image/png');
+        assert.deepEqual(fs.readFileSync(stored), card);
     });
 
-    it('stores the avatar field of a PNG card when present', async () => {
+    it('prefers the card avatar field over the PNG image when both are present', async () => {
+        const gif = Buffer.from('GIF89a' + 'x'.repeat(8)); // magic-byte-valid GIF
+        const card = pngCard(v2Card({
+            name: 'Dual Avatar',
+            avatar: `data:image/gif;base64,${gif.toString('base64')}`,
+        }));
+        const res = await postImport(cardUpload(card, 'dual.png', 'image/png'));
+        assert.equal(res.status, 201);
+        const character = await res.json();
+        assert.match(character.avatar_url, /^\/user\/images\/openparlor-avatar-\d+\.gif$/);
+        const stored = path.join(tmpRoot, 'user', 'images', path.basename(character.avatar_url));
+        assert.deepEqual(fs.readFileSync(stored), gif);
+    });
+
+    it('stores the avatar field of a legacy top-level PNG card when present', async () => {
         const card = pngCard({
             name: 'Png Avatar',
             avatar: `data:image/png;base64,${PNG_1x1.toString('base64')}`,
@@ -544,6 +841,19 @@ describe('character card import (HTTP)', () => {
         const res = await postImport(cardUpload(card, 'My Hero.png', 'image/png'));
         assert.equal(res.status, 201);
         assert.equal((await res.json()).name, 'My Hero');
+    });
+
+    it('uses the upload file name for a nested PNG card without a data name', async () => {
+        const card = pngCard({
+            spec: 'chara_card_v3',
+            spec_version: '3.0',
+            data: { description: 'unnamed v3 card' },
+        });
+        const res = await postImport(cardUpload(card, 'Nested Hero.png', 'image/png'));
+        assert.equal(res.status, 201);
+        const character = await res.json();
+        assert.equal(character.name, 'Nested Hero');
+        assert.equal(character.description, 'unnamed v3 card');
     });
 
     it('ignores privileged and config fields from the card (poisoning)', async () => {
@@ -568,6 +878,30 @@ describe('character card import (HTTP)', () => {
         assert.equal(character.avatar_url, undefined);
         assert.equal(character.tts_provider, '');
         for (const key of ['baseUrl', 'provider', 'pythonExecutable', 'system']) {
+            assert.equal(character[key], undefined);
+        }
+    });
+
+    it('ignores privileged and config fields inside nested data (poisoning)', async () => {
+        const card = v3Card({
+            id: 'attacker-id',
+            owner_id: 'bob',
+            avatar_url: '/user/images/../../etc/shadow',
+            baseUrl: 'http://attacker.example',
+            provider: 'evil-provider',
+            pythonExecutable: '/bin/sh',
+            system: 'SYSTEM OVERRIDE',
+            extensions: { openparlor: { provider: 'evil', apiKey: 'secret', temperature: 0.5 } },
+        });
+        const res = await postImport(jsonUpload(card));
+        assert.equal(res.status, 201);
+        const character = await res.json();
+        assert.equal(character.name, 'V3 Hero');
+        assert.equal(character.owner_id, 'alice');
+        assert.notEqual(character.id, 'attacker-id');
+        assert.equal(character.avatar_url, undefined);
+        assert.equal(character.temperature, 0.5);
+        for (const key of ['baseUrl', 'provider', 'pythonExecutable', 'system', 'apiKey']) {
             assert.equal(character[key], undefined);
         }
     });
@@ -672,11 +1006,14 @@ describe('character card export (HTTP)', () => {
         const card = await res.json();
         assert.equal(card.spec, 'chara_card_v3');
         assert.equal(card.spec_version, '3.0');
-        assert.equal(card.name, 'Export Me');
-        assert.equal(card.description, 'd');
-        assert.equal(card.first_mes, 'f');
-        assert.equal(card.openparlor.temperature, 0.9);
-        assert.equal(card.openparlor.time_aware, true);
+        assert.equal(card.name, undefined); // character fields never leak to top level
+        const data = /** @type {Record<string, unknown>} */ (card.data);
+        assert.equal(data.name, 'Export Me');
+        assert.equal(data.description, 'd');
+        assert.equal(data.first_mes, 'f');
+        assert.equal(data.extensions.openparlor.temperature, 0.9);
+        assert.equal(data.extensions.openparlor.time_aware, true);
+        assert.equal(new TavernCardValidator(card).validate(), 3);
     });
 
     it('omits the avatar when the file is missing or points outside the root', async () => {
@@ -687,12 +1024,12 @@ describe('character card export (HTTP)', () => {
         })).json();
         const res = await fetch(`${baseUrl}/api/openparlor/characters/${created.id}/export`);
         assert.equal(res.status, 200);
-        assert.equal((await res.json()).avatar, undefined);
+        assert.equal(/** @type {Record<string, unknown>} */ ((await res.json()).data).avatar, undefined);
 
         const outside = realPersistence.createCharacter(directories, 'alice', { name: 'Lurker', avatar_url: '/etc/passwd' });
         const res2 = await fetch(`${baseUrl}/api/openparlor/characters/${outside.id}/export`);
         assert.equal(res2.status, 200);
-        assert.equal((await res2.json()).avatar, undefined);
+        assert.equal(/** @type {Record<string, unknown>} */ ((await res2.json()).data).avatar, undefined);
     });
 
     it('rejects export without authentication and for other users\' characters', async () => {
@@ -718,7 +1055,7 @@ describe('character card export (HTTP)', () => {
     });
 
     it('round-trips an imported card through export and re-import', async () => {
-        const original = {
+        const original = v3Card({
             name: 'Round Trip',
             description: 'd',
             personality: 'p',
@@ -728,19 +1065,27 @@ describe('character card export (HTTP)', () => {
             example_dialogue: 'RT: hello',
             tags: ['one', 'two'],
             avatar: `data:image/png;base64,${PNG_1x1.toString('base64')}`,
-            openparlor: { temperature: 0.3, max_tokens: 512, time_aware: false, tts_voice: 'bf_emma' },
-        };
+            extensions: { openparlor: { temperature: 0.3, max_tokens: 512, time_aware: false, tts_voice: 'bf_emma' } },
+        });
         const first = await (await fetch(`${baseUrl}/api/openparlor/characters/import`, {
             method: 'POST',
             body: jsonUpload(original),
         })).json();
 
         const exported = await (await fetch(`${baseUrl}/api/openparlor/characters/${first.id}/export`)).json();
-        assert.equal(exported.name, 'Round Trip');
+        // The export is a standard nested Tavern Card V3, not a nonstandard
+        // OpenParlor-only shape.
         assert.equal(exported.spec, 'chara_card_v3');
-        assert.ok(typeof exported.avatar === 'string' && exported.avatar.startsWith('data:image/png;base64,'));
-        const avatarBytes = Buffer.from(exported.avatar.split(',', 2)[1], 'base64');
+        assert.equal(exported.spec_version, '3.0');
+        assert.equal(new TavernCardValidator(exported).validate(), 3);
+        assert.equal(exported.name, undefined);
+        assert.equal(exported.data.name, 'Round Trip');
+        assert.ok(typeof exported.data.avatar === 'string' && exported.data.avatar.startsWith('data:image/png;base64,'));
+        const avatarBytes = Buffer.from(/** @type {string} */ (exported.data.avatar).split(',', 2)[1], 'base64');
         assert.deepEqual(avatarBytes, PNG_1x1);
+        assert.deepEqual(exported.data.extensions.openparlor, {
+            temperature: 0.3, max_tokens: 512, time_aware: false, tts_voice: 'bf_emma',
+        });
 
         // Re-import the exported card as a fresh character.
         const secondRes = await fetch(`${baseUrl}/api/openparlor/characters/import`, {

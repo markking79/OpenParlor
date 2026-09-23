@@ -2,6 +2,15 @@
 // Pure (no express) logic for turning untrusted character-card payloads into
 // validated OpenParlor character data, and building export cards.
 //
+// Card shapes:
+// - Real SillyTavern Tavern Card V2/V3 payloads nest every character-facing
+//   field in a `data` object:
+//     { spec: "chara_card_v2" | "chara_card_v3", spec_version, data: { name, ... } }
+//   When a `data` object is present it is the authoritative field source
+//   (matching upstream SillyTavern's import path, which reads `data.*`).
+// - Legacy V1-style cards, and cards produced by earlier OpenParlor exports,
+//   keep all fields at the top level and continue to import unchanged.
+//
 // Security model:
 // - Every imported value is untrusted input. Only a fixed allow-list of
 //   character-facing fields is ever mapped; every mapped field is type-checked
@@ -10,6 +19,10 @@
 //   locations, commands, or any other privileged setting. Card fields that
 //   look like configuration (baseUrl, provider, pythonExecutable, ...) are
 //   ignored, not mapped.
+// - OpenParlor's per-character metadata lives in the Tavern Card spec's
+//   standard client extension slot (`data.extensions.openparlor`). The legacy
+//   top-level `openparlor` object is still accepted for backward
+//   compatibility; the standard slot wins per key when both are present.
 // - `avatar_url` (or any path/URL) from a card is never trusted. Avatars are
 //   only accepted as image bytes: PNG file bytes for PNG cards, or a
 //   base64/data-URI payload whose decoded bytes are magic-byte verified.
@@ -267,24 +280,65 @@ function readOpenParlorExtension(extension) {
 }
 
 /**
- * Normalizes an untrusted card object into a storage-safe OpenParlor character
- * create payload. Returns only allow-listed fields; unknown card fields are
- * ignored. When a decodable `avatar` is present, its verified image bytes are
- * returned under `avatarBuffer`.
+ * True for plain objects (no nulls, no arrays, no other types).
+ * @param {unknown} value Value to test
+ * @returns {boolean}
+ */
+function isPlainObject(value) {
+    return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * Resolves the character-facing field source of an untrusted card.
+ *
+ * Real SillyTavern Tavern Card V2 (`spec: "chara_card_v2"`) and V3
+ * (`spec: "chara_card_v3"`) payloads nest the character fields in a `data`
+ * object; when a `data` object is present it is the authoritative field
+ * source (it also wins over duplicated top-level fields in hybrid files,
+ * matching upstream SillyTavern's `readFromV2` import path). Legacy V1-style
+ * cards and cards produced by earlier OpenParlor exports keep every field at
+ * the top level and continue to work unchanged.
+ * @param {Record<string, unknown>} card Parsed card object
+ * @returns {{ source: Record<string, unknown>, data: Record<string, unknown> | null }}
+ */
+function resolveCardFields(card) {
+    const data = isPlainObject(card.data)
+        ? /** @type {Record<string, unknown>} */ (card.data)
+        : null;
+    const source = data ? { ...card, ...data } : card;
+    return { source, data };
+}
+
+/**
+ * Normalizes an untrusted card object into a storage-safe OpenParlor
+ * character create payload. Works for legacy top-level (V1-style) cards and
+ * for nested Tavern Card V2/V3 cards, whose character-facing fields live in
+ * `data` (name, description, personality, scenario, first_mes, mes_example /
+ * example_dialogue, system_prompt, tags, avatar, ...). Returns only
+ * allow-listed fields; unknown card fields are ignored. OpenParlor
+ * per-character metadata is read from the spec's standard client extension
+ * slot (`data.extensions.openparlor`), with the legacy top-level `openparlor`
+ * object still accepted for backward compatibility. When a decodable `avatar`
+ * is present, its verified image bytes are returned under `avatarBuffer`;
+ * `fallbackName` is used only when the card carries no usable name.
  * @param {unknown} card Parsed card object
+ * @param {string} [fallbackName] Name fallback (e.g. the uploaded PNG file name)
  * @returns {{ value: Record<string, unknown>, avatarBuffer: Buffer | null } | { error: string }}
  */
-export function normalizeCardCharacter(card) {
+export function normalizeCardCharacter(card, fallbackName = '') {
     if (card === null || typeof card !== 'object' || Array.isArray(card)) {
         return { error: 'Character data must be an object' };
     }
-    const source = /** @type {Record<string, unknown>} */ (card);
+    const { source, data } = resolveCardFields(/** @type {Record<string, unknown>} */ (card));
 
     const nameResult = readBoundedString(source, 'name', 'name');
     if ('error' in nameResult) return nameResult;
-    const name = nameResult.value.trim();
+    let name = nameResult.value.trim();
     if (name === '') {
-        return { error: '"name" is required and must not be empty' };
+        name = typeof fallbackName === 'string' ? fallbackName.trim() : '';
+        if (name === '' || name.length > MAX_CARD_TEXT_LENGTH) {
+            return { error: '"name" is required and must not be empty' };
+        }
     }
 
     /** @type {Record<string, unknown>} */
@@ -315,7 +369,23 @@ export function normalizeCardCharacter(card) {
     if ('error' in tagsResult) return tagsResult;
     if (tagsResult.value.length > 0) value.tags = tagsResult.value;
 
-    const extension = readOpenParlorExtension(source.openparlor);
+    // OpenParlor per-character metadata belongs in the Tavern Card spec's
+    // standard client extension slot (`data.extensions.openparlor`). The
+    // legacy top-level `openparlor` object produced by earlier OpenParlor
+    // exports is still accepted; when both are present the standard slot wins
+    // per key. A non-standard `data.openparlor` object is neither location,
+    // so it is ignored.
+    const legacyExtension = /** @type {Record<string, unknown>} */ (card).openparlor;
+    const properExtension = data !== null && isPlainObject(data.extensions)
+        ? /** @type {Record<string, unknown>} */ (data.extensions).openparlor
+        : undefined;
+    let extensionSource = legacyExtension;
+    if (properExtension !== undefined) {
+        extensionSource = isPlainObject(legacyExtension) && isPlainObject(properExtension)
+            ? { ...legacyExtension, ...properExtension }
+            : properExtension;
+    }
+    const extension = readOpenParlorExtension(extensionSource);
     if ('error' in extension) return extension;
     Object.assign(value, extension.value);
 
@@ -332,9 +402,14 @@ export function normalizeCardCharacter(card) {
 }
 
 /**
- * Builds a v3 character-card export for an OpenParlor character. The
- * `openparlor` extension preserves per-character settings so a card can
- * round-trip through OpenParlor without loss.
+ * Builds a genuinely valid Tavern Card V3 export for an OpenParlor character.
+ * The card follows the upstream SillyTavern spec shape: top-level `spec` and
+ * `spec_version`, with every character-facing field inside the `data` object.
+ * Safe required/default values are populated so the card stays compatible
+ * with the upstream SillyTavern TavernCardValidator and import path.
+ * OpenParlor's per-character settings go in the spec's standard client
+ * extension slot (`data.extensions.openparlor`) — never at the card top
+ * level and never as character-facing data.
  * @param {Record<string, unknown>} character Persisted character
  * @param {string|null} avatarDataUri Verified avatar data URI, or null
  * @returns {Record<string, unknown>} Export card object
@@ -342,20 +417,6 @@ export function normalizeCardCharacter(card) {
 export function buildExportCard(character, avatarDataUri) {
     /** @param {string} key */
     const str = (key) => (typeof character[key] === 'string' ? character[key] : '');
-    /** @type {Record<string, unknown>} */
-    const card = {
-        spec: 'chara_card_v3',
-        spec_version: '3.0',
-        name: str('name'),
-        description: str('description'),
-        personality: str('personality'),
-        scenario: str('scenario'),
-        first_mes: str('first_message'),
-        system_prompt: str('system_prompt'),
-        example_dialogue: str('example_dialogue'),
-        tags: Array.isArray(character.tags) ? character.tags.filter(tag => typeof tag === 'string') : [],
-    };
-    if (avatarDataUri) card.avatar = avatarDataUri;
 
     /** @type {Record<string, unknown>} */
     const openparlor = {};
@@ -369,8 +430,31 @@ export function buildExportCard(character, avatarDataUri) {
     if (typeof character.tts_voice === 'string' && character.tts_voice !== '') {
         openparlor.tts_voice = character.tts_voice;
     }
-    if (Object.keys(openparlor).length > 0) card.openparlor = openparlor;
-    return card;
+
+    /** @type {Record<string, unknown>} */
+    const data = {
+        name: str('name'),
+        description: str('description'),
+        personality: str('personality'),
+        scenario: str('scenario'),
+        first_mes: str('first_message'),
+        system_prompt: str('system_prompt'),
+        post_history_instructions: '',
+        creator_notes: '',
+        creator: '',
+        character_version: '',
+        example_dialogue: str('example_dialogue'),
+        alternate_greetings: [],
+        tags: Array.isArray(character.tags) ? character.tags.filter(tag => typeof tag === 'string') : [],
+        extensions: Object.keys(openparlor).length > 0 ? { openparlor } : {},
+    };
+    if (avatarDataUri) data.avatar = avatarDataUri;
+
+    return {
+        spec: 'chara_card_v3',
+        spec_version: '3.0',
+        data,
+    };
 }
 
 /**
