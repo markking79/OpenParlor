@@ -58,13 +58,15 @@ export function shouldShowMemorySection({ hasConversation, hasCharacter, memoryC
 }
 
 export function createMemoryRefreshGuard() {
+    // Generation 0 is the "no refresh in flight" sentinel: begin() issues
+    // 1-based generations, and isCurrent must never accept the sentinel.
     let generation = 0;
     return {
         begin() {
             return ++generation;
         },
         isCurrent(gen) {
-            return gen === generation;
+            return gen > 0 && gen === generation;
         },
     };
 }
@@ -72,6 +74,7 @@ export function createMemoryRefreshGuard() {
 import { createNdjsonParser, createStreamMessageCollector, normalizeConversation, resolveMessageCharacterId } from './conversations.js';
 import { buildCardExportFilename, normalizeCharacter, sanitizeCharacterInput, validateCharacterForm } from './characters.js';
 import { normalizeMemory, normalizeMemorySource, validateMemoryForm } from './memory.js';
+import { createFirstTokenEstimator, estimateResponseStartProgress, formatResponseStartProgress } from './progress.js';
 import { fetchDeferredPrerequisite, normalizeHealthStatus, normalizeModelStatus } from './settings.js';
 import {
     createGroupPlaybackQueue,
@@ -194,6 +197,13 @@ if (typeof document !== 'undefined') {
     let streamAbortController = null;
     const isDev = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
     const voiceTurnTimer = createVoiceTurnTimer();
+
+    // Estimated response-start progress (DOGFOOD-007). pendingStart tracks
+    // the speaker currently awaiting its first visible token; the window is
+    // per-speaker so sequential group replies never share or morph state.
+    const firstTokenEstimator = createFirstTokenEstimator();
+    let pendingStart = null;
+    let progressTimerId = null;
 
     // ── Auto-speak state ───────────────────────────────────────────────────
 
@@ -518,7 +528,20 @@ if (typeof document !== 'undefined') {
 
             const speakerEl = document.createElement('div');
             speakerEl.className = 'speaker';
-            speakerEl.textContent = isUser ? 'You' : charName;
+            // Estimated time-to-first-token for the speaker currently
+            // awaiting its first visible token (DOGFOOD-007).
+            if (!isUser && !msg.content && pendingStart && pendingStart.msg === msg) {
+                speakerEl.className = 'speaker speaker-progress';
+                speakerEl.textContent = formatResponseStartProgress(
+                    charName,
+                    estimateResponseStartProgress({
+                        elapsedMs: performance.now() - pendingStart.startedAt,
+                        expectedMs: firstTokenEstimator.expectedMs(),
+                    }),
+                );
+            } else {
+                speakerEl.textContent = isUser ? 'You' : charName;
+            }
 
             const bubble = document.createElement('div');
             bubble.className = 'bubble';
@@ -1555,6 +1578,7 @@ if (typeof document !== 'undefined') {
             updateRecorderUI();
             updateTranscriptionStatus();
             invalidateMemoryState();
+            stopPendingStart();
         }
 
         try {
@@ -1601,6 +1625,7 @@ if (typeof document !== 'undefined') {
         groupQueue.clear();
         playback.stop();
         voiceTurnTimer.cancel();
+        stopPendingStart();
         invalidateMemoryState();
         try {
             renderState(messagesEl, 'loading', 'Loading…');
@@ -1627,6 +1652,7 @@ if (typeof document !== 'undefined') {
         try {
             newChatButton.disabled = true;
             invalidateMemoryState();
+            stopPendingStart();
             const conv = await createConversation(charId, title);
             conversations.unshift(conv);
             currentConversation = conv;
@@ -1640,6 +1666,59 @@ if (typeof document !== 'undefined') {
         } finally {
             newChatButton.disabled = false;
         }
+    }
+
+    // ── Estimated response-start progress (DOGFOOD-007) ────────────────────
+    //
+    // Rough visual estimate of time-to-first-token while a speaker is being
+    // prepared. Not real model progress: the ratio caps below 100%, the
+    // label is marked with "~", and the indicator is removed on the first
+    // visible token or cancelled on stop/abort/switch/error/completion.
+
+    function startPendingStart(msg, name) {
+        pendingStart = { msg, startedAt: performance.now(), name: name || '' };
+        if (progressTimerId === null) {
+            progressTimerId = setInterval(tickPendingStart, 200);
+        }
+    }
+
+    function stopPendingStart() {
+        pendingStart = null;
+        if (progressTimerId !== null) {
+            clearInterval(progressTimerId);
+            progressTimerId = null;
+        }
+    }
+
+    // Fold the observed first-token latency into the browser-local estimate
+    // and remove the indicator; the delta path only updates the bubble, so
+    // the speaker label is fixed up here.
+    function completePendingStart(msg, bubble) {
+        if (!pendingStart || pendingStart.msg !== msg) return;
+        const name = pendingStart.name;
+        firstTokenEstimator.observe(performance.now() - pendingStart.startedAt);
+        stopPendingStart();
+        if (name && bubble) {
+            const content = bubble.closest('.message-content');
+            const speaker = content ? content.querySelector('.speaker-progress') : null;
+            if (speaker) speaker.textContent = name;
+        }
+    }
+
+    function tickPendingStart() {
+        if (!pendingStart) {
+            stopPendingStart();
+            return;
+        }
+        const speaker = messagesEl.querySelector('.speaker-progress');
+        if (!speaker) return;
+        speaker.textContent = formatResponseStartProgress(
+            pendingStart.name,
+            estimateResponseStartProgress({
+                elapsedMs: performance.now() - pendingStart.startedAt,
+                expectedMs: firstTokenEstimator.expectedMs(),
+            }),
+        );
     }
 
     async function sendMessage() {
@@ -1666,6 +1745,9 @@ if (typeof document !== 'undefined') {
         let currentAssistantMsg = streamCollector.getPendingMessage();
         currentMessages.push(currentAssistantMsg);
         renderMessages();
+        // The first speaker's pending window starts at send time: that is
+        // when waiting for visible text begins (identity may be unknown).
+        startPendingStart(currentAssistantMsg, '');
 
         let lastBubble = messagesEl.querySelector('.message:last-child .bubble');
         const abortController = new AbortController();
@@ -1695,6 +1777,7 @@ if (typeof document !== 'undefined') {
                 if (lastBubble) lastBubble.textContent = currentAssistantMsg.content;
                 renderMessages();
                 scrollMessages();
+                stopPendingStart();
                 if (isDev) voiceTurnTimer.log();
                 voiceTurnTimer.cancel();
                 return;
@@ -1719,6 +1802,17 @@ if (typeof document !== 'undefined') {
                         currentAssistantMsg = outcome.message;
                         if (outcome.isNewMessage) {
                             currentMessages.push(currentAssistantMsg);
+                            // Each speaker in a sequential reply waits for
+                            // its own first token: fresh pending state so
+                            // progress never carries across speakers.
+                            const speakerChar = findCharacter(resolveMessageCharacterId(currentAssistantMsg, currentConversation));
+                            startPendingStart(currentAssistantMsg, speakerChar ? speakerChar.name : '');
+                        } else if (pendingStart && pendingStart.msg === currentAssistantMsg) {
+                            // First speaker: identity was assigned to the
+                            // existing pending message. Keep the window
+                            // running from send time; only attach the name.
+                            const speakerChar = findCharacter(resolveMessageCharacterId(currentAssistantMsg, currentConversation));
+                            pendingStart.name = speakerChar ? speakerChar.name : '';
                         }
                         // Re-render on every speaker_start so the
                         // server-identified speaker is displayed before the
@@ -1726,11 +1820,15 @@ if (typeof document !== 'undefined') {
                         renderMessages();
                         lastBubble = messagesEl.querySelector('.message:last-child .bubble');
                     } else if (outcome.type === 'delta') {
+                        if (pendingStart && pendingStart.msg === currentAssistantMsg) {
+                            completePendingStart(currentAssistantMsg, lastBubble);
+                        }
                         voiceTurnTimer.markFirstToken();
                         if (lastBubble) lastBubble.textContent = currentAssistantMsg.content;
                         scrollMessages();
                     } else if (outcome.type === 'error') {
                         hadStreamError = true;
+                        stopPendingStart();
                         if (lastBubble) lastBubble.textContent = currentAssistantMsg.content;
                         scrollMessages();
                     }
@@ -1790,14 +1888,23 @@ if (typeof document !== 'undefined') {
                 voiceTurnTimer.cancel();
             }
         } catch (e) {
-            if (e && e.name === 'AbortError') return;
+            if (e && e.name === 'AbortError') {
+                stopPendingStart();
+                return;
+            }
             currentAssistantMsg.content = 'Connection error';
             if (lastBubble) lastBubble.textContent = currentAssistantMsg.content;
             renderMessages();
             scrollMessages();
+            stopPendingStart();
             if (isDev) voiceTurnTimer.log();
             voiceTurnTimer.cancel();
         } finally {
+            // Clear this stream's pending state on completion; the guard
+            // keeps a newer conversation's state (if any) untouched.
+            if (pendingStart && pendingStart.msg === currentAssistantMsg) {
+                stopPendingStart();
+            }
             if (streamAbortController === abortController) {
                 streamAbortController = null;
                 isSending = false;
