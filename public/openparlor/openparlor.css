@@ -31,6 +31,19 @@ button {
     height: 100vh;
     display: grid;
     grid-template-columns: 260px minmax(420px, 1fr) 270px;
+    overflow: hidden;
+}
+
+.app.left-collapsed {
+    grid-template-columns: 40px minmax(420px, 1fr) 270px;
+}
+
+.app.right-collapsed {
+    grid-template-columns: 260px minmax(420px, 1fr) 40px;
+}
+
+.app.left-collapsed.right-collapsed {
+    grid-template-columns: 40px minmax(420px, 1fr) 40px;
 }
 
 
@@ -38,8 +51,57 @@ button {
 
 .sidebar {
     background: #161719;
-    padding: 18px;
+    overflow: hidden;
+    min-height: 0;
+    position: relative;
+}
+
+.sidebar-content {
+    height: 100%;
     overflow-y: auto;
+    padding: 18px;
+}
+
+.sidebar-header {
+    display: flex;
+    justify-content: flex-end;
+    margin-bottom: 2px;
+}
+
+.sidebar-collapse-btn,
+.sidebar-restore-btn {
+    border: 0;
+    background: transparent;
+    color: #858991;
+    font-size: 14px;
+    padding: 4px 6px;
+    border-radius: 4px;
+    cursor: pointer;
+    line-height: 1;
+}
+
+.sidebar-collapse-btn:hover,
+.sidebar-restore-btn:hover {
+    background: #292b30;
+    color: #ececec;
+}
+
+.sidebar-rail {
+    display: none;
+    position: absolute;
+    inset: 0;
+    flex-direction: column;
+    align-items: center;
+    padding-top: 10px;
+    background: #161719;
+}
+
+.sidebar.collapsed .sidebar-content {
+    visibility: hidden;
+}
+
+.sidebar.collapsed .sidebar-rail {
+    display: flex;
 }
 
 .sidebar-left {
@@ -143,6 +205,59 @@ button {
     gap: 2px;
 }
 
+.conversation-actions {
+    display: flex;
+    gap: 2px;
+    margin-top: 4px;
+    opacity: 0;
+    transition: opacity 0.15s;
+}
+
+.conversation:hover .conversation-actions,
+.conversation.active .conversation-actions,
+.conversation-actions:focus-within {
+    opacity: 1;
+}
+
+.conversation-rename-btn,
+.conversation-delete-btn {
+    border: 0;
+    background: transparent;
+    color: #858991;
+    font-size: 11px;
+    padding: 2px 5px;
+    border-radius: 4px;
+    cursor: pointer;
+    line-height: 1;
+}
+
+.conversation-rename-btn:hover {
+    background: #292b30;
+    color: #ececec;
+}
+
+.conversation-delete-btn:hover {
+    background: #3a2527;
+    color: #f0a0a0;
+}
+
+.conversation-rename-input {
+    width: 100%;
+    border: 1px solid #555860;
+    background: #111214;
+    color: #ececec;
+    border-radius: 5px;
+    padding: 4px 6px;
+    font-size: 13px;
+    outline: none;
+}
+
+.conversation-rename-error {
+    font-size: 11px;
+    color: #f0a0a0;
+    margin-top: 3px;
+}
+
 .new-chat-area {
     display: flex;
     flex-direction: column;
@@ -205,9 +320,11 @@ button {
 
 .chat {
     min-width: 0;
+    min-height: 0;
     display: flex;
     flex-direction: column;
     background: #111214;
+    overflow: hidden;
 }
 
 .chat-header {
@@ -330,6 +447,7 @@ button {
 
 .messages {
     flex: 1;
+    min-height: 0;
     overflow-y: auto;
     padding: 30px max(30px, calc((100% - 800px) / 2));
 }

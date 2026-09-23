@@ -28,6 +28,14 @@ const GROUP_WIDE_CUES = [
     /\beverybody\b/,
     /\ball of you\b/,
     /\byou all\b/,
+    /\byou guys\b/,
+    /\bhey guys\b/,
+    /\bhi guys\b/,
+    /\bhello guys\b/,
+    /\byou folks\b/,
+    /\bhey folks\b/,
+    /\bhi folks\b/,
+    /\bhello folks\b/,
 ];
 
 // Two-person cues, honored only when exactly two character participants exist.

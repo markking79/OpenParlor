@@ -2,6 +2,60 @@
 
 ## Current state
 
+DOGFOOD-005 accepted and committed locally (`pending`): each sidebar now has
+keyboard-accessible collapse and restore controls, a persistent narrow rail,
+and an independent browser-local preference. The sidebar DOM stays mounted so
+its state and scroll position survive collapse; the center grid track expands.
+Storage failures leave toggling usable. Focused UI helpers: 187 passed; full
+OpenParlor Node suite: 1,103 passed; changed JS lint and `git diff --check`
+passed. No push.
+
+## Current state
+
+DOGFOOD-004 accepted and committed locally (`45aff300e`): the viewport grid and
+chat flex descendants now constrain their minimum height and hide overflow at
+the app/chat boundary, leaving both sidebars and the message pane independently
+scrollable. Message autoscroll is coalesced through requestAnimationFrame after
+each render/delta, covering conversation load, sends, streamed text, and a new
+group speaker. Focused UI helpers: 172 passed; full OpenParlor Node suite:
+1,088 passed; changed JS lint passed; `git diff --check` passed. No push.
+
+## Current state
+
+DOGFOOD-003 accepted and committed locally (`95894931f`): conversation cards now
+offer accessible in-place rename and destructive-action-confirmed deletion,
+using the existing PATCH and DELETE routes. Rename trims and visibly rejects
+empty titles; successful updates refresh list and current header without
+changing the conversation identity or server-held state. Deleting the active
+conversation cancels its owned stream before deletion, stops queue/playback and
+recording, clears local state and per-conversation Auto-speak/Voice values, and
+selects the next conversation or a clean empty state. Focused UI helpers: 167
+passed; full OpenParlor Node suite: 1,083 passed; production lint passed; test
+lint has zero errors and inherited warnings; `git diff --check` passed. No push.
+
+## Current state
+
+DOGFOOD-002 accepted and committed locally (`b66f0c0f0`): bounded second-person
+and greeting cues now treat `guys`/`folks` as collective addressing without
+matching third-person references. Identity-less stream placeholders render
+neutrally until `speaker_start`; correctly framed sequential group speakers
+remain distinct bubbles. Focused suites and the full OpenParlor Node suite
+passed (1,074 tests); production lint passed; test lint has 0 errors and only
+inherited warnings; `git diff --check` passed. No push.
+
+## Current state
+
+DOGFOOD-001 accepted and committed locally (`d289ca6a6`): persisted group
+messages now retain participant record IDs and resolve speaker identity through
+`participant_id -> participant -> character_id`, while explicit live stream
+`character_id` remains authoritative. Rendering therefore uses the resolved
+character's name, avatar, and TTS voice, falling back to the primary character
+only when no identity can resolve. Focused UI helper suites: 382 passed; full
+OpenParlor Node suite passed; production lint passed; test lint has only the
+inherited warning-level Playwright rules; `git diff --check` passed. No push.
+
+## Current state
+
 TASK-MEM-002 accepted and pushed (`02e5c5cd2`): completed character turns now
 launch server-side, non-blocking durable-memory extraction after the response
 has finished. Candidates require bounded JSON, reject trivial dialogue and

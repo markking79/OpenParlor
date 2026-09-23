@@ -21,6 +21,7 @@ import {
     createTranscriptionController,
     createVoiceTurnTimer,
 } from '../../public/openparlor/openparlor.js';
+import { validateConversationTitle, createScrollScheduler, normalizeSidebarCollapsed, createSidebarState, shouldShowMemorySection, createMemoryRefreshGuard } from '../../public/openparlor/app.js';
 
 // ─── formatRelativeTime ─────────────────────────────────────────────────────
 
@@ -72,7 +73,6 @@ describe('formatRelativeTime', () => {
         assert.doesNotMatch(result, /ago$/);
     });
 });
-
 // ─── normalizeConversation ──────────────────────────────────────────────────
 
 describe('normalizeConversation', () => {
@@ -1482,5 +1482,384 @@ describe('createStreamMessageCollector', () => {
         const messages = collector.getMessages();
         assert.equal(messages.length, 1);
         assert.equal(messages[0].content, '');
+    });
+
+    // ─── DOGFOOD-002: pending identity and complete two-speaker sequence ───
+
+    test('pending message before speaker_start has no character_id (neutral rendering contract)', () => {
+        const collector = createStreamMessageCollector();
+        const pending = collector.getPendingMessage();
+        assert.equal(pending.role, 'assistant');
+        assert.equal(pending.content, '');
+        assert.ok(!('character_id' in pending), 'pending message must not carry a character_id');
+        assert.ok(!('participant_id' in pending), 'pending message must not carry a participant_id');
+    });
+
+    test('complete two-speaker sequence: A-start/A-delta/A-end/B-start/B-delta/B-end leaves two distinct completed messages', () => {
+        const collector = createStreamMessageCollector();
+
+        // Speaker A starts
+        const aStart = collector.handleRecord({ type: 'speaker_start', character_id: 'char-alpha' });
+        assert.equal(aStart.isNewMessage, false, 'first speaker_start assigns identity to pending message');
+
+        // Speaker A deltas
+        collector.handleRecord({ type: 'delta', text: 'Hello, ' });
+        collector.handleRecord({ type: 'delta', text: 'I am Alpha.' });
+
+        // Speaker A ends
+        const aEnd = collector.handleRecord({ type: 'speaker_end', character_id: 'char-alpha' });
+        assert.equal(aEnd.message.character_id, 'char-alpha');
+
+        // After A ends, A's content is intact
+        let messages = collector.getMessages();
+        assert.equal(messages.length, 1);
+        assert.equal(messages[0].character_id, 'char-alpha');
+        assert.equal(messages[0].content, 'Hello, I am Alpha.');
+
+        // Speaker B starts — must create a NEW message, not replace A
+        const bStart = collector.handleRecord({ type: 'speaker_start', character_id: 'char-beta' });
+        assert.equal(bStart.isNewMessage, true, 'second speaker_start creates a new message');
+
+        // A is still present and unchanged after B starts
+        messages = collector.getMessages();
+        assert.equal(messages.length, 2, 'B-start must not erase A');
+        assert.equal(messages[0].character_id, 'char-alpha');
+        assert.equal(messages[0].content, 'Hello, I am Alpha.', 'A content must be preserved after B starts');
+
+        // Speaker B deltas
+        collector.handleRecord({ type: 'delta', text: 'Hi, ' });
+        collector.handleRecord({ type: 'delta', text: 'I am Beta.' });
+
+        // A is still intact during B's deltas
+        messages = collector.getMessages();
+        assert.equal(messages[0].content, 'Hello, I am Alpha.', 'A content must be preserved during B deltas');
+
+        // Speaker B ends
+        const bEnd = collector.handleRecord({ type: 'speaker_end', character_id: 'char-beta' });
+        assert.equal(bEnd.message.character_id, 'char-beta');
+
+        // Done
+        collector.handleRecord({ type: 'done' });
+
+        // Final state: two distinct, completed messages
+        messages = collector.getMessages();
+        assert.equal(messages.length, 2);
+        assert.equal(messages[0].role, 'assistant');
+        assert.equal(messages[0].character_id, 'char-alpha');
+        assert.equal(messages[0].content, 'Hello, I am Alpha.');
+        assert.equal(messages[1].role, 'assistant');
+        assert.equal(messages[1].character_id, 'char-beta');
+        assert.equal(messages[1].content, 'Hi, I am Beta.');
+        // B never replaced or erased A
+        assert.notEqual(messages[0], messages[1], 'messages must be distinct objects');
+    });
+});
+
+// ─── createScrollScheduler (DOGFOOD-004) ─────────────────────────────────────
+
+describe('createScrollScheduler', () => {
+    function makeMockRaf() {
+        const callbacks = [];
+        const rafFn = (cb) => {
+            callbacks.push(cb);
+            return callbacks.length;
+        };
+        return {
+            rafFn,
+            callbacks,
+            flush: () => {
+                const batch = callbacks.splice(0);
+                for (const cb of batch) cb();
+            },
+        };
+    }
+
+    test('schedules callback on next frame', () => {
+        const { rafFn, callbacks, flush } = makeMockRaf();
+        const scheduler = createScrollScheduler(rafFn);
+        let called = false;
+        scheduler.schedule(() => { called = true; });
+        assert.equal(called, false, 'callback not yet invoked');
+        assert.equal(callbacks.length, 1, 'one rAF scheduled');
+        flush();
+        assert.equal(called, true, 'callback invoked after frame');
+    });
+
+    test('coalesces multiple schedules within the same frame into one invocation', () => {
+        const { rafFn, callbacks, flush } = makeMockRaf();
+        const scheduler = createScrollScheduler(rafFn);
+        const calls = [];
+        scheduler.schedule(() => calls.push(1));
+        scheduler.schedule(() => calls.push(2));
+        scheduler.schedule(() => calls.push(3));
+        assert.equal(callbacks.length, 1, 'only one rAF scheduled');
+        flush();
+        assert.deepEqual(calls, [3], 'only the latest callback is invoked');
+    });
+
+    test('allows re-scheduling after a frame has fired', () => {
+        const { rafFn, callbacks, flush } = makeMockRaf();
+        const scheduler = createScrollScheduler(rafFn);
+        const calls = [];
+        scheduler.schedule(() => calls.push('a'));
+        flush();
+        assert.deepEqual(calls, ['a']);
+        assert.equal(callbacks.length, 0, 'no pending after flush');
+
+        scheduler.schedule(() => calls.push('b'));
+        assert.equal(callbacks.length, 1, 'new rAF scheduled after previous frame');
+        flush();
+        assert.deepEqual(calls, ['a', 'b']);
+    });
+
+    test('does not invoke callback if no schedule was called', () => {
+        const { rafFn, callbacks, flush } = makeMockRaf();
+        const scheduler = createScrollScheduler(rafFn);
+        // No schedule calls
+        assert.equal(callbacks.length, 0);
+        flush();
+        // Nothing should have happened
+    });
+
+    test('works with synchronous rafFn (immediate execution)', () => {
+        const scheduler = createScrollScheduler((fn) => fn());
+        let called = false;
+        scheduler.schedule(() => { called = true; });
+        assert.equal(called, true, 'synchronous raf executes immediately');
+    });
+});
+
+// ─── validateConversationTitle (DOGFOOD-003) ──────────────────────────────────
+
+describe('validateConversationTitle', () => {
+    test('returns invalid for non-string input', () => {
+        assert.equal(validateConversationTitle(null).valid, false);
+        assert.equal(validateConversationTitle(42).valid, false);
+        assert.equal(validateConversationTitle(undefined).valid, false);
+    });
+
+    test('returns invalid for empty string', () => {
+        const result = validateConversationTitle('');
+        assert.equal(result.valid, false);
+        assert.ok(result.error);
+    });
+
+    test('returns invalid for whitespace-only string', () => {
+        const result = validateConversationTitle('   ');
+        assert.equal(result.valid, false);
+        assert.ok(result.error);
+    });
+
+    test('trims and returns valid title', () => {
+        const result = validateConversationTitle('  My Chat  ');
+        assert.equal(result.valid, true);
+        assert.equal(result.title, 'My Chat');
+        assert.equal(result.error, '');
+    });
+
+    test('returns valid for single character title', () => {
+        const result = validateConversationTitle('a');
+        assert.equal(result.valid, true);
+        assert.equal(result.title, 'a');
+    });
+
+    test('returns invalid for title exceeding 200 chars', () => {
+        const result = validateConversationTitle('a'.repeat(201));
+        assert.equal(result.valid, false);
+        assert.ok(result.error.includes('200'));
+    });
+
+    test('returns valid for title at exactly 200 chars', () => {
+        const result = validateConversationTitle('a'.repeat(200));
+        assert.equal(result.valid, true);
+        assert.equal(result.title.length, 200);
+    });
+
+    test('trims before checking length (200 chars + surrounding whitespace is valid)', () => {
+        const result = validateConversationTitle('  ' + 'a'.repeat(200) + '  ');
+        assert.equal(result.valid, true);
+        assert.equal(result.title.length, 200);
+    });
+
+    test('trims before checking length (201 chars + surrounding whitespace is invalid)', () => {
+        const result = validateConversationTitle('  ' + 'a'.repeat(201) + '  ');
+        assert.equal(result.valid, false);
+    });
+});
+
+// ─── normalizeSidebarCollapsed (DOGFOOD-005) ─────────────────────────────────
+
+describe('normalizeSidebarCollapsed', () => {
+    test('returns true for boolean true', () => {
+        assert.equal(normalizeSidebarCollapsed(true), true);
+    });
+
+    test('returns true for string "true"', () => {
+        assert.equal(normalizeSidebarCollapsed('true'), true);
+    });
+
+    test('returns false for boolean false', () => {
+        assert.equal(normalizeSidebarCollapsed(false), false);
+    });
+
+    test('returns false for string "false"', () => {
+        assert.equal(normalizeSidebarCollapsed('false'), false);
+    });
+
+    test('returns false for null', () => {
+        assert.equal(normalizeSidebarCollapsed(null), false);
+    });
+
+    test('returns false for undefined', () => {
+        assert.equal(normalizeSidebarCollapsed(undefined), false);
+    });
+
+    test('returns false for empty string', () => {
+        assert.equal(normalizeSidebarCollapsed(''), false);
+    });
+
+    test('returns false for arbitrary string', () => {
+        assert.equal(normalizeSidebarCollapsed('yes'), false);
+    });
+
+    test('returns false for number', () => {
+        assert.equal(normalizeSidebarCollapsed(1), false);
+    });
+});
+
+// ─── createSidebarState (DOGFOOD-005) ────────────────────────────────────────
+
+describe('createSidebarState', () => {
+    function makeMockStorage() {
+        const store = new Map();
+        return {
+            getItem: (k) => store.has(k) ? store.get(k) : null,
+            setItem: (k, v) => { store.set(k, String(v)); },
+            removeItem: (k) => { store.delete(k); },
+            _store: store,
+        };
+    }
+
+    const keys = { left: 'key-left', right: 'key-right' };
+
+    test('get returns false for unset keys', () => {
+        const state = createSidebarState(makeMockStorage(), keys);
+        assert.equal(state.get('left'), false);
+        assert.equal(state.get('right'), false);
+    });
+
+    test('set then get round-trips true', () => {
+        const storage = makeMockStorage();
+        const state = createSidebarState(storage, keys);
+        state.set('left', true);
+        assert.equal(state.get('left'), true);
+    });
+
+    test('set then get round-trips false', () => {
+        const storage = makeMockStorage();
+        const state = createSidebarState(storage, keys);
+        state.set('right', true);
+        state.set('right', false);
+        assert.equal(state.get('right'), false);
+    });
+
+    test('left and right are independent', () => {
+        const storage = makeMockStorage();
+        const state = createSidebarState(storage, keys);
+        state.set('left', true);
+        assert.equal(state.get('left'), true);
+        assert.equal(state.get('right'), false);
+    });
+
+    test('storage failure on get is harmless (returns false)', () => {
+        const state = createSidebarState({
+            getItem: () => { throw new Error('denied'); },
+            setItem: () => { throw new Error('denied'); },
+        }, keys);
+        assert.equal(state.get('left'), false);
+    });
+
+    test('storage failure on set is harmless (no throw)', () => {
+        const state = createSidebarState({
+            getItem: () => null,
+            setItem: () => { throw new Error('denied'); },
+        }, keys);
+        assert.doesNotThrow(() => state.set('left', true));
+    });
+});
+
+// ─── shouldShowMemorySection (DOGFOOD-006) ────────────────────────────────────
+
+describe('shouldShowMemorySection', () => {
+    test('returns true when conversation, character, and memories all present', () => {
+        assert.equal(shouldShowMemorySection({ hasConversation: true, hasCharacter: true, memoryCount: 1 }), true);
+    });
+
+    test('returns false when no conversation is selected', () => {
+        assert.equal(shouldShowMemorySection({ hasConversation: false, hasCharacter: true, memoryCount: 3 }), false);
+    });
+
+    test('returns false when conversation has no character', () => {
+        assert.equal(shouldShowMemorySection({ hasConversation: true, hasCharacter: false, memoryCount: 2 }), false);
+    });
+
+    test('returns false when there are zero memories', () => {
+        assert.equal(shouldShowMemorySection({ hasConversation: true, hasCharacter: true, memoryCount: 0 }), false);
+    });
+
+    test('returns false when all conditions are absent', () => {
+        assert.equal(shouldShowMemorySection({ hasConversation: false, hasCharacter: false, memoryCount: 0 }), false);
+    });
+
+    test('returns true for large memory count', () => {
+        assert.equal(shouldShowMemorySection({ hasConversation: true, hasCharacter: true, memoryCount: 100 }), true);
+    });
+});
+
+// ─── createMemoryRefreshGuard (DOGFOOD-006) ───────────────────────────────────
+
+describe('createMemoryRefreshGuard', () => {
+    test('initial generation is not current (no begin called)', () => {
+        const guard = createMemoryRefreshGuard();
+        assert.equal(guard.isCurrent(0), false);
+    });
+
+    test('begin returns incrementing generations', () => {
+        const guard = createMemoryRefreshGuard();
+        assert.equal(guard.begin(), 1);
+        assert.equal(guard.begin(), 2);
+        assert.equal(guard.begin(), 3);
+    });
+
+    test('latest generation is current', () => {
+        const guard = createMemoryRefreshGuard();
+        const g1 = guard.begin();
+        const g2 = guard.begin();
+        assert.equal(guard.isCurrent(g2), true);
+    });
+
+    test('superseded generation is not current', () => {
+        const guard = createMemoryRefreshGuard();
+        const g1 = guard.begin();
+        guard.begin(); // supersede g1
+        assert.equal(guard.isCurrent(g1), false);
+    });
+
+    test('simulates stale response being discarded', () => {
+        const guard = createMemoryRefreshGuard();
+        // First refresh begins
+        const gen1 = guard.begin();
+        // Second refresh begins (user switched conversation)
+        const gen2 = guard.begin();
+        // First response arrives — should be discarded
+        assert.equal(guard.isCurrent(gen1), false, 'stale response must be rejected');
+        // Second response arrives — should be accepted
+        assert.equal(guard.isCurrent(gen2), true, 'current response must be accepted');
+    });
+
+    test('single refresh without supersede remains current', () => {
+        const guard = createMemoryRefreshGuard();
+        const gen = guard.begin();
+        assert.equal(guard.isCurrent(gen), true);
     });
 });

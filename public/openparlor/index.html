@@ -11,7 +11,11 @@
     <div class="app">
 
         <!-- LEFT: conversations -->
-        <aside class="sidebar sidebar-left">
+        <aside class="sidebar sidebar-left" id="sidebarLeft">
+            <div class="sidebar-content">
+                <div class="sidebar-header">
+                    <button id="collapseLeftBtn" class="sidebar-collapse-btn" aria-label="Collapse left sidebar" aria-expanded="true" title="Collapse left sidebar">◀</button>
+                </div>
             <div class="brand">
                 <div class="brand-mark">OP</div>
                 <div>
@@ -41,6 +45,10 @@
 
             <div id="conversationList" class="conversation-list">
                 <div class="state-loading">Loading…</div>
+            </div>
+            </div>
+            <div class="sidebar-rail">
+                <button id="restoreLeftBtn" class="sidebar-restore-btn" aria-label="Expand left sidebar" aria-expanded="false" title="Expand left sidebar">▶</button>
             </div>
         </aside>
 
@@ -102,7 +110,11 @@
 
 
         <!-- RIGHT: characters -->
-        <aside class="sidebar sidebar-right">
+        <aside class="sidebar sidebar-right" id="sidebarRight">
+            <div class="sidebar-content">
+                <div class="sidebar-header">
+                    <button id="collapseRightBtn" class="sidebar-collapse-btn" aria-label="Collapse right sidebar" aria-expanded="true" title="Collapse right sidebar">▶</button>
+                </div>
 
             <div class="section-title character-heading">
                 Characters
@@ -143,14 +155,16 @@
                 <div class="state-loading">Loading…</div>
             </div>
 
-            <div class="section-title memory-heading">
-                Memories
+            <div id="memorySection" class="memory-section" hidden>
+                <div class="section-title memory-heading">
+                    Memories
+                </div>
+                <div id="memoryPanel" class="memory-panel"></div>
             </div>
-
-            <div id="memoryPanel" class="memory-panel">
-                <div class="state-empty">Select a conversation to view memories.</div>
             </div>
-
+            <div class="sidebar-rail">
+                <button id="restoreRightBtn" class="sidebar-restore-btn" aria-label="Expand right sidebar" aria-expanded="false" title="Expand right sidebar">◀</button>
+            </div>
         </aside>
 
     </div>

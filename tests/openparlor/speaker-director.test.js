@@ -492,3 +492,93 @@ test('selectSpeakers maps multiple model-selected IDs to participants in partici
     const result = await selectSpeakers({ participants, characters, userMessage: 'hmm', provider });
     assert.deepEqual(result.map(p => p.id), ['part-0', 'part-2']);
 });
+
+// ─── DOGFOOD-002: guys/folks collective-address cues ─────────────────────────
+
+test('"hey guys" selects all participants in a two-character chat', () => {
+    const participants = makeParticipants(['Doug', 'Monica']);
+    const characters = makeCharacters(['Doug', 'Monica']);
+    const result = selectSpeaker(participants, characters, 'hey guys');
+    assert.deepEqual(result.map(p => p.id), ['part-0', 'part-1']);
+});
+
+test('"hi guys" selects all participants in a two-character chat', () => {
+    const participants = makeParticipants(['Doug', 'Monica']);
+    const characters = makeCharacters(['Doug', 'Monica']);
+    const result = selectSpeaker(participants, characters, 'hi guys');
+    assert.deepEqual(result.map(p => p.id), ['part-0', 'part-1']);
+});
+
+test('"hello guys" selects all participants in a two-character chat', () => {
+    const participants = makeParticipants(['Doug', 'Monica']);
+    const characters = makeCharacters(['Doug', 'Monica']);
+    const result = selectSpeaker(participants, characters, 'hello guys');
+    assert.deepEqual(result.map(p => p.id), ['part-0', 'part-1']);
+});
+
+test('"you guys" selects all participants in a two-character chat', () => {
+    const participants = makeParticipants(['Doug', 'Monica']);
+    const characters = makeCharacters(['Doug', 'Monica']);
+    const result = selectSpeaker(participants, characters, 'you guys, what do you think?');
+    assert.deepEqual(result.map(p => p.id), ['part-0', 'part-1']);
+});
+
+test('"what do you guys think" selects all participants', () => {
+    const participants = makeParticipants(['Doug', 'Monica']);
+    const characters = makeCharacters(['Doug', 'Monica']);
+    const result = selectSpeaker(participants, characters, 'what do you guys think?');
+    assert.deepEqual(result.map(p => p.id), ['part-0', 'part-1']);
+});
+
+test('"hey guys" selects all participants in a three-character chat', () => {
+    const participants = makeParticipants(['Doug', 'Monica', 'Rachel']);
+    const characters = makeCharacters(['Doug', 'Monica', 'Rachel']);
+    const result = selectSpeaker(participants, characters, 'hey guys, say hi');
+    assert.deepEqual(result.map(p => p.id), ['part-0', 'part-1', 'part-2']);
+});
+
+test('"you folks" selects all participants in a two-character chat', () => {
+    const participants = makeParticipants(['Doug', 'Monica']);
+    const characters = makeCharacters(['Doug', 'Monica']);
+    const result = selectSpeaker(participants, characters, 'you folks, what do you think?');
+    assert.deepEqual(result.map(p => p.id), ['part-0', 'part-1']);
+});
+
+test('"hey folks" selects all participants in a two-character chat', () => {
+    const participants = makeParticipants(['Doug', 'Monica']);
+    const characters = makeCharacters(['Doug', 'Monica']);
+    const result = selectSpeaker(participants, characters, 'hey folks');
+    assert.deepEqual(result.map(p => p.id), ['part-0', 'part-1']);
+});
+
+test('"I saw those guys yesterday" does NOT select the whole group', () => {
+    const participants = makeParticipants(['Doug', 'Monica']);
+    const characters = makeCharacters(['Doug', 'Monica']);
+    const result = selectSpeaker(participants, characters, 'I saw those guys yesterday');
+    assert.equal(result.length, 1);
+    assert.equal(result[0].id, 'part-0');
+});
+
+test('"the guys next door" does NOT select the whole group', () => {
+    const participants = makeParticipants(['Doug', 'Monica']);
+    const characters = makeCharacters(['Doug', 'Monica']);
+    const result = selectSpeaker(participants, characters, 'the guys next door are loud');
+    assert.equal(result.length, 1);
+    assert.equal(result[0].id, 'part-0');
+});
+
+test('"these guys are cool" does NOT select the whole group', () => {
+    const participants = makeParticipants(['Doug', 'Monica']);
+    const characters = makeCharacters(['Doug', 'Monica']);
+    const result = selectSpeaker(participants, characters, 'these guys are cool');
+    assert.equal(result.length, 1);
+    assert.equal(result[0].id, 'part-0');
+});
+
+test('"guys" alone without a second-person or vocative marker does NOT select the whole group', () => {
+    const participants = makeParticipants(['Doug', 'Monica']);
+    const characters = makeCharacters(['Doug', 'Monica']);
+    const result = selectSpeaker(participants, characters, 'my guys are coming over');
+    assert.equal(result.length, 1);
+    assert.equal(result[0].id, 'part-0');
+});

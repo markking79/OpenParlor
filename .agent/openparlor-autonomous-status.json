@@ -1,6 +1,6 @@
 {
-  "state": "plan_complete",
-  "currentTask": "TASK-PERF-003",
-  "updatedAt": "2026-09-22T00:00:00Z",
-  "note": "All planned local-stack tasks audited or accepted; latest pushed commit is aab496c05."
+  "state": "running",
+  "currentTask": "DOGFOOD-001",
+  "updatedAt": "2026-09-22T23:25:00-04:00",
+  "note": "Dogfood repair batch 001 started under Codex supervision."
 }
