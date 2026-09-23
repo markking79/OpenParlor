@@ -77,6 +77,7 @@ import { normalizeMemory, normalizeMemorySource, validateMemoryForm } from './me
 import { createFirstTokenEstimator, estimateResponseStartProgress, formatResponseStartProgress } from './progress.js';
 import { fetchDeferredPrerequisite, normalizeHealthStatus, normalizeModelStatus } from './settings.js';
 import {
+    createContinuousRecorder,
     createGroupPlaybackQueue,
     createPlaybackController,
     createRecorderController,
@@ -88,6 +89,12 @@ import {
     shouldAutoSendTranscription,
     shouldAutoSpeak,
 } from './audio.js';
+import {
+    HANDSFREE_STATES,
+    createHandsFreeController,
+    handsFreeStatusText,
+    normalizeHandsFreePreference,
+} from './handsfree.js';
 // ─── Browser application ─────────────────────────────────────────────────────
 
 if (typeof document !== 'undefined') {
@@ -116,6 +123,8 @@ if (typeof document !== 'undefined') {
     const modelStatusBody = document.getElementById('modelStatusBody');
     const autoSpeakButton = document.getElementById('autoSpeakButton');
     const voiceModeButton = document.getElementById('voiceModeButton');
+    const handsFreeButton = document.getElementById('handsFreeButton');
+    const handsFreeStatus = document.getElementById('handsFreeStatus');
 
     // ── Sidebar collapse/restore ──────────────────────────────────────────
 
@@ -190,9 +199,14 @@ if (typeof document !== 'undefined') {
         onAllDone: () => {
             if (isDev) voiceTurnTimer.log();
             voiceTurnTimer.cancel();
+            if (handsfree) handsfree.markSpeakingEnd();
         },
     });
     let selectionEpoch = 0;
+    // Hands-free controller: declared before the group queue so playback
+    // completion can resume listening; instantiated near the recorder
+    // controls once all pipeline pieces exist.
+    let handsfree = null;
     let recordingInterruptionPending = false;
     let streamAbortController = null;
     const isDev = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
@@ -560,12 +574,24 @@ if (typeof document !== 'undefined') {
                 playBtn.setAttribute('aria-label', 'Play message');
                 playBtn.textContent = '▶';
                 playBtn.addEventListener('click', async () => {
+                    const hf = handsfree;
+                    const willSpeak = !!(hf && hf.state !== HANDSFREE_STATES.OFF);
+                    let manualEndArmed = false;
+                    // play() calls stop() internally before starting, so the
+                    // onEnded hook is only armed after playback has begun.
+                    playback.onEnded = () => {
+                        if (willSpeak && manualEndArmed && hf) hf.markSpeakingEnd();
+                    };
                     try {
                         groupQueue.clear();
+                        if (willSpeak) hf.markSpeakingStart();
                         await playback.play(msg.content, voice);
+                        manualEndArmed = true;
                         updatePlaybackButtons();
                     } catch {
-                        // silent
+                        manualEndArmed = true;
+                        playback.onEnded = null;
+                        if (willSpeak && hf) hf.markSpeakingEnd();
                     }
                 });
 
@@ -576,6 +602,7 @@ if (typeof document !== 'undefined') {
                 stopBtn.addEventListener('click', () => {
                     groupQueue.clear();
                     playback.stop();
+                    if (handsfree) handsfree.markSpeakingEnd();
                     updatePlaybackButtons();
                 });
 
@@ -584,12 +611,22 @@ if (typeof document !== 'undefined') {
                 replayBtn.setAttribute('aria-label', 'Replay message');
                 replayBtn.textContent = '↺';
                 replayBtn.addEventListener('click', async () => {
+                    const hf = handsfree;
+                    const willSpeak = !!(hf && hf.state !== HANDSFREE_STATES.OFF);
+                    let manualEndArmed = false;
+                    playback.onEnded = () => {
+                        if (willSpeak && manualEndArmed && hf) hf.markSpeakingEnd();
+                    };
                     try {
                         groupQueue.clear();
+                        if (willSpeak) hf.markSpeakingStart();
                         await playback.replay(msg.content, voice);
+                        manualEndArmed = true;
                         updatePlaybackButtons();
                     } catch {
-                        // silent
+                        manualEndArmed = true;
+                        playback.onEnded = null;
+                        if (willSpeak && hf) hf.markSpeakingEnd();
                     }
                 });
 
@@ -624,6 +661,7 @@ if (typeof document !== 'undefined') {
             sendButton.disabled = true;
             updateAutoSpeakButton();
             updateVoiceModeButton();
+            updateHandsFreeUI();
             renderParticipants();
             return;
         }
@@ -634,6 +672,7 @@ if (typeof document !== 'undefined') {
         sendButton.disabled = false;
         updateAutoSpeakButton();
         updateVoiceModeButton();
+        updateHandsFreeUI();
         renderParticipants();
     }
 
@@ -1571,6 +1610,7 @@ if (typeof document !== 'undefined') {
             playback.stop();
             voiceTurnTimer.cancel();
             recorder.cancel();
+            if (handsfree) handsfree.invalidate();
             isSending = false;
             sendButton.disabled = true;
             messageInput.disabled = true;
@@ -1627,6 +1667,7 @@ if (typeof document !== 'undefined') {
         voiceTurnTimer.cancel();
         stopPendingStart();
         invalidateMemoryState();
+        if (handsfree) handsfree.invalidate();
         try {
             renderState(messagesEl, 'loading', 'Loading…');
             await fetchConversation(id);
@@ -1656,6 +1697,7 @@ if (typeof document !== 'undefined') {
             const conv = await createConversation(charId, title);
             conversations.unshift(conv);
             currentConversation = conv;
+            if (handsfree) handsfree.invalidate();
             currentMessages = [];
             renderConversations();
             renderMessages();
@@ -1723,7 +1765,9 @@ if (typeof document !== 'undefined') {
 
     async function sendMessage() {
         const text = messageInput.value.trim();
-        if (!text || isSending || !currentConversation) return;
+        // Returns whether the message was actually dispatched; the
+        // hands-free controller treats a skipped send as a send error.
+        if (!text || isSending || !currentConversation) return false;
 
         const sendConversationId = currentConversation.id;
         const sendEpoch = selectionEpoch;
@@ -1780,7 +1824,8 @@ if (typeof document !== 'undefined') {
                 stopPendingStart();
                 if (isDev) voiceTurnTimer.log();
                 voiceTurnTimer.cancel();
-                return;
+                if (handsfree) handsfree.markResponseComplete();
+                return true;
             }
 
             const parser = createNdjsonParser();
@@ -1879,18 +1924,27 @@ if (typeof document !== 'undefined') {
                 }
                 if (groupQueue.pending > 0) {
                     ttsHandled = true;
-                    groupQueue.playAll().catch(() => {});
+                    // Hands-free: one speaking phase covers the whole queued
+                    // group reply (all items, including gaps); listening
+                    // resumes only when the final item has actually ended
+                    // (groupQueue.onAllDone → markSpeakingEnd).
+                    if (handsfree) handsfree.markSpeakingStart();
+                    groupQueue.playAll().catch(() => {
+                        if (handsfree) handsfree.markSpeakingEnd();
+                    });
                     updatePlaybackButtons();
                 }
             }
             if (!ttsHandled) {
                 if (isDev) voiceTurnTimer.log();
                 voiceTurnTimer.cancel();
+                if (handsfree) handsfree.markResponseComplete();
             }
         } catch (e) {
             if (e && e.name === 'AbortError') {
                 stopPendingStart();
-                return;
+                if (handsfree) handsfree.markResponseComplete();
+                return true;
             }
             currentAssistantMsg.content = 'Connection error';
             if (lastBubble) lastBubble.textContent = currentAssistantMsg.content;
@@ -1899,6 +1953,7 @@ if (typeof document !== 'undefined') {
             stopPendingStart();
             if (isDev) voiceTurnTimer.log();
             voiceTurnTimer.cancel();
+            if (handsfree) handsfree.markResponseComplete();
         } finally {
             // Clear this stream's pending state on completion; the guard
             // keeps a newer conversation's state (if any) untouched.
@@ -1911,6 +1966,7 @@ if (typeof document !== 'undefined') {
                 sendButton.disabled = false;
             }
         }
+        return true;
     }
 
     // ── Event listeners ────────────────────────────────────────────────────
@@ -1959,6 +2015,7 @@ if (typeof document !== 'undefined') {
             if (!newState) {
                 groupQueue.clear();
                 playback.stop();
+                if (handsfree) handsfree.markSpeakingEnd();
                 updatePlaybackButtons();
             }
             updateAutoSpeakButton();
@@ -1973,6 +2030,7 @@ if (typeof document !== 'undefined') {
             if (!newState) {
                 groupQueue.clear();
                 playback.stop();
+                if (handsfree) handsfree.markSpeakingEnd();
                 updatePlaybackButtons();
             }
             updateVoiceModeButton();
@@ -2063,6 +2121,8 @@ if (typeof document !== 'undefined') {
 
     if (recordButton) {
         recordButton.addEventListener('click', async () => {
+            // Hands-free owns the microphone while active.
+            if (handsfree && handsfree.state !== HANDSFREE_STATES.OFF) return;
             recordingInterruptionPending = true;
             playback.stop();
             updatePlaybackButtons();
@@ -2113,6 +2173,246 @@ if (typeof document !== 'undefined') {
             updateTranscriptionStatus();
         });
     }
+
+    // ── Hands-free conversation mode (TASK-VOICE-HANDSFREE-001) ─────────────
+    //
+    // Browser-local half-duplex voice loop. The microphone never streams to
+    // STT: an energy VAD fed by AudioWorklet frames detects utterances, the
+    // continuous recorder finalizes each utterance as a blob, and the blob
+    // goes through the EXISTING transcription controller → STT endpoint →
+    // auto send. Enabling always requires an explicit user gesture; the
+    // persisted preference only remembers that hands-free was preferred.
+
+    const HANDSFREE_PREF_KEY = 'openparlor-hands-free';
+
+    function getHandsFreePreference() {
+        try {
+            return normalizeHandsFreePreference(localStorage.getItem(HANDSFREE_PREF_KEY));
+        } catch {
+            return false;
+        }
+    }
+
+    function setHandsFreePreference(enabled) {
+        try {
+            localStorage.setItem(HANDSFREE_PREF_KEY, enabled ? 'true' : 'false');
+        } catch { /* storage unavailable */ }
+    }
+
+    // AudioWorklet that chunks the mic stream into ~21 ms mono frames and
+    // posts { samples, sampleRate } to the main thread for VAD analysis.
+    const HANDSFREE_WORKLET_SOURCE = `class OpHandsFreeFrames extends AudioWorkletProcessor {
+    constructor() {
+        super();
+        this.buffer = new Float32Array(1024);
+        this.offset = 0;
+    }
+    process(inputs) {
+        const input = inputs[0];
+        if (!input || input.length === 0 || input[0].length === 0) return true;
+        const channel = input[0][0];
+        for (let i = 0; i < channel.length; i += 1) {
+            this.buffer[this.offset] = channel[i];
+            this.offset += 1;
+            if (this.offset === this.buffer.length) {
+                this.port.postMessage({ samples: this.buffer.slice(), sampleRate });
+                this.offset = 0;
+            }
+        }
+        return true;
+    }
+}
+registerProcessor('op-handsfree-frames', OpHandsFreeFrames);`;
+
+    // Active hands-free audio-analysis session (context + mic stream).
+    let handsFreeAudio = null;
+
+    function stopHandsFreeAudio() {
+        if (!handsFreeAudio) return;
+        const session = handsFreeAudio;
+        handsFreeAudio = null;
+        try {
+            if (session.node) {
+                session.node.port.onmessage = null;
+                session.node.disconnect();
+            }
+        } catch { /* ignore */ }
+        try {
+            if (session.sink) session.sink.disconnect();
+        } catch { /* ignore */ }
+        try {
+            if (session.source) session.source.disconnect();
+        } catch { /* ignore */ }
+        if (session.stream) {
+            for (const track of session.stream.getTracks()) track.stop();
+        }
+        if (session.workletUrl) {
+            try {
+                URL.revokeObjectURL(session.workletUrl);
+            } catch { /* ignore */ }
+        }
+        if (session.ctx && session.ctx.state !== 'closed') {
+            session.ctx.close().catch(() => {});
+        }
+    }
+
+    async function startHandsFreeAudio() {
+        const AudioCtx = (typeof window.AudioContext !== 'undefined')
+            ? window.AudioContext
+            : (typeof window.webkitAudioContext !== 'undefined' ? window.webkitAudioContext : null);
+        if (!AudioCtx) throw new Error('Web Audio API is not supported');
+        let stream;
+        try {
+            stream = await navigator.mediaDevices.getUserMedia({
+                audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
+            });
+        } catch {
+            stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        }
+        const ctx = new AudioCtx();
+        if (ctx.state === 'suspended') await ctx.resume();
+        const source = ctx.createMediaStreamSource(stream);
+        // The zero-gain sink keeps the graph running without re-emitting the
+        // mic through the speakers (which would feed back into the VAD).
+        const sink = ctx.createGain();
+        sink.gain.value = 0;
+        sink.connect(ctx.destination);
+        let node = null;
+        let workletUrl = null;
+        if (ctx.audioWorklet) {
+            try {
+                workletUrl = URL.createObjectURL(new Blob([HANDSFREE_WORKLET_SOURCE], { type: 'text/javascript' }));
+                await ctx.audioWorklet.addModule(workletUrl);
+                node = new AudioWorkletNode(ctx, 'op-handsfree-frames');
+                node.port.onmessage = (event) => {
+                    if (event.data && handsfree) handsfree.onAudioFrame(event.data);
+                };
+            } catch {
+                if (workletUrl) {
+                    try {
+                        URL.revokeObjectURL(workletUrl);
+                    } catch { /* ignore */ }
+                    workletUrl = null;
+                }
+            }
+        }
+        if (!node) {
+            // Legacy fallback: ScriptProcessor delivers larger (~85 ms)
+            // frames; the VAD is frame-rate agnostic.
+            node = ctx.createScriptProcessor(4096, 1, 1);
+            node.onaudioprocess = (event) => {
+                if (handsfree) handsfree.onAudioFrame({
+                    samples: event.inputBuffer.getChannelData(0),
+                    sampleRate: ctx.sampleRate,
+                });
+            };
+        }
+        source.connect(node);
+        node.connect(sink);
+        handsFreeAudio = { ctx, source, node, sink, stream, workletUrl };
+        for (const track of stream.getTracks()) {
+            track.addEventListener('ended', () => {
+                if (handsfree) handsfree.onDeviceLost();
+                stopHandsFreeAudio();
+            });
+        }
+    }
+
+    const handsFreeRecorder = createContinuousRecorder({});
+
+    handsfree = createHandsFreeController({
+        getConversationId: () => (currentConversation ? currentConversation.id : ''),
+        getEpoch: () => selectionEpoch,
+        startListening: async () => {
+            await handsFreeRecorder.start();
+            try {
+                await startHandsFreeAudio();
+            } catch (e) {
+                handsFreeRecorder.stop();
+                throw e;
+            }
+        },
+        stopListening: () => {
+            stopHandsFreeAudio();
+            handsFreeRecorder.stop();
+        },
+        getUtteranceBlob: (sinceMs) => handsFreeRecorder.collectBlob(sinceMs),
+        clearUtteranceBuffer: () => handsFreeRecorder.clearBuffer(),
+        transcribe: async (blob) => {
+            voiceTurnTimer.markRecordingEnd();
+            return transcription.transcribe(blob);
+        },
+        onSendText: async (text) => {
+            messageInput.value = text;
+            const sent = await sendMessage();
+            if (sent !== true) throw new Error('send skipped');
+        },
+        onStateChange: (state) => {
+            updateHandsFreeUI();
+            if (state === HANDSFREE_STATES.HEARING) voiceTurnTimer.start();
+        },
+    });
+
+    function updateHandsFreeUI() {
+        const hfState = handsfree ? handsfree.state : HANDSFREE_STATES.OFF;
+        const hfInfo = handsfree ? handsfree.stateInfo : {};
+        const active = hfState !== HANDSFREE_STATES.OFF;
+        if (handsFreeButton) {
+            if (!currentConversation) {
+                handsFreeButton.hidden = true;
+            } else {
+                handsFreeButton.hidden = false;
+                handsFreeButton.setAttribute('aria-pressed', String(active));
+                handsFreeButton.textContent = active ? 'Hands-free: On' : 'Hands-free: Off';
+            }
+        }
+        if (handsFreeStatus) {
+            let text = '';
+            if (currentConversation) {
+                if (hfState === HANDSFREE_STATES.OFF) {
+                    text = getHandsFreePreference() ? 'Hands-free preferred · click to start' : '';
+                } else {
+                    const char = findCharacter(currentConversation.characterId);
+                    text = handsFreeStatusText(hfState, {
+                        characterName: char ? char.name : '',
+                        error: hfInfo.error || '',
+                    });
+                }
+            }
+            handsFreeStatus.textContent = text;
+            handsFreeStatus.hidden = !text;
+        }
+        if (recordButton) {
+            if (active) {
+                recordButton.disabled = true;
+            } else {
+                updateRecorderUI();
+            }
+        }
+    }
+
+    if (handsFreeButton) {
+        handsFreeButton.addEventListener('click', () => {
+            const state = handsfree.state;
+            if (state === HANDSFREE_STATES.OFF || state === HANDSFREE_STATES.ERROR) {
+                if (!currentConversation) return;
+                if (recorder.state === 'recording') return; // manual recording owns the mic
+                setHandsFreePreference(true);
+                // enable() drives the UI via onStateChange; failures land in
+                // a controlled error state that this same button can retry.
+                handsfree.enable().catch(() => {});
+            } else {
+                setHandsFreePreference(false);
+                handsfree.disable();
+            }
+        });
+    }
+
+    // Release the microphone when the page is hidden/closed so the mic
+    // indicator never lingers.
+    window.addEventListener('pagehide', () => {
+        if (handsfree && handsfree.state !== HANDSFREE_STATES.OFF) handsfree.disable();
+    });
 
     // ── Initial load ───────────────────────────────────────────────────────
 
