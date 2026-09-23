@@ -20,6 +20,11 @@ import {
     createRecorderController,
     createTranscriptionController,
     createVoiceTurnTimer,
+    createFirstTokenEstimator,
+    estimateResponseStartProgress,
+    formatResponseStartProgress,
+    DEFAULT_FIRST_TOKEN_MS,
+    PROGRESS_CAP,
 } from '../../public/openparlor/openparlor.js';
 import { validateConversationTitle, createScrollScheduler, normalizeSidebarCollapsed, createSidebarState, shouldShowMemorySection, createMemoryRefreshGuard } from '../../public/openparlor/app.js';
 
@@ -1615,10 +1620,12 @@ describe('createScrollScheduler', () => {
     test('does not invoke callback if no schedule was called', () => {
         const { rafFn, callbacks, flush } = makeMockRaf();
         const scheduler = createScrollScheduler(rafFn);
+        assert.ok(scheduler, 'scheduler created');
         // No schedule calls
         assert.equal(callbacks.length, 0);
         flush();
         // Nothing should have happened
+        assert.equal(callbacks.length, 0, 'still nothing after flush');
     });
 
     test('works with synchronous rafFn (immediate execution)', () => {
@@ -1833,7 +1840,7 @@ describe('createMemoryRefreshGuard', () => {
 
     test('latest generation is current', () => {
         const guard = createMemoryRefreshGuard();
-        const g1 = guard.begin();
+        guard.begin(); // an earlier generation
         const g2 = guard.begin();
         assert.equal(guard.isCurrent(g2), true);
     });
@@ -1861,5 +1868,121 @@ describe('createMemoryRefreshGuard', () => {
         const guard = createMemoryRefreshGuard();
         const gen = guard.begin();
         assert.equal(guard.isCurrent(gen), true);
+    });
+});
+
+// ─── Estimated response-start progress (DOGFOOD-007) ────────────────────────
+
+function createMemoryStorage() {
+    const map = new Map();
+    return {
+        getItem: (k) => (map.has(k) ? map.get(k) : null),
+        setItem: (k, v) => { map.set(k, String(v)); },
+        removeItem: (k) => { map.delete(k); },
+    };
+}
+
+describe('createFirstTokenEstimator', () => {
+    test('uses conservative default when no history exists', () => {
+        const est = createFirstTokenEstimator({ storage: null });
+        assert.equal(est.expectedMs(), DEFAULT_FIRST_TOKEN_MS);
+    });
+
+    test('EMA moves toward observed samples', () => {
+        const est = createFirstTokenEstimator({ storage: null, alpha: 0.5 });
+        est.observe(4000);
+        // 0.5 * 4000 + 0.5 * 8000
+        assert.ok(Math.abs(est.expectedMs() - 6000) < 1e-9);
+        est.observe(2000);
+        assert.ok(Math.abs(est.expectedMs() - 4000) < 1e-9);
+    });
+
+    test('repeated observations converge on stable latency', () => {
+        const est = createFirstTokenEstimator({ storage: null, alpha: 0.3 });
+        for (let i = 0; i < 20; i++) est.observe(3000);
+        assert.ok(est.expectedMs() < 3200);
+    });
+
+    test('ignores invalid samples', () => {
+        const est = createFirstTokenEstimator({ storage: null });
+        est.observe(NaN);
+        est.observe(-100);
+        est.observe(0);
+        est.observe(undefined);
+        assert.equal(est.expectedMs(), DEFAULT_FIRST_TOKEN_MS);
+    });
+
+    test('persists to and loads from storage', () => {
+        const storage = createMemoryStorage();
+        const est = createFirstTokenEstimator({ storage, alpha: 1 });
+        est.observe(2500);
+        assert.equal(est.expectedMs(), 2500);
+        const next = createFirstTokenEstimator({ storage });
+        assert.equal(next.expectedMs(), 2500);
+    });
+
+    test('falls back to default on corrupted storage', () => {
+        const storage = createMemoryStorage();
+        storage.setItem('openparlor-first-token-ema-ms', 'not-a-number');
+        const est = createFirstTokenEstimator({ storage });
+        assert.equal(est.expectedMs(), DEFAULT_FIRST_TOKEN_MS);
+    });
+
+    test('reset restores the default', () => {
+        const est = createFirstTokenEstimator({ storage: null });
+        est.observe(1200);
+        est.reset();
+        assert.equal(est.expectedMs(), DEFAULT_FIRST_TOKEN_MS);
+    });
+});
+
+describe('estimateResponseStartProgress', () => {
+    test('is 0 before any elapsed time', () => {
+        assert.equal(estimateResponseStartProgress({ elapsedMs: 0, expectedMs: 8000 }), 0);
+    });
+
+    test('rises gradually with elapsed time', () => {
+        const p1 = estimateResponseStartProgress({ elapsedMs: 2000, expectedMs: 8000 });
+        const p2 = estimateResponseStartProgress({ elapsedMs: 4000, expectedMs: 8000 });
+        assert.ok(p1 > 0 && p2 > p1);
+        assert.ok(Math.abs(p1 - 0.25) < 1e-9);
+    });
+
+    test('caps below 100% while waiting', () => {
+        const p = estimateResponseStartProgress({ elapsedMs: 600000, expectedMs: 8000 });
+        assert.ok(p < 1);
+        assert.ok(p <= PROGRESS_CAP);
+    });
+
+    test('never reaches 1 for any finite elapsed time', () => {
+        for (const elapsed of [1, 1000, 8000, 60000, 3600000]) {
+            assert.ok(estimateResponseStartProgress({ elapsedMs: elapsed, expectedMs: 8000 }) < 1);
+        }
+    });
+
+    test('handles invalid input conservatively', () => {
+        assert.equal(estimateResponseStartProgress({ elapsedMs: NaN, expectedMs: 8000 }), 0);
+        // Missing expected falls back to the conservative default (8000ms).
+        const p = estimateResponseStartProgress({ elapsedMs: 4000, expectedMs: undefined });
+        assert.ok(Math.abs(p - 0.5) < 1e-9);
+    });
+});
+
+describe('formatResponseStartProgress', () => {
+    test('includes speaker name and tilde estimate', () => {
+        assert.equal(formatResponseStartProgress('Monica', 0.45), 'Monica · ~45%');
+    });
+
+    test('marks the value as estimated with ~', () => {
+        assert.ok(formatResponseStartProgress('Monica', 0.92).includes('~'));
+    });
+
+    test('never formats 100%', () => {
+        assert.equal(formatResponseStartProgress('Monica', 0.92), 'Monica · ~92%');
+        assert.ok(!formatResponseStartProgress('Monica', 1).includes('100%'));
+    });
+
+    test('handles empty name', () => {
+        assert.equal(formatResponseStartProgress('', 0.1), '~10%');
     });
 });
