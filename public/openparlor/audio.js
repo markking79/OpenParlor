@@ -126,6 +126,7 @@ export function selectSupportedMime(candidates, isTypeSupported) {
  *   mimeCandidates?: string[],
  *   now?: () => number,
  *   onStateChange?: (state: string) => void,
+ *   ownsStream?: boolean,
  * }} [deps]
  * @returns {{
  *   state: 'idle'|'recording'|'error',
@@ -140,6 +141,10 @@ export function selectSupportedMime(candidates, isTypeSupported) {
 export function createContinuousRecorder(deps = {}) {
     const {
         getUserMedia = (constraints) => navigator.mediaDevices.getUserMedia(constraints),
+        // When false, getUserMedia() returns a stream owned by the caller
+        // (e.g. shared with the Web Audio VAD graph); the recorder borrows
+        // it and must never stop its tracks.
+        ownsStream = true,
         MediaRecorderCtor = (typeof MediaRecorder !== 'undefined') ? MediaRecorder : null,
         constraints = { audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 } },
         fallbackConstraint = { audio: true },
@@ -164,7 +169,9 @@ export function createContinuousRecorder(deps = {}) {
 
     function cleanup() {
         if (stream) {
-            for (const track of stream.getTracks()) track.stop();
+            if (ownsStream) {
+                for (const track of stream.getTracks()) track.stop();
+            }
             stream = null;
         }
         if (recorder) {

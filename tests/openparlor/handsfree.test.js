@@ -9,8 +9,10 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import vm from 'node:vm';
 import {
     HANDSFREE_STATES,
+    HANDSFREE_WORKLET_SOURCE,
     computeFrameRms,
     createEnergyVad,
     createHandsFreeController,
@@ -115,6 +117,65 @@ describe('handsFreeStatusText', () => {
         );
     });
 });
+// ─── HANDSFREE_WORKLET_SOURCE ────────────────────────────────────────────────
+// The worklet ships as a source string loaded by the browser; execute it here
+// against a fake AudioWorkletProcessor to lock in the channel indexing.
+// `inputs[0]` is the input port's channel list, so `inputs[0][0]` is channel
+// 0's Float32Array — a regression to `inputs[0][0][0]` would hand the VAD a
+// scalar sample and silently post no frames at all.
+
+function runWorkletSource() {
+    const posted = [];
+    let Ctor = null;
+    const sandbox = {
+        sampleRate: 16000,
+        registerProcessor: (name, ctor) => { Ctor = ctor; },
+        AudioWorkletProcessor: class {
+            constructor() {
+                this.port = { postMessage: (msg) => posted.push(msg) };
+            }
+        },
+    };
+    vm.runInContext(HANDSFREE_WORKLET_SOURCE, vm.createContext(sandbox));
+    return { proc: new Ctor(), posted };
+}
+
+describe('HANDSFREE_WORKLET_SOURCE', () => {
+    it('posts frames built from channel 0 of the input port', () => {
+        const { proc, posted } = runWorkletSource();
+        const ch0 = new Float32Array(1024).fill(0.25);
+        const ch1 = new Float32Array(1024).fill(-0.75);
+        assert.equal(proc.process([[ch0, ch1]]), true, 'the processor keeps running');
+        assert.equal(posted.length, 1);
+        const { samples, sampleRate } = posted[0];
+        // Structural check: the vm context has its own Float32Array global,
+        // so instanceof would be cross-realm false.
+        assert.ok(ArrayBuffer.isView(samples) && samples.BYTES_PER_ELEMENT === 4,
+            'samples must be a Float32Array');
+        assert.equal(samples.length, 1024);
+        assert.equal(samples[0], 0.25, 'must read channel 0, not a scalar sample');
+        assert.equal(sampleRate, 16000);
+    });
+
+    it('accumulates partial frames before posting', () => {
+        const { proc, posted } = runWorkletSource();
+        proc.process([[new Float32Array(512).fill(0.25)]]);
+        assert.equal(posted.length, 0, 'half a buffer is held back');
+        proc.process([[new Float32Array(512).fill(0.5)]]);
+        assert.equal(posted.length, 1);
+        assert.equal(posted[0].samples[0], 0.25);
+        assert.equal(posted[0].samples[512], 0.5);
+    });
+
+    it('survives empty and absent input shapes without posting', () => {
+        const { proc, posted } = runWorkletSource();
+        assert.equal(proc.process([]), true);
+        assert.equal(proc.process([[]]), true);
+        assert.equal(proc.process([[[]]]), true);
+        assert.equal(posted.length, 0);
+    });
+});
+
 // ─── createEnergyVad ─────────────────────────────────────────────────────────
 
 describe('createEnergyVad', () => {
@@ -756,6 +817,20 @@ describe('createContinuousRecorder', () => {
         await rec.start();
         assert.equal(rec.state, 'error');
         assert.equal(rec.error, 'MediaRecorder is not supported in this browser.');
+    });
+
+    it('borrows a shared stream without stopping its tracks', async () => {
+        const m = makeFakeMedia();
+        const rec = createContinuousRecorder({
+            getUserMedia: () => Promise.resolve(m.stream),
+            MediaRecorderCtor: m.Ctor,
+            ownsStream: false,
+        });
+        await rec.start();
+        assert.equal(rec.state, 'recording');
+        rec.stop();
+        assert.equal(m.stopped.length, 0, 'a borrowed stream is never stopped by the recorder');
+        assert.equal(rec.state, 'idle');
     });
 
     it('stop() is safe when nothing is active', () => {

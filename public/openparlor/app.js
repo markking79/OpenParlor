@@ -91,6 +91,7 @@ import {
 } from './audio.js';
 import {
     HANDSFREE_STATES,
+    HANDSFREE_WORKLET_SOURCE,
     createHandsFreeController,
     handsFreeStatusText,
     normalizeHandsFreePreference,
@@ -2199,33 +2200,39 @@ if (typeof document !== 'undefined') {
         } catch { /* storage unavailable */ }
     }
 
-    // AudioWorklet that chunks the mic stream into ~21 ms mono frames and
-    // posts { samples, sampleRate } to the main thread for VAD analysis.
-    const HANDSFREE_WORKLET_SOURCE = `class OpHandsFreeFrames extends AudioWorkletProcessor {
-    constructor() {
-        super();
-        this.buffer = new Float32Array(1024);
-        this.offset = 0;
-    }
-    process(inputs) {
-        const input = inputs[0];
-        if (!input || input.length === 0 || input[0].length === 0) return true;
-        const channel = input[0][0];
-        for (let i = 0; i < channel.length; i += 1) {
-            this.buffer[this.offset] = channel[i];
-            this.offset += 1;
-            if (this.offset === this.buffer.length) {
-                this.port.postMessage({ samples: this.buffer.slice(), sampleRate });
-                this.offset = 0;
-            }
-        }
-        return true;
-    }
-}
-registerProcessor('op-handsfree-frames', OpHandsFreeFrames);`;
-
-    // Active hands-free audio-analysis session (context + mic stream).
+    // One Hands-Free session owns exactly ONE browser microphone capture
+    // (handsFreeStream), shared between the MediaRecorder utterance buffer
+    // and the Web Audio / VAD graph. The tracks are stopped exactly once,
+    // by stopHandsFreeStream() inside teardownHandsFreeAudio().
     let handsFreeAudio = null;
+    let handsFreeStream = null;
+
+    async function acquireHandsFreeStream() {
+        let stream;
+        try {
+            stream = await navigator.mediaDevices.getUserMedia({
+                audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
+            });
+        } catch {
+            stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        }
+        handsFreeStream = stream;
+        for (const track of stream.getTracks()) {
+            track.addEventListener('ended', () => {
+                if (handsfree) handsfree.onDeviceLost();
+                teardownHandsFreeAudio();
+            });
+        }
+        return stream;
+    }
+
+    function stopHandsFreeStream() {
+        const stream = handsFreeStream;
+        handsFreeStream = null;
+        if (stream) {
+            for (const track of stream.getTracks()) track.stop();
+        }
+    }
 
     function stopHandsFreeAudio() {
         if (!handsFreeAudio) return;
@@ -2243,9 +2250,6 @@ registerProcessor('op-handsfree-frames', OpHandsFreeFrames);`;
         try {
             if (session.source) session.source.disconnect();
         } catch { /* ignore */ }
-        if (session.stream) {
-            for (const track of session.stream.getTracks()) track.stop();
-        }
         if (session.workletUrl) {
             try {
                 URL.revokeObjectURL(session.workletUrl);
@@ -2256,19 +2260,22 @@ registerProcessor('op-handsfree-frames', OpHandsFreeFrames);`;
         }
     }
 
+    // Full teardown of one hands-free mic session. Idempotent, so it is safe
+    // to call from stopListening, the track 'ended' handler, and startup
+    // failure paths without double-stopping the shared stream's tracks.
+    function teardownHandsFreeAudio() {
+        stopHandsFreeAudio();
+        handsFreeRecorder.stop();
+        stopHandsFreeStream();
+    }
+
     async function startHandsFreeAudio() {
         const AudioCtx = (typeof window.AudioContext !== 'undefined')
             ? window.AudioContext
             : (typeof window.webkitAudioContext !== 'undefined' ? window.webkitAudioContext : null);
         if (!AudioCtx) throw new Error('Web Audio API is not supported');
-        let stream;
-        try {
-            stream = await navigator.mediaDevices.getUserMedia({
-                audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
-            });
-        } catch {
-            stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        }
+        const stream = handsFreeStream;
+        if (!stream) throw new Error('Microphone unavailable.');
         const ctx = new AudioCtx();
         if (ctx.state === 'suspended') await ctx.resume();
         const source = ctx.createMediaStreamSource(stream);
@@ -2309,32 +2316,33 @@ registerProcessor('op-handsfree-frames', OpHandsFreeFrames);`;
         }
         source.connect(node);
         node.connect(sink);
-        handsFreeAudio = { ctx, source, node, sink, stream, workletUrl };
-        for (const track of stream.getTracks()) {
-            track.addEventListener('ended', () => {
-                if (handsfree) handsfree.onDeviceLost();
-                stopHandsFreeAudio();
-            });
-        }
+        handsFreeAudio = { ctx, source, node, sink, workletUrl };
     }
 
-    const handsFreeRecorder = createContinuousRecorder({});
+    // The recorder does not open its own microphone: it borrows the shared
+    // hands-free stream and must not stop tracks it does not own.
+    const handsFreeRecorder = createContinuousRecorder({
+        getUserMedia: () => Promise.resolve(handsFreeStream),
+        ownsStream: false,
+    });
 
     handsfree = createHandsFreeController({
         getConversationId: () => (currentConversation ? currentConversation.id : ''),
         getEpoch: () => selectionEpoch,
         startListening: async () => {
-            await handsFreeRecorder.start();
+            // Acquire the single shared mic capture, then hand the same
+            // stream to both consumers.
+            await acquireHandsFreeStream();
             try {
+                await handsFreeRecorder.start();
                 await startHandsFreeAudio();
             } catch (e) {
-                handsFreeRecorder.stop();
+                teardownHandsFreeAudio();
                 throw e;
             }
         },
         stopListening: () => {
-            stopHandsFreeAudio();
-            handsFreeRecorder.stop();
+            teardownHandsFreeAudio();
         },
         getUtteranceBlob: (sinceMs) => handsFreeRecorder.collectBlob(sinceMs),
         clearUtteranceBuffer: () => handsFreeRecorder.clearBuffer(),

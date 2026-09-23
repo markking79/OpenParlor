@@ -11,5 +11,5 @@ export { buildCardExportFilename, normalizeCharacter, sanitizeCharacterInput, va
 export { normalizeMemory, normalizeMemorySource, validateMemoryForm } from './memory.js';
 export { checkLocalReadiness, fetchDeferredPrerequisite, normalizeAudioReadiness, normalizeChatReadiness, normalizeDeferredPrerequisite, normalizeHealthStatus, normalizeModelStatus, normalizeSettings } from './settings.js';
 export { createContinuousRecorder, createGroupPlaybackQueue, createPlaybackController, createRecorderController, createTranscriptionController, createVoiceTurnTimer, normalizeAutoSpeakState, normalizeTtsVoices, normalizeVoiceModeState, selectSupportedMime, shouldAutoSendTranscription, shouldAutoSpeak } from './audio.js';
-export { HANDSFREE_ERROR_TEXT, HANDSFREE_STATES, computeFrameRms, createEnergyVad, createHandsFreeController, handsFreeStatusText, normalizeHandsFreePreference } from './handsfree.js';
+export { HANDSFREE_ERROR_TEXT, HANDSFREE_STATES, HANDSFREE_WORKLET_SOURCE, computeFrameRms, createEnergyVad, createHandsFreeController, handsFreeStatusText, normalizeHandsFreePreference } from './handsfree.js';
 export { createFirstTokenEstimator, estimateResponseStartProgress, formatResponseStartProgress, DEFAULT_FIRST_TOKEN_MS, PROGRESS_CAP } from './progress.js';

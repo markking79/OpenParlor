@@ -37,6 +37,36 @@ export const HANDSFREE_ERROR_TEXT = {
     'send': 'Message could not be sent. Retrying…',
 };
 
+// AudioWorklet that chunks the shared mic stream into ~21 ms mono frames and
+// posts { samples, sampleRate } to the main thread for VAD analysis.
+// NOTE on indexing: `inputs[0]` is the first input port's CHANNEL LIST, so
+// `inputs[0][0]` is channel 0's Float32Array — `inputs[0][0][0]` would be a
+// single sample. The processor must iterate the channel array, never a
+// scalar.
+export const HANDSFREE_WORKLET_SOURCE = `class OpHandsFreeFrames extends AudioWorkletProcessor {
+    constructor() {
+        super();
+        this.buffer = new Float32Array(1024);
+        this.offset = 0;
+    }
+    process(inputs) {
+        const input = inputs[0];
+        if (!input || input.length === 0) return true;
+        const channel = input[0];
+        if (!channel || channel.length === 0) return true;
+        for (let i = 0; i < channel.length; i += 1) {
+            this.buffer[this.offset] = channel[i];
+            this.offset += 1;
+            if (this.offset === this.buffer.length) {
+                this.port.postMessage({ samples: this.buffer.slice(), sampleRate });
+                this.offset = 0;
+            }
+        }
+        return true;
+    }
+}
+registerProcessor('op-handsfree-frames', OpHandsFreeFrames);`;
+
 /**
  * Normalizes the persisted hands-free preference.
  * @param {string|boolean|null|undefined} value
