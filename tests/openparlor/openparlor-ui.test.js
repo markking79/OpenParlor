@@ -21,6 +21,7 @@ import {
     createTranscriptionController,
     createVoiceTurnTimer,
 } from '../../public/openparlor/openparlor.js';
+import { validateConversationTitle } from '../../public/openparlor/app.js';
 
 // ─── formatRelativeTime ─────────────────────────────────────────────────────
 
@@ -72,7 +73,6 @@ describe('formatRelativeTime', () => {
         assert.doesNotMatch(result, /ago$/);
     });
 });
-
 // ─── normalizeConversation ──────────────────────────────────────────────────
 
 describe('normalizeConversation', () => {
@@ -1552,5 +1552,63 @@ describe('createStreamMessageCollector', () => {
         assert.equal(messages[1].content, 'Hi, I am Beta.');
         // B never replaced or erased A
         assert.notEqual(messages[0], messages[1], 'messages must be distinct objects');
+    });
+});
+
+// ─── validateConversationTitle (DOGFOOD-003) ──────────────────────────────────
+
+describe('validateConversationTitle', () => {
+    test('returns invalid for non-string input', () => {
+        assert.equal(validateConversationTitle(null).valid, false);
+        assert.equal(validateConversationTitle(42).valid, false);
+        assert.equal(validateConversationTitle(undefined).valid, false);
+    });
+
+    test('returns invalid for empty string', () => {
+        const result = validateConversationTitle('');
+        assert.equal(result.valid, false);
+        assert.ok(result.error);
+    });
+
+    test('returns invalid for whitespace-only string', () => {
+        const result = validateConversationTitle('   ');
+        assert.equal(result.valid, false);
+        assert.ok(result.error);
+    });
+
+    test('trims and returns valid title', () => {
+        const result = validateConversationTitle('  My Chat  ');
+        assert.equal(result.valid, true);
+        assert.equal(result.title, 'My Chat');
+        assert.equal(result.error, '');
+    });
+
+    test('returns valid for single character title', () => {
+        const result = validateConversationTitle('a');
+        assert.equal(result.valid, true);
+        assert.equal(result.title, 'a');
+    });
+
+    test('returns invalid for title exceeding 200 chars', () => {
+        const result = validateConversationTitle('a'.repeat(201));
+        assert.equal(result.valid, false);
+        assert.ok(result.error.includes('200'));
+    });
+
+    test('returns valid for title at exactly 200 chars', () => {
+        const result = validateConversationTitle('a'.repeat(200));
+        assert.equal(result.valid, true);
+        assert.equal(result.title.length, 200);
+    });
+
+    test('trims before checking length (200 chars + surrounding whitespace is valid)', () => {
+        const result = validateConversationTitle('  ' + 'a'.repeat(200) + '  ');
+        assert.equal(result.valid, true);
+        assert.equal(result.title.length, 200);
+    });
+
+    test('trims before checking length (201 chars + surrounding whitespace is invalid)', () => {
+        const result = validateConversationTitle('  ' + 'a'.repeat(201) + '  ');
+        assert.equal(result.valid, false);
     });
 });

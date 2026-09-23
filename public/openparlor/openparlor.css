@@ -143,6 +143,59 @@ button {
     gap: 2px;
 }
 
+.conversation-actions {
+    display: flex;
+    gap: 2px;
+    margin-top: 4px;
+    opacity: 0;
+    transition: opacity 0.15s;
+}
+
+.conversation:hover .conversation-actions,
+.conversation.active .conversation-actions,
+.conversation-actions:focus-within {
+    opacity: 1;
+}
+
+.conversation-rename-btn,
+.conversation-delete-btn {
+    border: 0;
+    background: transparent;
+    color: #858991;
+    font-size: 11px;
+    padding: 2px 5px;
+    border-radius: 4px;
+    cursor: pointer;
+    line-height: 1;
+}
+
+.conversation-rename-btn:hover {
+    background: #292b30;
+    color: #ececec;
+}
+
+.conversation-delete-btn:hover {
+    background: #3a2527;
+    color: #f0a0a0;
+}
+
+.conversation-rename-input {
+    width: 100%;
+    border: 1px solid #555860;
+    background: #111214;
+    color: #ececec;
+    border-radius: 5px;
+    padding: 4px 6px;
+    font-size: 13px;
+    outline: none;
+}
+
+.conversation-rename-error {
+    font-size: 11px;
+    color: #f0a0a0;
+    margin-top: 3px;
+}
+
 .new-chat-area {
     display: flex;
     flex-direction: column;

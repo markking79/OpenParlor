@@ -3,6 +3,14 @@
 // entry module (openparlor.js) imports it for its side effects.
 
 import { formatRelativeTime, normalizeServiceError } from './ui.js';
+
+export function validateConversationTitle(title) {
+    if (typeof title !== 'string') return { valid: false, title: '', error: 'Title is required.' };
+    const trimmed = title.trim();
+    if (!trimmed) return { valid: false, title: '', error: 'Title cannot be empty.' };
+    if (trimmed.length > 200) return { valid: false, title: '', error: 'Title must be 200 characters or fewer.' };
+    return { valid: true, title: trimmed, error: '' };
+}
 import { createNdjsonParser, createStreamMessageCollector, normalizeConversation, resolveMessageCharacterId } from './conversations.js';
 import { buildCardExportFilename, normalizeCharacter, sanitizeCharacterInput, validateCharacterForm } from './characters.js';
 import { normalizeMemory, normalizeMemorySource, validateMemoryForm } from './memory.js';
@@ -83,6 +91,7 @@ if (typeof document !== 'undefined') {
     });
     let selectionEpoch = 0;
     let recordingInterruptionPending = false;
+    let streamAbortController = null;
     const isDev = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
     const voiceTurnTimer = createVoiceTurnTimer();
 
@@ -186,7 +195,33 @@ if (typeof document !== 'undefined') {
             if (time) parts.push(time);
             metaEl.textContent = parts.join(' · ');
 
-            item.append(titleEl, metaEl);
+            const actionsEl = document.createElement('div');
+            actionsEl.className = 'conversation-actions';
+
+            const renameBtn = document.createElement('button');
+            renameBtn.className = 'conversation-rename-btn';
+            renameBtn.type = 'button';
+            renameBtn.title = 'Rename conversation';
+            renameBtn.setAttribute('aria-label', 'Rename ' + conv.title);
+            renameBtn.textContent = '✎';
+            renameBtn.addEventListener('click', e => {
+                e.stopPropagation();
+                handleRenameConversation(conv, item);
+            });
+
+            const deleteBtn = document.createElement('button');
+            deleteBtn.className = 'conversation-delete-btn';
+            deleteBtn.type = 'button';
+            deleteBtn.title = 'Delete conversation';
+            deleteBtn.setAttribute('aria-label', 'Delete ' + conv.title);
+            deleteBtn.textContent = '✕';
+            deleteBtn.addEventListener('click', e => {
+                e.stopPropagation();
+                handleDeleteConversation(conv);
+            });
+
+            actionsEl.append(renameBtn, deleteBtn);
+            item.append(titleEl, metaEl, actionsEl);
             item.addEventListener('click', () => selectConversation(conv.id));
             conversationList.appendChild(item);
         }
@@ -846,6 +881,35 @@ if (typeof document !== 'undefined') {
         };
     }
 
+    async function renameConversation(id, title) {
+        const token = await getCsrfToken();
+        const res = await fetch('/api/openparlor/conversations/' + encodeURIComponent(id), {
+            method: 'PATCH',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRF-Token': token,
+            },
+            body: JSON.stringify({ title }),
+        });
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(normalizeServiceError(err, 'Failed to rename conversation'));
+        }
+        return normalizeConversation(await res.json());
+    }
+
+    async function deleteConversation(id) {
+        const token = await getCsrfToken();
+        const res = await fetch('/api/openparlor/conversations/' + encodeURIComponent(id), {
+            method: 'DELETE',
+            headers: { 'X-CSRF-Token': token },
+        });
+        if (!res.ok && res.status !== 204) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(normalizeServiceError(err, 'Failed to delete conversation'));
+        }
+    }
+
     let characterNoticeTimer = null;
     function showCharacterNotice(text) {
         const existing = characterList.querySelector('.character-notice');
@@ -1311,6 +1375,126 @@ if (typeof document !== 'undefined') {
         }
     }
 
+    function handleRenameConversation(conv, item) {
+        const titleEl = item.querySelector('.conversation-title');
+        if (!titleEl) return;
+
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'conversation-rename-input';
+        input.value = conv.title;
+        input.maxLength = 200;
+        input.setAttribute('aria-label', 'Rename conversation');
+
+        titleEl.replaceWith(input);
+        input.focus();
+        input.select();
+
+        let settled = false;
+
+        const errorEl = document.createElement('div');
+        errorEl.className = 'conversation-rename-error';
+        errorEl.hidden = true;
+        item.appendChild(errorEl);
+
+        function commit() {
+            if (settled) return;
+            const validation = validateConversationTitle(input.value);
+            if (!validation.valid) {
+                errorEl.textContent = validation.error;
+                errorEl.hidden = false;
+                input.focus();
+                return;
+            }
+            settled = true;
+            renameConversation(conv.id, validation.title).then(updated => {
+                const idx = conversations.findIndex(c => c.id === conv.id);
+                if (idx !== -1) conversations[idx] = updated;
+                if (currentConversation && currentConversation.id === conv.id) {
+                    currentConversation = updated;
+                    updateChatHeader();
+                }
+                renderConversations();
+            }).catch(() => {
+                renderConversations();
+            });
+        }
+
+        input.addEventListener('keydown', e => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                commit();
+            } else if (e.key === 'Escape') {
+                settled = true;
+                renderConversations();
+            }
+        });
+        input.addEventListener('blur', commit);
+        input.addEventListener('click', e => e.stopPropagation());
+    }
+
+    async function handleDeleteConversation(conv) {
+        if (!window.confirm('Delete "' + conv.title + '"? This cannot be undone.')) return;
+        const isCurrent = currentConversation && currentConversation.id === conv.id;
+
+        // Neutralize active response UI before awaiting the DELETE fetch so
+        // server latency cannot allow an old stream to update the UI.
+        if (isCurrent) {
+            if (streamAbortController) {
+                streamAbortController.abort();
+                streamAbortController = null;
+            }
+            groupQueue.clear();
+            playback.stop();
+            voiceTurnTimer.cancel();
+            recorder.cancel();
+            isSending = false;
+            sendButton.disabled = true;
+            messageInput.disabled = true;
+            updatePlaybackButtons();
+            updateRecorderUI();
+            updateTranscriptionStatus();
+        }
+
+        try {
+            await deleteConversation(conv.id);
+            conversations = conversations.filter(c => c.id !== conv.id);
+
+            if (isCurrent) {
+                // Clear per-conversation localStorage
+                try {
+                    localStorage.removeItem('openparlor-auto-speak-' + conv.id);
+                    localStorage.removeItem('openparlor-voice-mode-' + conv.id);
+                } catch { /* storage unavailable */ }
+                // Clear current state
+                currentConversation = null;
+                currentMessages = [];
+                memories = [];
+
+                // Select another conversation or show empty state
+                if (conversations.length > 0) {
+                    await selectConversation(conversations[0].id);
+                } else {
+                    renderConversations();
+                    renderMessages();
+                    updateChatHeader();
+                    renderParticipants();
+                    renderMemoryPanel();
+                }
+            } else {
+                renderConversations();
+            }
+        } catch (e) {
+            if (isCurrent && currentConversation && currentConversation.id === conv.id) {
+                isSending = false;
+                sendButton.disabled = false;
+                messageInput.disabled = false;
+                renderMessages();
+                updateChatHeader();
+            }
+        }
+    }
+
     async function selectConversation(id) {
         selectionEpoch++;
         groupQueue.clear();
@@ -1381,6 +1565,8 @@ if (typeof document !== 'undefined') {
         renderMessages();
 
         let lastBubble = messagesEl.querySelector('.message:last-child .bubble');
+        const abortController = new AbortController();
+        streamAbortController = abortController;
 
         try {
             const token = await getCsrfToken();
@@ -1397,6 +1583,7 @@ if (typeof document !== 'undefined') {
                     stream: true,
                     conversation_id: currentConversation.id,
                 }),
+                signal: abortController.signal,
             });
 
             if (!response.ok) {
@@ -1499,7 +1686,8 @@ if (typeof document !== 'undefined') {
                 if (isDev) voiceTurnTimer.log();
                 voiceTurnTimer.cancel();
             }
-        } catch {
+        } catch (e) {
+            if (e && e.name === 'AbortError') return;
             currentAssistantMsg.content = 'Connection error';
             if (lastBubble) lastBubble.textContent = currentAssistantMsg.content;
             renderMessages();
@@ -1507,8 +1695,11 @@ if (typeof document !== 'undefined') {
             if (isDev) voiceTurnTimer.log();
             voiceTurnTimer.cancel();
         } finally {
-            isSending = false;
-            sendButton.disabled = false;
+            if (streamAbortController === abortController) {
+                streamAbortController = null;
+                isSending = false;
+                sendButton.disabled = false;
+            }
         }
     }
 
