@@ -30,6 +30,28 @@ export function createScrollScheduler(rafFn) {
         },
     };
 }
+
+export function normalizeSidebarCollapsed(value) {
+    return value === true || value === 'true';
+}
+
+export function createSidebarState(storage, keys) {
+    function get(side) {
+        try {
+            return normalizeSidebarCollapsed(storage.getItem(keys[side]));
+        } catch {
+            return false;
+        }
+    }
+    function set(side, collapsed) {
+        try {
+            storage.setItem(keys[side], collapsed ? 'true' : 'false');
+        } catch {
+            // storage unavailable
+        }
+    }
+    return { get, set };
+}
 import { createNdjsonParser, createStreamMessageCollector, normalizeConversation, resolveMessageCharacterId } from './conversations.js';
 import { buildCardExportFilename, normalizeCharacter, sanitizeCharacterInput, validateCharacterForm } from './characters.js';
 import { normalizeMemory, normalizeMemorySource, validateMemoryForm } from './memory.js';
@@ -74,6 +96,48 @@ if (typeof document !== 'undefined') {
     const modelStatusBody = document.getElementById('modelStatusBody');
     const autoSpeakButton = document.getElementById('autoSpeakButton');
     const voiceModeButton = document.getElementById('voiceModeButton');
+
+    // ── Sidebar collapse/restore ──────────────────────────────────────────
+
+    const appEl = document.querySelector('.app');
+    const sidebarLeft = document.getElementById('sidebarLeft');
+    const sidebarRight = document.getElementById('sidebarRight');
+    const collapseLeftBtn = document.getElementById('collapseLeftBtn');
+    const collapseRightBtn = document.getElementById('collapseRightBtn');
+    const restoreLeftBtn = document.getElementById('restoreLeftBtn');
+    const restoreRightBtn = document.getElementById('restoreRightBtn');
+
+    const sidebarState = createSidebarState(localStorage, {
+        left: 'openparlor-sidebar-left-collapsed',
+        right: 'openparlor-sidebar-right-collapsed',
+    });
+
+    function applySidebarState(side, collapsed) {
+        const sidebar = side === 'left' ? sidebarLeft : sidebarRight;
+        const appClass = side === 'left' ? 'left-collapsed' : 'right-collapsed';
+        const collapseBtn = side === 'left' ? collapseLeftBtn : collapseRightBtn;
+        const restoreBtn = side === 'left' ? restoreLeftBtn : restoreRightBtn;
+        if (sidebar) sidebar.classList.toggle('collapsed', collapsed);
+        if (appEl) appEl.classList.toggle(appClass, collapsed);
+        if (collapseBtn) collapseBtn.setAttribute('aria-expanded', String(!collapsed));
+        if (restoreBtn) restoreBtn.setAttribute('aria-expanded', String(collapsed));
+    }
+
+    function toggleSidebar(side) {
+        const appClass = side === 'left' ? 'left-collapsed' : 'right-collapsed';
+        const collapsed = !(appEl && appEl.classList.contains(appClass));
+        sidebarState.set(side, collapsed);
+        applySidebarState(side, collapsed);
+    }
+
+    // Restore persisted state
+    applySidebarState('left', sidebarState.get('left'));
+    applySidebarState('right', sidebarState.get('right'));
+
+    if (collapseLeftBtn) collapseLeftBtn.addEventListener('click', () => toggleSidebar('left'));
+    if (collapseRightBtn) collapseRightBtn.addEventListener('click', () => toggleSidebar('right'));
+    if (restoreLeftBtn) restoreLeftBtn.addEventListener('click', () => toggleSidebar('left'));
+    if (restoreRightBtn) restoreRightBtn.addEventListener('click', () => toggleSidebar('right'));
 
     let characters = [];
     let allCharacters = [];

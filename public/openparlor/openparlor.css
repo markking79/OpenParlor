@@ -34,14 +34,74 @@ button {
     overflow: hidden;
 }
 
+.app.left-collapsed {
+    grid-template-columns: 40px minmax(420px, 1fr) 270px;
+}
+
+.app.right-collapsed {
+    grid-template-columns: 260px minmax(420px, 1fr) 40px;
+}
+
+.app.left-collapsed.right-collapsed {
+    grid-template-columns: 40px minmax(420px, 1fr) 40px;
+}
+
 
 /* Sidebars */
 
 .sidebar {
     background: #161719;
-    padding: 18px;
-    overflow-y: auto;
+    overflow: hidden;
     min-height: 0;
+    position: relative;
+}
+
+.sidebar-content {
+    height: 100%;
+    overflow-y: auto;
+    padding: 18px;
+}
+
+.sidebar-header {
+    display: flex;
+    justify-content: flex-end;
+    margin-bottom: 2px;
+}
+
+.sidebar-collapse-btn,
+.sidebar-restore-btn {
+    border: 0;
+    background: transparent;
+    color: #858991;
+    font-size: 14px;
+    padding: 4px 6px;
+    border-radius: 4px;
+    cursor: pointer;
+    line-height: 1;
+}
+
+.sidebar-collapse-btn:hover,
+.sidebar-restore-btn:hover {
+    background: #292b30;
+    color: #ececec;
+}
+
+.sidebar-rail {
+    display: none;
+    position: absolute;
+    inset: 0;
+    flex-direction: column;
+    align-items: center;
+    padding-top: 10px;
+    background: #161719;
+}
+
+.sidebar.collapsed .sidebar-content {
+    visibility: hidden;
+}
+
+.sidebar.collapsed .sidebar-rail {
+    display: flex;
 }
 
 .sidebar-left {

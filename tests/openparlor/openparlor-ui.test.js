@@ -21,7 +21,7 @@ import {
     createTranscriptionController,
     createVoiceTurnTimer,
 } from '../../public/openparlor/openparlor.js';
-import { validateConversationTitle, createScrollScheduler } from '../../public/openparlor/app.js';
+import { validateConversationTitle, createScrollScheduler, normalizeSidebarCollapsed, createSidebarState } from '../../public/openparlor/app.js';
 
 // ─── formatRelativeTime ─────────────────────────────────────────────────────
 
@@ -1684,5 +1684,106 @@ describe('validateConversationTitle', () => {
     test('trims before checking length (201 chars + surrounding whitespace is invalid)', () => {
         const result = validateConversationTitle('  ' + 'a'.repeat(201) + '  ');
         assert.equal(result.valid, false);
+    });
+});
+
+// ─── normalizeSidebarCollapsed (DOGFOOD-005) ─────────────────────────────────
+
+describe('normalizeSidebarCollapsed', () => {
+    test('returns true for boolean true', () => {
+        assert.equal(normalizeSidebarCollapsed(true), true);
+    });
+
+    test('returns true for string "true"', () => {
+        assert.equal(normalizeSidebarCollapsed('true'), true);
+    });
+
+    test('returns false for boolean false', () => {
+        assert.equal(normalizeSidebarCollapsed(false), false);
+    });
+
+    test('returns false for string "false"', () => {
+        assert.equal(normalizeSidebarCollapsed('false'), false);
+    });
+
+    test('returns false for null', () => {
+        assert.equal(normalizeSidebarCollapsed(null), false);
+    });
+
+    test('returns false for undefined', () => {
+        assert.equal(normalizeSidebarCollapsed(undefined), false);
+    });
+
+    test('returns false for empty string', () => {
+        assert.equal(normalizeSidebarCollapsed(''), false);
+    });
+
+    test('returns false for arbitrary string', () => {
+        assert.equal(normalizeSidebarCollapsed('yes'), false);
+    });
+
+    test('returns false for number', () => {
+        assert.equal(normalizeSidebarCollapsed(1), false);
+    });
+});
+
+// ─── createSidebarState (DOGFOOD-005) ────────────────────────────────────────
+
+describe('createSidebarState', () => {
+    function makeMockStorage() {
+        const store = new Map();
+        return {
+            getItem: (k) => store.has(k) ? store.get(k) : null,
+            setItem: (k, v) => { store.set(k, String(v)); },
+            removeItem: (k) => { store.delete(k); },
+            _store: store,
+        };
+    }
+
+    const keys = { left: 'key-left', right: 'key-right' };
+
+    test('get returns false for unset keys', () => {
+        const state = createSidebarState(makeMockStorage(), keys);
+        assert.equal(state.get('left'), false);
+        assert.equal(state.get('right'), false);
+    });
+
+    test('set then get round-trips true', () => {
+        const storage = makeMockStorage();
+        const state = createSidebarState(storage, keys);
+        state.set('left', true);
+        assert.equal(state.get('left'), true);
+    });
+
+    test('set then get round-trips false', () => {
+        const storage = makeMockStorage();
+        const state = createSidebarState(storage, keys);
+        state.set('right', true);
+        state.set('right', false);
+        assert.equal(state.get('right'), false);
+    });
+
+    test('left and right are independent', () => {
+        const storage = makeMockStorage();
+        const state = createSidebarState(storage, keys);
+        state.set('left', true);
+        assert.equal(state.get('left'), true);
+        assert.equal(state.get('right'), false);
+    });
+
+    test('storage failure on get is harmless (returns false)', () => {
+        const state = createSidebarState({
+            getItem: () => { throw new Error('denied'); },
+            setItem: () => { throw new Error('denied'); },
+        }, keys);
+        assert.equal(state.get('left'), false);
+    });
+
+    test('storage failure on set is harmless (no throw)', () => {
+        const state = createSidebarState({
+            getItem: () => null,
+            setItem: () => { throw new Error('denied'); },
+        }, keys);
+        assert.doesNotThrow(() => state.set('left', true));
     });
 });
