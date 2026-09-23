@@ -58,13 +58,15 @@ export function shouldShowMemorySection({ hasConversation, hasCharacter, memoryC
 }
 
 export function createMemoryRefreshGuard() {
+    // Generation 0 is the "no refresh in flight" sentinel: begin() issues
+    // 1-based generations, and isCurrent must never accept the sentinel.
     let generation = 0;
     return {
         begin() {
             return ++generation;
         },
         isCurrent(gen) {
-            return gen === generation;
+            return gen > 0 && gen === generation;
         },
     };
 }
