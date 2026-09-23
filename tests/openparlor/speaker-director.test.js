@@ -66,9 +66,9 @@ test('does not match a name embedded in a longer word', () => {
 });
 
 test('handles names with special regex characters', () => {
-    const participants = makeParticipants(["O'Brien", 'Smith']);
-    const characters = makeCharacters(["O'Brien", 'Smith']);
-    const result = selectSpeaker(participants, characters, "Hey O'Brien, what's up?");
+    const participants = makeParticipants(['O\'Brien', 'Smith']);
+    const characters = makeCharacters(['O\'Brien', 'Smith']);
+    const result = selectSpeaker(participants, characters, 'Hey O\'Brien, what\'s up?');
     assert.equal(result.length, 1);
     assert.equal(result[0].id, 'part-0');
 });
@@ -192,7 +192,7 @@ test('whole-group cue takes precedence over an explicit name', () => {
 test('"That\'s all I wanted to say" does NOT select the whole group', () => {
     const participants = makeParticipants(['Doug', 'Monica']);
     const characters = makeCharacters(['Doug', 'Monica']);
-    const result = selectSpeaker(participants, characters, "That's all I wanted to say.");
+    const result = selectSpeaker(participants, characters, 'That\'s all I wanted to say.');
     assert.equal(result.length, 1);
     assert.equal(result[0].id, 'part-0');
 });

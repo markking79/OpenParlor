@@ -21,7 +21,7 @@ test('parses multiple records in one chunk', () => {
     assert.deepStrictEqual(parsedRecords(parser), [
         { type: 'delta', text: 'a' },
         { type: 'delta', text: 'b' },
-        { type: 'done' }
+        { type: 'done' },
     ]);
 });
 
@@ -75,7 +75,7 @@ test('handles done record after deltas', () => {
     assert.deepStrictEqual(parsedRecords(parser), [
         { type: 'delta', text: 'Hi ' },
         { type: 'delta', text: 'there' },
-        { type: 'done' }
+        { type: 'done' },
     ]);
 });
 

@@ -15,7 +15,7 @@
 //   - it is covered by the repository .gitignore (*.storage-state.json);
 //   - never commit it, push it, or copy it to shared locations;
 //   - delete it when you no longer need browser acceptance runs.
-import { chromium, expect } from '@playwright/test';
+import { chromium } from '@playwright/test';
 import path from 'node:path';
 import process from 'node:process';
 
@@ -29,7 +29,7 @@ const page = await context.newPage();
 console.log(`Opening ${baseURL}/login — log in, then open /openparlor/ in the opened browser.`);
 console.log('The script saves the storage state automatically once the OpenParlor UI loads.');
 await page.goto(`${baseURL}/login`);
-await expect(page.locator('.brand-name')).toBeVisible({ timeout: 0 });
+await page.locator('.brand-name').waitFor({ timeout: 0 });
 await context.storageState({ path: outputPath });
 console.log(`Saved authenticated storage state to ${outputPath}`);
 console.log('Remember: this file is git-ignored and must never be committed.');

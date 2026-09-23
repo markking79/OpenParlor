@@ -426,7 +426,6 @@ test('requires an authenticated user with directories', async () => {
             loadConfig: async () => configuredConfig,
             createProvider: () => mock.provider,
             runMemoryExtraction: async () => [],
-            runMemoryExtraction: async () => [],
         }, user, async baseUrl => {
             const result = await postChat(baseUrl, { messages: [{ role: 'user', content: 'hello' }] });
             assert.equal(result.status, 401);
@@ -2264,8 +2263,8 @@ test('group prompt keeps speaker identity of persisted history for the selected 
         const monicaParticipant = conversation.participants.find(p => p.character_id === monica.id);
         // Pre-persisted history from an earlier group turn.
         persistence.appendMessage(dirs, conv.id, dougParticipant.id, 'Hello everyone', 'user');
-        persistence.appendMessage(dirs, conv.id, dougParticipant.id, "Hi, I am Doug", 'character');
-        persistence.appendMessage(dirs, conv.id, monicaParticipant.id, "Hi, I am Monica", 'character');
+        persistence.appendMessage(dirs, conv.id, dougParticipant.id, 'Hi, I am Doug', 'character');
+        persistence.appendMessage(dirs, conv.id, monicaParticipant.id, 'Hi, I am Monica', 'character');
         const mock = mockProvider(() => completion);
         const user = { profile: { handle: 'alice' }, directories: dirs };
 
@@ -2288,15 +2287,15 @@ test('group prompt keeps speaker identity of persisted history for the selected 
         assert.ok(system.includes('Present participants in this conversation: Doug, Monica'));
         assert.ok(!system.includes('[object Object]'));
 
-        const monicaLine = prompt.find(m => m.content === "Hi, I am Monica");
+        const monicaLine = prompt.find(m => m.content === 'Hi, I am Monica');
         assert.ok(monicaLine, 'Monica line must be present');
         assert.equal(monicaLine.role, 'assistant', 'the target character\'s own line must be an assistant message');
 
-        const dougLine = prompt.find(m => m.content.includes("Hi, I am Doug"));
+        const dougLine = prompt.find(m => m.content.includes('Hi, I am Doug'));
         assert.ok(dougLine, 'Doug line must be present');
         assert.equal(dougLine.role, 'user', 'another character\'s line must not be an assistant message');
         assert.ok(dougLine.content.includes('[Doug said to the group]'), 'Doug line must be attributed to Doug');
-        assert.ok(!prompt.some(m => m.role === 'assistant' && m.content.includes("Hi, I am Doug")));
+        assert.ok(!prompt.some(m => m.role === 'assistant' && m.content.includes('Hi, I am Doug')));
     } finally {
         tmp.cleanup();
     }

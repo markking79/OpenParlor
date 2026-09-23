@@ -929,55 +929,55 @@ describe('normalizeServiceError', () => {
     it('should return fallback when error contains a URL', () => {
         assert.equal(
             normalizeServiceError({ error: 'Connection refused at http://localhost:11434' }),
-            'Service unavailable. Please try again.'
+            'Service unavailable. Please try again.',
         );
         assert.equal(
             normalizeServiceError({ error: 'Failed to reach https://api.openai.com/v1' }),
-            'Service unavailable. Please try again.'
+            'Service unavailable. Please try again.',
         );
     });
 
     it('should return fallback when error contains a file URL', () => {
         assert.equal(
             normalizeServiceError({ error: 'Cannot load file:///opt/models/llama.gguf' }),
-            'Service unavailable. Please try again.'
+            'Service unavailable. Please try again.',
         );
     });
 
     it('should return fallback when error contains a filesystem path', () => {
         assert.equal(
             normalizeServiceError({ error: 'Failed to load model from /opt/models/llama-7b.gguf' }),
-            'Service unavailable. Please try again.'
+            'Service unavailable. Please try again.',
         );
         assert.equal(
             normalizeServiceError({ error: 'Permission denied: /etc/shadow' }),
-            'Service unavailable. Please try again.'
+            'Service unavailable. Please try again.',
         );
     });
 
     it('should return fallback when error contains credential patterns', () => {
         assert.equal(
             normalizeServiceError({ error: 'Invalid api_key: sk-abc123secret' }),
-            'Service unavailable. Please try again.'
+            'Service unavailable. Please try again.',
         );
         assert.equal(
             normalizeServiceError({ error: 'Authorization: Bearer eyJhbGciOi' }),
-            'Service unavailable. Please try again.'
+            'Service unavailable. Please try again.',
         );
         assert.equal(
             normalizeServiceError({ error: 'token=supersecret123' }),
-            'Service unavailable. Please try again.'
+            'Service unavailable. Please try again.',
         );
     });
 
     it('should use custom fallback when provided', () => {
         assert.equal(
             normalizeServiceError({ error: 'http://internal:8080/secret' }, 'TTS service unavailable'),
-            'TTS service unavailable'
+            'TTS service unavailable',
         );
         assert.equal(
             normalizeServiceError(null, 'Chat failed'),
-            'Chat failed'
+            'Chat failed',
         );
     });
 
@@ -1002,7 +1002,7 @@ describe('normalizeServiceError', () => {
     it('should handle error with mixed safe and unsafe content by returning fallback', () => {
         assert.equal(
             normalizeServiceError({ error: 'Error at /var/log/app.log: connection to http://db:5432 failed' }),
-            'Service unavailable. Please try again.'
+            'Service unavailable. Please try again.',
         );
     });
 });
@@ -1302,7 +1302,7 @@ describe('selectSupportedMime', () => {
     it('should return the first supported MIME type', () => {
         const result = selectSupportedMime(
             ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg'],
-            (mime) => mime === 'audio/webm'
+            (mime) => mime === 'audio/webm',
         );
         assert.equal(result, 'audio/webm');
     });
@@ -1310,7 +1310,7 @@ describe('selectSupportedMime', () => {
     it('should return empty string when none are supported', () => {
         const result = selectSupportedMime(
             ['audio/webm', 'audio/ogg'],
-            () => false
+            () => false,
         );
         assert.equal(result, '');
     });
@@ -1325,21 +1325,21 @@ describe('shouldAutoSendTranscription', () => {
     it('should return true when voice mode is enabled and transcription succeeded', () => {
         assert.equal(
             shouldAutoSendTranscription({ voiceModeEnabled: true, transcriptionSucceeded: true }),
-            true
+            true,
         );
     });
 
     it('should return false when voice mode is disabled', () => {
         assert.equal(
             shouldAutoSendTranscription({ voiceModeEnabled: false, transcriptionSucceeded: true }),
-            false
+            false,
         );
     });
 
     it('should return false when transcription failed', () => {
         assert.equal(
             shouldAutoSendTranscription({ voiceModeEnabled: true, transcriptionSucceeded: false }),
-            false
+            false,
         );
     });
 });
@@ -1638,9 +1638,10 @@ describe('createTranscriptionController', () => {
                 return new Promise(() => {});
             },
         });
-        const p1 = controller.transcribe(blob);
+        void controller.transcribe(blob);
         const p2 = await controller.transcribe(blob);
         assert.equal(p2, null);
+        assert.equal(fetchCount, 1);
     });
 
     it('should reject blobs exceeding maxSizeBytes without calling fetch', async () => {
@@ -1753,7 +1754,7 @@ describe('createPlaybackController', () => {
 
         await assert.rejects(
             () => controller.play('Hello', 'voice-a'),
-            /TTS engine failed/
+            /TTS engine failed/,
         );
     });
 
@@ -1944,7 +1945,7 @@ describe('server-side provider ownership', () => {
                 assert.ok(!err.message.includes('http'));
                 assert.ok(!err.message.includes('tts-internal'));
                 return true;
-            }
+            },
         );
     });
 
@@ -1965,7 +1966,7 @@ describe('server-side provider ownership', () => {
                 assert.ok(!err.message.includes('/opt/'));
                 assert.ok(!err.message.includes('.onnx'));
                 return true;
-            }
+            },
         );
     });
 
@@ -1986,7 +1987,7 @@ describe('server-side provider ownership', () => {
                 assert.ok(!err.message.includes('sk-tts-secret-456'));
                 assert.ok(!err.message.includes('api_key'));
                 return true;
-            }
+            },
         );
     });
 

@@ -391,8 +391,8 @@ const GROUP_CONTEXT = [
 
 const GROUP_HISTORY = [
     { role: 'user', content: 'Hello everyone', participant_id: 'part-doug' },
-    { role: 'character', content: "Hi, I'm Doug", participant_id: 'part-doug' },
-    { role: 'character', content: "Hi, I'm Monica", participant_id: 'part-monica' },
+    { role: 'character', content: 'Hi, I\'m Doug', participant_id: 'part-doug' },
+    { role: 'character', content: 'Hi, I\'m Monica', participant_id: 'part-monica' },
 ];
 
 test('group prompt for Monica keeps her own line as assistant and labels Doug\'s line', () => {
@@ -405,15 +405,15 @@ test('group prompt for Monica keeps her own line as assistant and labels Doug\'s
     assert.ok(sys.includes('Present participants in this conversation: Doug, Monica'));
     assert.ok(!sys.includes('[object Object]'));
 
-    const monicaLine = result.find(m => m.content === "Hi, I'm Monica");
+    const monicaLine = result.find(m => m.content === 'Hi, I\'m Monica');
     assert.ok(monicaLine, 'Monica line must be present');
     assert.equal(monicaLine.role, 'assistant');
 
-    const dougLine = result.find(m => m.content.includes("I'm Doug"));
+    const dougLine = result.find(m => m.content.includes('I\'m Doug'));
     assert.ok(dougLine, 'Doug line must be present');
     assert.equal(dougLine.role, 'user');
     assert.ok(dougLine.content.includes('Doug'), 'Doug line must be attributed to Doug');
-    assert.ok(!result.some(m => m.role === 'assistant' && m.content.includes("I'm Doug")),
+    assert.ok(!result.some(m => m.role === 'assistant' && m.content.includes('I\'m Doug')),
         'Doug line must not be an anonymous assistant message');
 
     assert.equal(result.filter(m => m.content === 'Hello everyone').length, 1);
@@ -431,15 +431,15 @@ test('group prompt for Doug keeps his own line as assistant and labels Monica\'s
     const sys = result[0].content;
     assert.ok(sys.includes('Present participants in this conversation: Doug, Monica'));
 
-    const dougLine = result.find(m => m.content === "Hi, I'm Doug");
+    const dougLine = result.find(m => m.content === 'Hi, I\'m Doug');
     assert.ok(dougLine, 'Doug line must be present');
     assert.equal(dougLine.role, 'assistant');
 
-    const monicaLine = result.find(m => m.content.includes("I'm Monica"));
+    const monicaLine = result.find(m => m.content.includes('I\'m Monica'));
     assert.ok(monicaLine, 'Monica line must be present');
     assert.equal(monicaLine.role, 'user');
     assert.ok(monicaLine.content.includes('Monica'), 'Monica line must be attributed to Monica');
-    assert.ok(!result.some(m => m.role === 'assistant' && m.content.includes("I'm Monica")),
+    assert.ok(!result.some(m => m.role === 'assistant' && m.content.includes('I\'m Monica')),
         'Monica line must not be an anonymous assistant message');
 });
 
