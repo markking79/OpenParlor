@@ -4,7 +4,7 @@ import { loadOpenParlorConfig } from './config.js';
 import { createModelProvider, ModelProviderError } from './model-provider.js';
 import * as persistence from './persistence.js';
 import { buildPrompt } from './prompt-builder.js';
-import { applyPromptBudget, resolvePromptBudget } from './prompt-budget.js';
+import { applyPromptBudget, resolvePromptBudget, resolveGenerationReserve } from './prompt-budget.js';
 import { sanitizeSummaryForPrompt, updateConversationSummary } from './conversation-summary.js';
 import { retrieveMemories } from './memory-retrieval.js';
 import { extractAndPersistMemories } from './memory-extractor.js';
@@ -215,11 +215,12 @@ export function createOpenParlorChatRouter({
 
             // STAB-005: rolling summary + prompt budget. The stored summary is
             // sanitized before injection (delimiters and newlines neutralized so
-            // it can only ever act as context), and every assembled prompt is
+            // it can only ever act as context). Every speaker's prompt is
             // bounded to the model context resolved from the server
-            // configuration with the documented fallback.
+            // configuration with the documented fallback, reserving the
+            // larger of the default generation reserve and that character's
+            // server-controlled max_tokens so its full generation always fits.
             const summary = sanitizeSummaryForPrompt(conversation.summary);
-            const promptBudget = resolvePromptBudget(modelConfig);
             speakerContexts = [];
             for (const speaker of selectedSpeakers) {
                 const character = persistence.getCharacter(user.directories, speaker.character_id);
@@ -229,7 +230,7 @@ export function createOpenParlorChatRouter({
                     : [];
                 const prompt = applyPromptBudget(
                     buildPrompt({ character, conversation, history, newMessages: safeMessages, memories: memoryLines, participantContext, summary }),
-                    promptBudget,
+                    resolvePromptBudget(modelConfig, resolveGenerationReserve(character)),
                 );
                 speakerContexts.push({ participant: speaker, character, prompt });
             }

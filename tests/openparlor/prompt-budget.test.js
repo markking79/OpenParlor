@@ -5,6 +5,7 @@ import {
     estimatePromptTokens,
     applyPromptBudget,
     resolvePromptBudget,
+    resolveGenerationReserve,
     DEFAULT_MAX_PROMPT_TOKENS,
     DEFAULT_GENERATION_RESERVE_TOKENS,
 } from '../../src/openparlor/prompt-budget.js';
@@ -128,6 +129,38 @@ test('resolvePromptBudget falls back to the documented default when unconfigured
             maxPromptTokens: DEFAULT_MAX_PROMPT_TOKENS,
             generationReserveTokens: DEFAULT_GENERATION_RESERVE_TOKENS,
         }, `fallback expected for ${JSON.stringify(modelConfig)}`);
+    }
+});
+
+test('resolveGenerationReserve uses the larger of the default reserve and a valid character max_tokens', () => {
+    assert.equal(resolveGenerationReserve(undefined), DEFAULT_GENERATION_RESERVE_TOKENS);
+    assert.equal(resolveGenerationReserve(null), DEFAULT_GENERATION_RESERVE_TOKENS);
+    assert.equal(resolveGenerationReserve({}), DEFAULT_GENERATION_RESERVE_TOKENS);
+    assert.equal(resolveGenerationReserve({ max_tokens: '8192' }), DEFAULT_GENERATION_RESERVE_TOKENS);
+    assert.equal(resolveGenerationReserve({ max_tokens: Number.NaN }), DEFAULT_GENERATION_RESERVE_TOKENS);
+    assert.equal(resolveGenerationReserve({ max_tokens: Number.POSITIVE_INFINITY }), DEFAULT_GENERATION_RESERVE_TOKENS);
+    assert.equal(resolveGenerationReserve({ max_tokens: 0 }), DEFAULT_GENERATION_RESERVE_TOKENS);
+    assert.equal(resolveGenerationReserve({ max_tokens: -1 }), DEFAULT_GENERATION_RESERVE_TOKENS);
+    assert.equal(resolveGenerationReserve({ max_tokens: 100 }), DEFAULT_GENERATION_RESERVE_TOKENS);
+    assert.equal(resolveGenerationReserve({ max_tokens: 512.4 }), 512);
+    assert.equal(resolveGenerationReserve({ max_tokens: 8192 }), 8192);
+    assert.equal(resolveGenerationReserve({ max_tokens: 8192.9 }), 8192);
+});
+
+test('resolvePromptBudget applies a per-character generation reserve', () => {
+    assert.deepEqual(resolvePromptBudget({ maxContextTokens: 32768 }, resolveGenerationReserve({ max_tokens: 8192 })), {
+        maxPromptTokens: 32768,
+        generationReserveTokens: 8192,
+    });
+    // No reserve argument keeps the safe default (standalone chat).
+    assert.equal(resolvePromptBudget({ maxContextTokens: 32768 }).generationReserveTokens, DEFAULT_GENERATION_RESERVE_TOKENS);
+    // An invalid explicit reserve falls back to the safe default.
+    for (const reserve of [undefined, null, 0, -1, Number.NaN, Number.POSITIVE_INFINITY, '8192', {}]) {
+        assert.equal(
+            resolvePromptBudget({ maxContextTokens: 32768 }, reserve).generationReserveTokens,
+            DEFAULT_GENERATION_RESERVE_TOKENS,
+            `fallback reserve expected for ${JSON.stringify(reserve)}`,
+        );
     }
 });
 

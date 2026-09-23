@@ -122,22 +122,50 @@ export function applyPromptBudget(messages, {
  *
  * The returned generation reserve is subtracted by applyPromptBudget before
  * history/summary content is bounded, so prompt plus reserved generation
- * tokens always fit inside the model context.
+ * tokens always fit inside the model context. The default reserve covers a
+ * typical short turn; for a specific generation, pass the character's
+ * resolved reserve (see resolveGenerationReserve) so a character-controlled
+ * `max_tokens` up to 8192 is never squeezed by the budget. An invalid reserve
+ * falls back to the safe default.
  *
  * @param {{ maxContextTokens?: unknown }} [modelConfig] Model section of the OpenParlor server configuration
+ * @param {unknown} [generationReserveTokens] Generation reserve for this
+ *   prompt (default: DEFAULT_GENERATION_RESERVE_TOKENS)
  * @returns {{ maxPromptTokens: number, generationReserveTokens: number }} Resolved prompt budget
  */
-export function resolvePromptBudget(modelConfig) {
+export function resolvePromptBudget(modelConfig, generationReserveTokens = DEFAULT_GENERATION_RESERVE_TOKENS) {
     const configured = modelConfig !== null && typeof modelConfig === 'object'
         && typeof modelConfig.maxContextTokens === 'number'
         && Number.isFinite(modelConfig.maxContextTokens)
         && modelConfig.maxContextTokens > 0
         ? Math.floor(modelConfig.maxContextTokens)
         : DEFAULT_MAX_PROMPT_TOKENS;
+    const reserve = Number.isFinite(generationReserveTokens) && generationReserveTokens > 0
+        ? generationReserveTokens
+        : DEFAULT_GENERATION_RESERVE_TOKENS;
     return {
         maxPromptTokens: configured,
-        generationReserveTokens: DEFAULT_GENERATION_RESERVE_TOKENS,
+        generationReserveTokens: reserve,
     };
+}
+
+/**
+ * Resolves the generation reserve for one character's prompt: the larger of
+ * the default reserve and the character's valid positive `max_tokens`
+ * (floored), because that is the generation length the server will actually
+ * request when generating as this character.
+ *
+ * @param {{ max_tokens?: unknown }} [character] Character record with optional `max_tokens`
+ * @returns {number} Generation reserve in estimated tokens
+ */
+export function resolveGenerationReserve(character) {
+    const maxTokens = character !== null && typeof character === 'object'
+        && typeof character.max_tokens === 'number'
+        && Number.isFinite(character.max_tokens)
+        && character.max_tokens > 0
+        ? Math.floor(character.max_tokens)
+        : 0;
+    return Math.max(DEFAULT_GENERATION_RESERVE_TOKENS, maxTokens);
 }
 
 export { DEFAULT_MAX_PROMPT_TOKENS, DEFAULT_GENERATION_RESERVE_TOKENS };

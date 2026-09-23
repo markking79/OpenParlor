@@ -2547,3 +2547,163 @@ test('streaming conversation generation receives the stored summary and a budget
         tmp.cleanup();
     }
 });
+
+test('POST /chat keeps the unsummarized backlog in the prompt when the rolling summary is behind', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'C' });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'Test');
+        const participant = conv.participants.find(p => p.role === 'character');
+        // 40 stored messages; the summary only covers the first 10, leaving a
+        // 20-message unsummarized backlog ahead of the recent raw window.
+        for (let i = 0; i < 40; i++) {
+            const isUser = i % 2 === 0;
+            persistence.appendMessage(dirs, conv.id, participant.id, isUser ? `u${i}` : `c${i}`, isUser ? 'user' : 'character');
+        }
+        persistence.updateConversation(dirs, conv.id, {
+            summary: 'They met at the market and agreed to trade.',
+            summary_message_count: 10,
+        });
+        const mock = mockProvider(() => completion);
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+            runMemoryExtraction: async () => [],
+        }, user, async baseUrl => {
+            const result = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'new turn' }],
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+        });
+
+        const prompt = mock.calls[0];
+        assert.ok(prompt[0].content.includes('[Conversation Summary]'), 'summary section present');
+        // The window starts at the covered count (10), not the recent-window
+        // start (30): every unsummarized message plus the new turn reaches the
+        // model, and all of them fit the default 4096-token budget.
+        assert.equal(prompt.length, 1 + 30 + 1);
+        assert.equal(prompt[1].content, 'u10', 'unsummarized backlog is not skipped');
+        assert.equal(prompt[1 + 29].content, 'c39');
+        assert.equal(prompt[prompt.length - 1].content, 'new turn');
+        // The fire-and-forget refresh (after the user turn and the assistant
+        // reply are stored: 42 total) is now caught up through the recent
+        // window; let it settle before cleanup.
+        let updated = persistence.getConversation(dirs, conv.id);
+        const deadline = Date.now() + 5000;
+        while (updated.summary_message_count !== 32 && Date.now() < deadline) {
+            await new Promise(resolve => setTimeout(resolve, 25));
+            updated = persistence.getConversation(dirs, conv.id);
+        }
+        assert.equal(updated.summary_message_count, 32, 'the refresh advances through the unsummarized backlog');
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('POST /chat budgets a character prompt against its server-controlled max_tokens', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'C', max_tokens: 8192 });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'Test');
+        const participant = conv.participants.find(p => p.role === 'character');
+        // 16 oversized history messages (~1005 estimated tokens each). With
+        // the default 512-token reserve against a 10240-token context, about
+        // nine of them would survive; the character's 8192-token generation
+        // reserve must dominate instead.
+        for (let i = 0; i < 16; i++) {
+            const isUser = i % 2 === 0;
+            persistence.appendMessage(dirs, conv.id, participant.id, `x${'x'.repeat(4000)}-${i}`, isUser ? 'user' : 'character');
+        }
+        const bigContextConfig = {
+            ...configuredConfig,
+            model: { ...configuredConfig.model, maxContextTokens: 10240 },
+        };
+        const mock = mockProvider(() => completion);
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => bigContextConfig,
+            createProvider: () => mock.provider,
+            runMemoryExtraction: async () => [],
+        }, user, async baseUrl => {
+            const result = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'new turn' }],
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+        });
+
+        const prompt = mock.calls[0];
+        assert.ok(
+            estimatePromptTokens(prompt) + char.max_tokens <= 10240,
+            'prompt plus the character max_tokens reserve must fit the configured context',
+        );
+        assert.equal(prompt[0].role, 'system', 'the system prompt is never trimmed');
+        assert.equal(prompt[prompt.length - 1].content, 'new turn', 'the newest user turn is never trimmed');
+        // Only [system, one history message, new turn] fits the 10240 - 8192
+        // limit — proving the larger generation reserve was used (the default
+        // reserve would have kept about nine oversized messages).
+        assert.equal(prompt.length, 3, 'the character max_tokens reserve trimmed the older history');
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+test('streaming conversation generation budgets against the character max_tokens identically', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'C', max_tokens: 8192 });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'Test');
+        const participant = conv.participants.find(p => p.role === 'character');
+        for (let i = 0; i < 16; i++) {
+            const isUser = i % 2 === 0;
+            persistence.appendMessage(dirs, conv.id, participant.id, `x${'x'.repeat(4000)}-${i}`, isUser ? 'user' : 'character');
+        }
+        const bigContextConfig = {
+            ...configuredConfig,
+            model: { ...configuredConfig.model, maxContextTokens: 10240 },
+        };
+        const mock = mockStreamProvider([sseDelta('hi'), 'data: [DONE]\n\n']);
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => bigContextConfig,
+            createProvider: () => mock.provider,
+            runMemoryExtraction: async () => [],
+        }, user, async baseUrl => {
+            const result = await postChatStream(baseUrl, {
+                messages: [{ role: 'user', content: 'new turn' }],
+                stream: true,
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+            assert.deepEqual(
+                result.records.filter(r => r.type === 'delta'),
+                [{ type: 'delta', text: 'hi' }],
+                'the streamed reply is relayed to the client',
+            );
+            assert.ok(result.records.some(r => r.type === 'done' && r.conversation_id === conv.id));
+        });
+
+        assert.equal(mock.calls.length, 1, 'the stream provider is called exactly once');
+        const prompt = mock.calls[0].messages;
+        assert.ok(
+            estimatePromptTokens(prompt) + char.max_tokens <= 10240,
+            'streamed prompt plus the character max_tokens reserve fits the configured context',
+        );
+        assert.equal(prompt[0].role, 'system', 'the system prompt is never trimmed');
+        assert.equal(prompt[prompt.length - 1].content, 'new turn', 'the newest user turn is never trimmed');
+        assert.equal(prompt.length, 3, 'the character max_tokens reserve trimmed the older history');
+    } finally {
+        tmp.cleanup();
+    }
+});

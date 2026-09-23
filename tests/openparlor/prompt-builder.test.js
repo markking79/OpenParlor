@@ -557,16 +557,39 @@ describe('rolling summary injection', () => {
         assert.equal(body[0].content, 'm4');
     });
 
-    test('a stale summary_message_count beyond the stored history shrinks but never skips the window', () => {
+    test('keeps an unsummarized backlog in the raw window when the summary is behind', () => {
+        const history = [];
+        for (let i = 0; i < 60; i++) {
+            history.push({ role: 'user', content: `m${i}` });
+        }
+        // The summary only covers 20 of 60 stored messages: 20 messages are
+        // unsummarized and sit ahead of the recent raw window (start 50).
+        const conversation = { summary: 's', summary_message_count: 20 };
+        const result = buildPrompt({ character, conversation, history, newMessages: [], summary: 's' });
+        const body = result.slice(1);
+        // The window must start at the covered count, not the recent-window
+        // start: every unsummarized message stays eligible (the prompt budget
+        // trims the oldest history later, never the builder).
+        assert.equal(body.length, 60 - 20);
+        assert.equal(body[0].content, 'm20', 'unsummarized backlog is not skipped');
+        for (let i = 0; i < body.length; i++) {
+            assert.equal(body[i].content, `m${20 + i}`, `message ${20 + i} must remain in the prompt`);
+        }
+    });
+
+    test('a stale summary_message_count beyond the stored history falls back to the recent window', () => {
         const history = [];
         for (let i = 0; i < 12; i++) {
             history.push({ role: 'user', content: `m${i}` });
         }
         const conversation = { summary: 's', summary_message_count: 999 };
         const result = buildPrompt({ character, conversation, history, newMessages: [], summary: 's' });
-        // covered (clamped to 12) >= total - window, so no raw history is resent.
-        assert.equal(result.length, 1);
-        assert.equal(result[0].role, 'system');
+        // covered clamps to the stored total, which is past the recent-window
+        // start, so the recent raw window is kept and nothing is skipped.
+        const body = result.slice(1);
+        assert.equal(body.length, RECENT_WINDOW_MESSAGES);
+        assert.equal(body[0].content, 'm2');
+        assert.equal(body[body.length - 1].content, 'm11');
     });
 
     test('no summary keeps the legacy last-N window and no summary section', () => {

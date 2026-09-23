@@ -62,9 +62,12 @@ function normalizeParticipantNames(entries) {
  *   rendered speaker-relative to the target character.
  * @param {string} [params.summary] Optional sanitized rolling summary of earlier
  *   turns. When present it is injected as a delimited untrusted context section
- *   (never as a character instruction) and the raw history window shrinks to the
- *   recent window: messages covered by `conversation.summary_message_count` are
- *   dropped because the summary stands in for them. Without a summary the
+ *   (never as a character instruction) and the raw history window starts at
+ *   `conversation.summary_message_count`: messages covered by the summary are
+ *   dropped because the summary stands in for them. If the summary is behind
+ *   the recent window, the unsummarized backlog between the covered count and
+ *   the recent window is never skipped and stays eligible for the prompt (the
+ *   prompt budget trims the oldest raw history instead). Without a summary the
  *   legacy last-N behavior is preserved.
  * @returns {Array<{role: string, content: string}>} Assembled model messages
  */
@@ -131,11 +134,15 @@ export function buildPrompt({ character, conversation, history, newMessages, mem
     const targetCharacterId = character && typeof character.id === 'string' ? character.id : null;
 
     // Raw history window. Without a rolling summary the legacy last-N window
-    // applies. With a summary, the summarized prefix (the first
-    // `summary_message_count` stored messages) is dropped because the summary
-    // section stands in for it, and only the recent raw window is resent. The
-    // window start never moves past the end of the stored history, so a stale
-    // count can only shrink the window, never skip messages.
+    // applies. With a summary, the window starts at the earlier of the
+    // covered count and the recent-window start: the summarized prefix is
+    // dropped because the summary section stands in for it, and when the
+    // summary is behind, every unsummarized message between the covered count
+    // and the recent window stays eligible for the prompt context. applyPromptBudget
+    // trims the oldest raw history if the result no longer fits the model
+    // context, so no stored message is deliberately skipped here. A stale
+    // count beyond the stored history simply falls back to the recent raw
+    // window.
     const stored = (history || []).filter(msg => msg && (msg.role === 'user' || msg.role === 'character'));
     let bounded;
     if (typeof summary === 'string' && summary.trim() !== '') {
@@ -143,7 +150,7 @@ export function buildPrompt({ character, conversation, history, newMessages, mem
         const covered = Number.isFinite(conversation?.summary_message_count)
             ? Math.max(0, Math.min(total, conversation.summary_message_count))
             : 0;
-        bounded = stored.slice(Math.min(Math.max(covered, total - RECENT_WINDOW_MESSAGES), total));
+        bounded = stored.slice(Math.max(0, Math.min(covered, total - RECENT_WINDOW_MESSAGES)));
     } else {
         bounded = stored.slice(-MAX_HISTORY_MESSAGES);
     }
