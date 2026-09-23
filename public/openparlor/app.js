@@ -11,6 +11,25 @@ export function validateConversationTitle(title) {
     if (trimmed.length > 200) return { valid: false, title: '', error: 'Title must be 200 characters or fewer.' };
     return { valid: true, title: trimmed, error: '' };
 }
+
+export function createScrollScheduler(rafFn) {
+    let scheduled = false;
+    let callback = null;
+    return {
+        schedule(fn) {
+            callback = fn;
+            if (!scheduled) {
+                scheduled = true;
+                rafFn(() => {
+                    scheduled = false;
+                    const cb = callback;
+                    callback = null;
+                    if (cb) cb();
+                });
+            }
+        },
+    };
+}
 import { createNdjsonParser, createStreamMessageCollector, normalizeConversation, resolveMessageCharacterId } from './conversations.js';
 import { buildCardExportFilename, normalizeCharacter, sanitizeCharacterInput, validateCharacterForm } from './characters.js';
 import { normalizeMemory, normalizeMemorySource, validateMemoryForm } from './memory.js';
@@ -514,8 +533,12 @@ if (typeof document !== 'undefined') {
         renderParticipants();
     }
 
+    const scrollScheduler = createScrollScheduler((fn) => requestAnimationFrame(fn));
+
     function scrollMessages() {
-        messagesEl.scrollTop = messagesEl.scrollHeight;
+        scrollScheduler.schedule(() => {
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+        });
     }
 
     // ── Participants ───────────────────────────────────────────────────────

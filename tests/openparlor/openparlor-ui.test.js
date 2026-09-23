@@ -21,7 +21,7 @@ import {
     createTranscriptionController,
     createVoiceTurnTimer,
 } from '../../public/openparlor/openparlor.js';
-import { validateConversationTitle } from '../../public/openparlor/app.js';
+import { validateConversationTitle, createScrollScheduler } from '../../public/openparlor/app.js';
 
 // ─── formatRelativeTime ─────────────────────────────────────────────────────
 
@@ -1552,6 +1552,80 @@ describe('createStreamMessageCollector', () => {
         assert.equal(messages[1].content, 'Hi, I am Beta.');
         // B never replaced or erased A
         assert.notEqual(messages[0], messages[1], 'messages must be distinct objects');
+    });
+});
+
+// ─── createScrollScheduler (DOGFOOD-004) ─────────────────────────────────────
+
+describe('createScrollScheduler', () => {
+    function makeMockRaf() {
+        const callbacks = [];
+        const rafFn = (cb) => {
+            callbacks.push(cb);
+            return callbacks.length;
+        };
+        return {
+            rafFn,
+            callbacks,
+            flush: () => {
+                const batch = callbacks.splice(0);
+                for (const cb of batch) cb();
+            },
+        };
+    }
+
+    test('schedules callback on next frame', () => {
+        const { rafFn, callbacks, flush } = makeMockRaf();
+        const scheduler = createScrollScheduler(rafFn);
+        let called = false;
+        scheduler.schedule(() => { called = true; });
+        assert.equal(called, false, 'callback not yet invoked');
+        assert.equal(callbacks.length, 1, 'one rAF scheduled');
+        flush();
+        assert.equal(called, true, 'callback invoked after frame');
+    });
+
+    test('coalesces multiple schedules within the same frame into one invocation', () => {
+        const { rafFn, callbacks, flush } = makeMockRaf();
+        const scheduler = createScrollScheduler(rafFn);
+        const calls = [];
+        scheduler.schedule(() => calls.push(1));
+        scheduler.schedule(() => calls.push(2));
+        scheduler.schedule(() => calls.push(3));
+        assert.equal(callbacks.length, 1, 'only one rAF scheduled');
+        flush();
+        assert.deepEqual(calls, [3], 'only the latest callback is invoked');
+    });
+
+    test('allows re-scheduling after a frame has fired', () => {
+        const { rafFn, callbacks, flush } = makeMockRaf();
+        const scheduler = createScrollScheduler(rafFn);
+        const calls = [];
+        scheduler.schedule(() => calls.push('a'));
+        flush();
+        assert.deepEqual(calls, ['a']);
+        assert.equal(callbacks.length, 0, 'no pending after flush');
+
+        scheduler.schedule(() => calls.push('b'));
+        assert.equal(callbacks.length, 1, 'new rAF scheduled after previous frame');
+        flush();
+        assert.deepEqual(calls, ['a', 'b']);
+    });
+
+    test('does not invoke callback if no schedule was called', () => {
+        const { rafFn, callbacks, flush } = makeMockRaf();
+        const scheduler = createScrollScheduler(rafFn);
+        // No schedule calls
+        assert.equal(callbacks.length, 0);
+        flush();
+        // Nothing should have happened
+    });
+
+    test('works with synchronous rafFn (immediate execution)', () => {
+        const scheduler = createScrollScheduler((fn) => fn());
+        let called = false;
+        scheduler.schedule(() => { called = true; });
+        assert.equal(called, true, 'synchronous raf executes immediately');
     });
 });
 
