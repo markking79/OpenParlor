@@ -551,4 +551,3 @@ export function handsFreeStatusText(state, info = {}) {
             return '';
     }
 }
-
