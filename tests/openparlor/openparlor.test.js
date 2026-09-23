@@ -6,6 +6,7 @@ import {
     validateMemoryForm,
     normalizeParticipants,
     normalizeConversation,
+    resolveMessageCharacterId,
     createGroupPlaybackQueue,
     normalizeSettings,
     normalizeHealthStatus,
@@ -153,9 +154,27 @@ describe('normalizeParticipants', () => {
         ];
         const result = normalizeParticipants(raw);
         assert.equal(result.length, 2);
+        assert.equal(result[0].id, 'participant-1');
         assert.equal(result[0].characterId, 'char-1');
         assert.equal(result[0].role, 'character');
+        assert.equal(result[1].id, 'participant-2');
         assert.equal(result[1].characterId, 'char-2');
+    });
+
+    it('should accept browser-style participantId as the record id', () => {
+        const raw = [
+            { participantId: 'part-abc', character_id: 'char-1', role: 'character' },
+        ];
+        const result = normalizeParticipants(raw);
+        assert.equal(result.length, 1);
+        assert.equal(result[0].id, 'part-abc');
+        assert.equal(result[0].characterId, 'char-1');
+    });
+
+    it('should default id to empty string when missing', () => {
+        const raw = [{ character_id: 'char-1', role: 'character' }];
+        const result = normalizeParticipants(raw);
+        assert.equal(result[0].id, '');
     });
 
     it('should return empty array for null or non-array input', () => {
@@ -174,6 +193,7 @@ describe('normalizeParticipants', () => {
         ];
         const result = normalizeParticipants(raw);
         assert.equal(result.length, 1);
+        assert.equal(result[0].id, '');
         assert.equal(result[0].characterId, 'char-1');
     });
 
@@ -194,6 +214,7 @@ describe('normalizeConversation', () => {
         };
         const result = normalizeConversation(raw);
         assert.equal(result.participants.length, 1);
+        assert.equal(result.participants[0].id, 'participant-1');
         assert.equal(result.participants[0].characterId, 'char-1');
     });
 
@@ -2225,6 +2246,65 @@ describe('HTML/message rendering safety', () => {
             stt: null,
         });
         assert.equal(result.model.label, '<b>safe</b>');
+    });
+});
+
+describe('resolveMessageCharacterId', () => {
+    const conversation = {
+        id: 'conv-1',
+        characterId: 'char-primary',
+        participants: [
+            { id: 'part-a', characterId: 'char-alpha', role: 'character' },
+            { id: 'part-b', characterId: 'char-beta', role: 'character' },
+        ],
+    };
+
+    it('should prefer explicit live character_id over participant_id', () => {
+        const msg = { role: 'assistant', character_id: 'char-beta', participant_id: 'part-a' };
+        assert.equal(resolveMessageCharacterId(msg, conversation), 'char-beta');
+    });
+
+    it('should resolve persisted participant_id to the correct character (char-alpha)', () => {
+        const msg = { role: 'assistant', participant_id: 'part-a' };
+        assert.equal(resolveMessageCharacterId(msg, conversation), 'char-alpha');
+    });
+
+    it('should resolve persisted participant_id to the correct character (char-beta)', () => {
+        const msg = { role: 'assistant', participant_id: 'part-b' };
+        assert.equal(resolveMessageCharacterId(msg, conversation), 'char-beta');
+    });
+
+    it('should fall back to primary character when participant_id is not found', () => {
+        const msg = { role: 'assistant', participant_id: 'part-unknown' };
+        assert.equal(resolveMessageCharacterId(msg, conversation), 'char-primary');
+    });
+
+    it('should fall back to primary character when message has no identity fields', () => {
+        const msg = { role: 'assistant' };
+        assert.equal(resolveMessageCharacterId(msg, conversation), 'char-primary');
+    });
+
+    it('should return empty string for user messages', () => {
+        const msg = { role: 'user', content: 'hello' };
+        assert.equal(resolveMessageCharacterId(msg, conversation), '');
+    });
+
+    it('should return empty string for null message', () => {
+        assert.equal(resolveMessageCharacterId(null, conversation), '');
+    });
+
+    it('should return empty string for non-object message', () => {
+        assert.equal(resolveMessageCharacterId('text', conversation), '');
+    });
+
+    it('should handle null conversation gracefully', () => {
+        const msg = { role: 'assistant', participant_id: 'part-a' };
+        assert.equal(resolveMessageCharacterId(msg, null), '');
+    });
+
+    it('should handle conversation with no participants array', () => {
+        const msg = { role: 'assistant', participant_id: 'part-a' };
+        assert.equal(resolveMessageCharacterId(msg, { characterId: 'char-primary' }), 'char-primary');
     });
 });
 

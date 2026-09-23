@@ -6,7 +6,7 @@
 import './app.js';
 
 export { formatRelativeTime, normalizeServiceError, resolveBrowserUrl } from './ui.js';
-export { createNdjsonParser, createStreamMessageCollector, mapChatRole, normalizeConversation, normalizeParticipants } from './conversations.js';
+export { createNdjsonParser, createStreamMessageCollector, mapChatRole, normalizeConversation, normalizeParticipants, resolveMessageCharacterId } from './conversations.js';
 export { buildCardExportFilename, normalizeCharacter, sanitizeCharacterInput, validateCharacterForm } from './characters.js';
 export { normalizeMemory, normalizeMemorySource, validateMemoryForm } from './memory.js';
 export { checkLocalReadiness, fetchDeferredPrerequisite, normalizeAudioReadiness, normalizeChatReadiness, normalizeDeferredPrerequisite, normalizeHealthStatus, normalizeModelStatus, normalizeSettings } from './settings.js';

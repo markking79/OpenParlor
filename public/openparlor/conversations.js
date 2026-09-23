@@ -5,12 +5,41 @@ export function normalizeParticipants(raw) {
     return raw
         .filter(p => p && typeof p === 'object')
         .map(p => ({
+            id: typeof p.id === 'string'
+                ? p.id
+                : (typeof p.participantId === 'string' ? p.participantId : ''),
             characterId: typeof p.character_id === 'string'
                 ? p.character_id
                 : (typeof p.characterId === 'string' ? p.characterId : ''),
             role: typeof p.role === 'string' ? p.role : 'character',
         }))
         .filter(p => p.characterId !== '');
+}
+
+/**
+ * Resolves the character ID for a message in a conversation.
+ *
+ * Resolution order:
+ * 1. Explicit live `message.character_id` (stream messages).
+ * 2. Persisted `message.participant_id` → conversation participant → characterId.
+ * 3. Fallback to the conversation's primary `characterId`.
+ *
+ * @param {object} message - The message object (may have `character_id` or `participant_id`).
+ * @param {object} conversation - Normalized conversation with `participants` and `characterId`.
+ * @returns {string} The resolved character ID, or empty string if unresolvable.
+ */
+export function resolveMessageCharacterId(message, conversation) {
+    if (!message || typeof message !== 'object') return '';
+    if (message.role === 'user') return '';
+    if (typeof message.character_id === 'string' && message.character_id) {
+        return message.character_id;
+    }
+    if (typeof message.participant_id === 'string' && message.participant_id) {
+        const participants = (conversation && Array.isArray(conversation.participants)) ? conversation.participants : [];
+        const participant = participants.find(p => p && p.id === message.participant_id);
+        if (participant && participant.characterId) return participant.characterId;
+    }
+    return (conversation && typeof conversation.characterId === 'string') ? conversation.characterId : '';
 }
 
 export function normalizeConversation(raw) {

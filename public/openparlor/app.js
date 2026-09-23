@@ -3,7 +3,7 @@
 // entry module (openparlor.js) imports it for its side effects.
 
 import { formatRelativeTime, normalizeServiceError } from './ui.js';
-import { createNdjsonParser, createStreamMessageCollector, normalizeConversation } from './conversations.js';
+import { createNdjsonParser, createStreamMessageCollector, normalizeConversation, resolveMessageCharacterId } from './conversations.js';
 import { buildCardExportFilename, normalizeCharacter, sanitizeCharacterInput, validateCharacterForm } from './characters.js';
 import { normalizeMemory, normalizeMemorySource, validateMemoryForm } from './memory.js';
 import { fetchDeferredPrerequisite, normalizeHealthStatus, normalizeModelStatus } from './settings.js';
@@ -337,7 +337,7 @@ if (typeof document !== 'undefined') {
             const messageEl = document.createElement('div');
             messageEl.className = 'message' + (isUser ? ' user-message' : '');
 
-            const msgCharId = !isUser && msg.character_id ? msg.character_id : currentConversation.characterId;
+            const msgCharId = !isUser ? resolveMessageCharacterId(msg, currentConversation) : currentConversation.characterId;
             const char = findCharacter(msgCharId);
             const charName = char ? char.name : 'Assistant';
 
