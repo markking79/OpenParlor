@@ -3,6 +3,10 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { sync as writeFileAtomicSync } from 'write-file-atomic';
 
+import { detectImageFormat, MAX_CARD_AVATAR_BYTES } from './character-card.js';
+
+const MAX_AVATAR_READ_BYTES = MAX_CARD_AVATAR_BYTES;
+
 /**
  * @typedef {object} Character
  * @property {string} id UUID v4
@@ -401,6 +405,63 @@ export function removeCharacterAvatarFile(directories, character) {
     if (shared) return false;
     fs.unlinkSync(filePath);
     return true;
+}
+
+/**
+ * Stores an image verified from an imported character card using the same
+ * `openparlor-avatar-<timestamp>.<ext>` naming convention as avatar uploads,
+ * so the existing cleanup logic keeps managing these files. The format comes
+ * from magic-byte detection (never from declared types or file names).
+ * @param {import('../users.js').UserDirectoryList} directories
+ * @param {Buffer} imageBuffer Verified image bytes
+ * @param {{ extension: string, mime: string }} format Image format detected from magic bytes
+ * @returns {string} Browser-relative avatar URL (e.g. /user/images/openparlor-avatar-123.png)
+ */
+export function storeCharacterAvatar(directories, imageBuffer, format) {
+    const root = path.resolve(directories.root);
+    const imagesDir = path.resolve(directories.userImages);
+    if (!isWithinDirectory(root, imagesDir)) {
+        throw new Error('User images directory escapes user root');
+    }
+    fs.mkdirSync(imagesDir, { recursive: true });
+    let timestamp = Date.now();
+    let filePath;
+    do {
+        filePath = path.join(imagesDir, `openparlor-avatar-${timestamp}.${format.extension}`);
+        timestamp += 1;
+    } while (fs.existsSync(filePath));
+    writeFileAtomicSync(filePath, imageBuffer);
+    const relative = path.relative(root, filePath).split(path.sep).join('/');
+    return `/${relative}`;
+}
+
+/**
+ * Reads a character's avatar file and returns it as a base64 data URI with a
+ * MIME type derived from the file's magic bytes. Never follows paths outside
+ * the user root, and never trusts the file extension or declared type.
+ * @param {import('../users.js').UserDirectoryList} directories
+ * @param {string} avatarUrl Browser-relative avatar URL
+ * @returns {string|null} Data URI, or null when the avatar is missing, unreadable, or not a known image
+ */
+export function readCharacterAvatarDataUri(directories, avatarUrl) {
+    if (typeof avatarUrl !== 'string' || avatarUrl === ''
+        || !avatarUrl.startsWith('/') || avatarUrl.includes('\\') || avatarUrl.includes('..')) {
+        return null;
+    }
+    const root = path.resolve(directories.root);
+    const filePath = path.resolve(root, '.' + avatarUrl);
+    if (!isWithinDirectory(root, filePath)) return null;
+    let stats;
+    try {
+        stats = fs.statSync(filePath);
+    } catch {
+        return null;
+    }
+    if (!stats.isFile() || stats.size === 0 || stats.size > MAX_AVATAR_READ_BYTES) return null;
+    const buffer = fs.readFileSync(filePath);
+    const format = detectImageFormat(buffer);
+    if (!format) return null;
+    return `data:${format.mime};base64,${buffer.toString('base64')}`;
 }
 
 /**

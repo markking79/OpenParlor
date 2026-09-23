@@ -42,3 +42,28 @@ export function sanitizeCharacterInput(data) {
 
     return { name, avatarUrl, ttsVoice };
 }
+
+/**
+ * Derives a safe download file name for an exported character card from the
+ * server's Content-Disposition header, falling back to a sanitized character
+ * name. The value is never used as a URL or path — only as an attribute of a
+ * download anchor.
+ * @param {string|null|undefined} contentDisposition Content-Disposition header
+ * @param {string} fallbackName Character name
+ * @returns {string} File name ending in .json
+ */
+export function buildCardExportFilename(contentDisposition, fallbackName) {
+    const fallbackBase = (typeof fallbackName === 'string' ? fallbackName : '').trim();
+    const fallbackSafe = fallbackBase.replace(/[^\p{L}\p{N} _-]/gu, '').trim().replace(/\s+/g, '_');
+    const fallback = (fallbackSafe || 'character').slice(0, 100) + '.json';
+    if (typeof contentDisposition !== 'string') return fallback;
+    const match = /\bfilename="?([^";]+)"?/i.exec(contentDisposition);
+    if (!match) return fallback;
+    const name = match[1].trim();
+    if (name === '' || name === '.' || name === '..'
+        || name.includes('/') || name.includes('\\') || name.includes('\0')
+        || !name.toLowerCase().endsWith('.json')) {
+        return fallback;
+    }
+    return name;
+}

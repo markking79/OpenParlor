@@ -4,7 +4,7 @@
 
 import { formatRelativeTime, normalizeServiceError } from './ui.js';
 import { createNdjsonParser, createStreamMessageCollector, normalizeConversation } from './conversations.js';
-import { normalizeCharacter, sanitizeCharacterInput, validateCharacterForm } from './characters.js';
+import { buildCardExportFilename, normalizeCharacter, sanitizeCharacterInput, validateCharacterForm } from './characters.js';
 import { normalizeMemory, normalizeMemorySource, validateMemoryForm } from './memory.js';
 import { fetchDeferredPrerequisite, normalizeHealthStatus, normalizeModelStatus } from './settings.js';
 import {
@@ -40,6 +40,9 @@ if (typeof document !== 'undefined') {
     const charFormCancel = document.getElementById('charFormCancel');
     const charVoiceSelect = document.getElementById('charVoiceSelect');
     const newCharacterButton = document.getElementById('newCharacterButton');
+    const importCharacterButton = document.getElementById('importCharacterButton');
+    const importCharacterFileInput = document.getElementById('importCharacterFileInput');
+    const charExportButton = document.getElementById('charExportButton');
     const modelStatusDot = document.getElementById('modelStatusDot');
     const modelStatusBody = document.getElementById('modelStatusBody');
     const autoSpeakButton = document.getElementById('autoSpeakButton');
@@ -283,6 +286,7 @@ if (typeof document !== 'undefined') {
         populateVoiceSelect(character ? character.ttsVoice : '');
         charFormError.hidden = true;
         charFormError.textContent = '';
+        charExportButton.hidden = !character;
         characterForm.hidden = false;
         charNameInput.focus();
     }
@@ -307,6 +311,7 @@ if (typeof document !== 'undefined') {
         charVoiceSelect.value = '';
         charFormError.hidden = true;
         charFormError.textContent = '';
+        charExportButton.hidden = true;
     }
 
     function showFormError(message) {
@@ -835,6 +840,78 @@ if (typeof document !== 'undefined') {
             notice.remove();
             characterNoticeTimer = null;
         }, 6000);
+    }
+
+    // ── Character card import/export ───────────────────────────────────────
+
+    const MAX_CARD_IMPORT_BYTES = 16 * 1024 * 1024;
+
+    function isImportableCardFile(file) {
+        if (!file || typeof file.size !== 'number' || file.size === 0) return false;
+        if (file.size > MAX_CARD_IMPORT_BYTES) return false;
+        const name = (file.name || '').toLowerCase();
+        if (name.endsWith('.json') || name.endsWith('.png')) return true;
+        return file.type === 'application/json' || file.type === 'image/png';
+    }
+
+    async function importCharacterCard(file) {
+        if (!isImportableCardFile(file)) {
+            showCharacterNotice('Import failed: choose a character card file (.json or .png) of 16 MB or less.');
+            return;
+        }
+        importCharacterButton.disabled = true;
+        try {
+            const token = await getCsrfToken();
+            const form = new FormData();
+            form.append('file', file);
+            const res = await fetch('/api/openparlor/characters/import', {
+                method: 'POST',
+                headers: { 'X-CSRF-Token': token },
+                body: form,
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) {
+                throw new Error(normalizeServiceError(data, 'Failed to import character card'));
+            }
+            const imported = normalizeCharacter(data);
+            if (!imported || !imported.id) throw new Error('Import returned an invalid character');
+            allCharacters.push(imported);
+            characters.push(imported); // imported characters are active
+            renderCharacters();
+            showCharacterNotice(`Imported ${imported.name}.`);
+        } catch (e) {
+            showCharacterNotice('Import failed: ' + (e.message || 'unknown error'));
+        } finally {
+            importCharacterButton.disabled = false;
+        }
+    }
+
+    async function exportCharacterCard() {
+        if (!editingCharacterId) return;
+        const character = findCharacter(editingCharacterId);
+        charExportButton.disabled = true;
+        try {
+            const res = await fetch('/api/openparlor/characters/' + encodeURIComponent(editingCharacterId) + '/export');
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                throw new Error(normalizeServiceError(err, 'Failed to export character card'));
+            }
+            const blob = await res.blob();
+            const filename = buildCardExportFilename(res.headers.get('Content-Disposition'), character ? character.name : '');
+            const url = URL.createObjectURL(blob);
+            const anchor = document.createElement('a');
+            anchor.href = url;
+            anchor.download = filename;
+            anchor.rel = 'noopener';
+            document.body.appendChild(anchor);
+            anchor.click();
+            anchor.remove();
+            URL.revokeObjectURL(url);
+        } catch (e) {
+            showFormError(e.message || 'Failed to export character card');
+        } finally {
+            charExportButton.disabled = false;
+        }
     }
 
     async function fetchTtsVoices() {
@@ -1427,6 +1504,18 @@ if (typeof document !== 'undefined') {
     });
 
     newCharacterButton.addEventListener('click', () => showCharacterForm(null));
+
+    importCharacterButton.addEventListener('click', () => {
+        importCharacterFileInput.value = '';
+        importCharacterFileInput.click();
+    });
+    importCharacterFileInput.addEventListener('change', () => {
+        const file = importCharacterFileInput.files && importCharacterFileInput.files[0];
+        if (file) importCharacterCard(file);
+        importCharacterFileInput.value = '';
+    });
+
+    charExportButton.addEventListener('click', exportCharacterCard);
 
     charFormSave.addEventListener('click', handleCharacterFormSubmit);
 

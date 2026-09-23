@@ -7,7 +7,7 @@ import './app.js';
 
 export { formatRelativeTime, normalizeServiceError, resolveBrowserUrl } from './ui.js';
 export { createNdjsonParser, createStreamMessageCollector, mapChatRole, normalizeConversation, normalizeParticipants } from './conversations.js';
-export { normalizeCharacter, sanitizeCharacterInput, validateCharacterForm } from './characters.js';
+export { buildCardExportFilename, normalizeCharacter, sanitizeCharacterInput, validateCharacterForm } from './characters.js';
 export { normalizeMemory, normalizeMemorySource, validateMemoryForm } from './memory.js';
 export { checkLocalReadiness, fetchDeferredPrerequisite, normalizeAudioReadiness, normalizeChatReadiness, normalizeDeferredPrerequisite, normalizeHealthStatus, normalizeModelStatus, normalizeSettings } from './settings.js';
 export { createGroupPlaybackQueue, createPlaybackController, createRecorderController, createTranscriptionController, createVoiceTurnTimer, normalizeAutoSpeakState, normalizeTtsVoices, normalizeVoiceModeState, selectSupportedMime, shouldAutoSendTranscription, shouldAutoSpeak } from './audio.js';

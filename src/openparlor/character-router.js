@@ -1,7 +1,15 @@
 import express from 'express';
+import multer from 'multer';
 
 import * as persistence from './persistence.js';
 import { getValidVoiceIds } from './tts-router.js';
+import {
+    buildCardFilename,
+    buildExportCard,
+    detectImageFormat,
+    normalizeCardCharacter,
+    parseCardBuffer,
+} from './character-card.js';
 
 const CHARACTER_FIELDS = new Set([
     'name',
@@ -19,6 +27,15 @@ const CHARACTER_FIELDS = new Set([
     'time_aware',
 ]);
 const MAX_TEXT_LENGTH = 20_000;
+// Upload cap for character card imports: JSON cards carry the avatar as
+// base64 (bounded by MAX_CARD_AVATAR_SOURCE_LENGTH); PNG cards carry the
+// image bytes plus metadata. 16 MB stays safely above both.
+const MAX_IMPORT_BYTES = 16 * 1024 * 1024;
+
+const cardUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: MAX_IMPORT_BYTES, files: 1 },
+});
 
 function isValidId(id) {
     return typeof id === 'string' && id.length > 0 && !id.includes('/') && !id.includes('\\') && !id.includes('..');
@@ -157,6 +174,72 @@ export function createOpenParlorCharacterRouter({ persistence: persistenceModule
             }
         }
         return response.status(201).json(persistenceModule.createCharacter(auth.directories, auth.handle, validated.value));
+    });
+
+    // Import a character card (JSON or PNG with embedded card metadata) as a
+    // new character owned by the authenticated user. Every field in the card
+    // is untrusted input and passes the allow-list validation in
+    // normalizeCardCharacter; imported paths/URLs/config are never trusted.
+    router.post('/import', (request, response, next) => {
+        const auth = withAuth(request, response);
+        if (!auth) return;
+        return cardUpload.single('file')(request, response, (error) => {
+            if (error) {
+                return response.status(400).json({ error: 'Invalid card upload' });
+            }
+            next();
+        });
+    }, async (request, response) => {
+        const auth = withAuth(request, response);
+        if (!auth) return;
+        const file = request.file;
+        if (!file || !Buffer.isBuffer(file.buffer) || file.buffer.length === 0) {
+            return response.status(400).json({ error: 'A character card file is required' });
+        }
+        const parsed = parseCardBuffer(file.buffer);
+        if ('error' in parsed) return response.status(400).json({ error: parsed.error });
+
+        const card = parsed.imageBytes !== null && parsed.card.name === undefined
+            ? { ...parsed.card, name: file.originalname.replace(/\.(json|png)$/i, '') }
+            : parsed.card;
+        const normalized = normalizeCardCharacter(card);
+        if ('error' in normalized) return response.status(400).json({ error: normalized.error });
+
+        const value = { ...normalized.value };
+        if (value.tts_voice !== undefined && value.tts_voice !== '') {
+            const validVoices = await getValidVoiceIds(ttsProvider, auth.directories);
+            if (!validVoices.has(value.tts_voice)) {
+                return response.status(400).json({ error: '"tts_voice" must be a valid voice ID or empty' });
+            }
+        }
+        if (normalized.avatarBuffer !== null) {
+            const format = detectImageFormat(normalized.avatarBuffer);
+            if (!format) {
+                return response.status(400).json({ error: '"avatar" does not contain a supported image' });
+            }
+            try {
+                value.avatar_url = persistenceModule.storeCharacterAvatar(auth.directories, normalized.avatarBuffer, format);
+            } catch {
+                return response.status(500).json({ error: 'Failed to store character avatar' });
+            }
+        }
+        return response.status(201).json(persistenceModule.createCharacter(auth.directories, auth.handle, value));
+    });
+
+    // Export the owned character as a v3 character card (JSON attachment) so
+    // it can be shared with, or round-tripped through, other chat tools.
+    router.get('/:id/export', (request, response) => {
+        const auth = withAuth(request, response);
+        if (!auth) return;
+        const character = getOwnedCharacter(request, response, auth);
+        if (!character) return;
+        const avatarDataUri = persistenceModule.readCharacterAvatarDataUri
+            ? persistenceModule.readCharacterAvatarDataUri(auth.directories, character.avatar_url)
+            : null;
+        const card = buildExportCard(character, avatarDataUri);
+        response.set('Content-Type', 'application/json; charset=utf-8');
+        response.set('Content-Disposition', `attachment; filename="${buildCardFilename(character.name)}"`);
+        return response.json(card);
     });
 
     router.get('/:id', (request, response) => {
