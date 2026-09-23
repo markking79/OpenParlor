@@ -24,8 +24,11 @@
 //   top-level `openparlor` object is still accepted for backward
 //   compatibility; the standard slot wins per key when both are present.
 // - `avatar_url` (or any path/URL) from a card is never trusted. Avatars are
-//   only accepted as image bytes: PNG file bytes for PNG cards, or a
-//   base64/data-URI payload whose decoded bytes are magic-byte verified.
+//   only accepted as image bytes: PNG file bytes for PNG cards, or a bounded
+//   base64 image data URI — the standard CCv3 main icon asset in
+//   `data.assets` (type "icon", name "main"), or the legacy `avatar` field —
+//   whose decoded bytes are magic-byte verified. Remote HTTP(S) asset URIs
+//   are rejected, never fetched.
 
 import { Buffer } from 'node:buffer';
 
@@ -289,6 +292,30 @@ function isPlainObject(value) {
 }
 
 /**
+ * Reads the standard CCv3 main icon asset from a card's nested `data.assets`
+ * array: the first entry with type "icon" and name "main". Its `uri` must be
+ * a bounded base64 image data URI (same limits as the legacy `avatar`
+ * field); remote HTTP(S) URIs and any other scheme are rejected, never
+ * fetched. All other asset entries (backgrounds, chat images, other icons)
+ * are ignored.
+ * @param {Record<string, unknown> | null} data Nested card `data` object
+ * @returns {{ buffer: Buffer } | { error: string } | null} Verified image
+ *   bytes, an error, or null when no main icon asset is present
+ */
+function readMainIconAsset(data) {
+    if (data === null || !Array.isArray(data.assets)) return null;
+    for (const entry of data.assets) {
+        if (!isPlainObject(entry) || entry.type !== 'icon' || entry.name !== 'main') continue;
+        const decoded = decodeCardAvatar(entry.uri);
+        if ('error' in decoded) {
+            return { error: '"assets" main icon must be a bounded base64 image data URI' };
+        }
+        return { buffer: decoded.buffer };
+    }
+    return null;
+}
+
+/**
  * Resolves the character-facing field source of an untrusted card.
  *
  * Real SillyTavern Tavern Card V2 (`spec: "chara_card_v2"`) and V3
@@ -356,8 +383,10 @@ export function normalizeCardCharacter(card, fallbackName = '') {
         if (result.value !== '') value[mappedKey] = result.value;
     }
 
-    // v2 cards use `mes_example`, v3 cards use `example_dialogue`.
-    const dialogue = source.example_dialogue !== undefined ? source.example_dialogue : source.mes_example;
+    // CCv3 (and V2) cards use the standard `mes_example` field; the legacy
+    // `example_dialogue` field produced by earlier OpenParlor exports is
+    // still accepted. The standard field wins when both are present.
+    const dialogue = source.mes_example !== undefined ? source.mes_example : source.example_dialogue;
     if (dialogue !== undefined) {
         if (typeof dialogue !== 'string' || dialogue.length > MAX_CARD_TEXT_LENGTH) {
             return { error: `"example dialogue" must be a string up to ${MAX_CARD_TEXT_LENGTH} characters` };
@@ -389,8 +418,18 @@ export function normalizeCardCharacter(card, fallbackName = '') {
     if ('error' in extension) return extension;
     Object.assign(value, extension.value);
 
+    // Avatar precedence: the standard CCv3 main icon asset (`data.assets`)
+    // wins over the legacy `avatar` field. Both must be bounded base64 image
+    // data URIs; remote HTTP(S) URIs are rejected, never fetched. When
+    // neither yields image bytes the caller may fall back to the PNG card's
+    // own image.
     let avatarBuffer = null;
-    if (source.avatar !== undefined) {
+    const assetResult = readMainIconAsset(data);
+    if (assetResult !== null) {
+        if ('error' in assetResult) return assetResult;
+        avatarBuffer = assetResult.buffer;
+    }
+    if (avatarBuffer === null && source.avatar !== undefined) {
         const decoded = decodeCardAvatar(source.avatar);
         if ('error' in decoded) return decoded;
         avatarBuffer = decoded.buffer;
@@ -402,11 +441,15 @@ export function normalizeCardCharacter(card, fallbackName = '') {
 }
 
 /**
- * Builds a genuinely valid Tavern Card V3 export for an OpenParlor character.
- * The card follows the upstream SillyTavern spec shape: top-level `spec` and
- * `spec_version`, with every character-facing field inside the `data` object.
- * Safe required/default values are populated so the card stays compatible
- * with the upstream SillyTavern TavernCardValidator and import path.
+ * Builds a genuinely valid Character Card V3 export for an OpenParlor
+ * character. The card follows the CCv3 standard shape: top-level `spec` and
+ * `spec_version`, with every character-facing field inside the `data`
+ * object. Safe required/default values are populated so the card stays
+ * compatible with the upstream SillyTavern TavernCardValidator and import
+ * path, including the CCv3-standard `mes_example` and `group_only_greetings`
+ * fields and the standard `assets` main icon for the avatar (OpenParlor
+ * never invents group greetings, and does not emit the nonstandard
+ * `data.example_dialogue` / `data.avatar` fields).
  * OpenParlor's per-character settings go in the spec's standard client
  * extension slot (`data.extensions.openparlor`) — never at the card top
  * level and never as character-facing data.
@@ -431,6 +474,11 @@ export function buildExportCard(character, avatarDataUri) {
         openparlor.tts_voice = character.tts_voice;
     }
 
+    // CCv3 standard shape: `mes_example` (never the nonstandard
+    // `example_dialogue`), an empty `group_only_greetings` list (OpenParlor
+    // has no group greetings and never invents any), and the avatar — when
+    // present — as the standard `assets` main icon (never the nonstandard
+    // `data.avatar` field).
     /** @type {Record<string, unknown>} */
     const data = {
         name: str('name'),
@@ -443,12 +491,23 @@ export function buildExportCard(character, avatarDataUri) {
         creator_notes: '',
         creator: '',
         character_version: '',
-        example_dialogue: str('example_dialogue'),
+        mes_example: str('example_dialogue'),
+        group_only_greetings: [],
         alternate_greetings: [],
         tags: Array.isArray(character.tags) ? character.tags.filter(tag => typeof tag === 'string') : [],
         extensions: Object.keys(openparlor).length > 0 ? { openparlor } : {},
     };
-    if (avatarDataUri) data.avatar = avatarDataUri;
+    if (avatarDataUri) {
+        const mimeMatch = avatarDataUri.match(/^data:image\/([A-Za-z0-9.+-]+)/i);
+        data.assets = [
+            {
+                type: 'icon',
+                name: 'main',
+                uri: avatarDataUri,
+                ext: mimeMatch ? mimeMatch[1].toLowerCase() : 'png',
+            },
+        ];
+    }
 
     return {
         spec: 'chara_card_v3',

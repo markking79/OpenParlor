@@ -78,8 +78,10 @@ function v2Card(data = {}) {
 }
 
 /**
- * A real nested Tavern Card V3 fixture (spec chara_card_v3, spec_version
- * 3.0, character fields in `data`, example_dialogue instead of mes_example).
+ * A real nested Character Card V3 fixture in the standard shape:
+ * spec chara_card_v3, spec_version 3.0, character fields in `data`, standard
+ * `mes_example`, `group_only_greetings`, and the avatar (when present) as a
+ * `data.assets` main icon.
  * @param {Record<string, unknown>} [data] Overrides for the nested data object
  * @returns {Record<string, unknown>}
  */
@@ -98,7 +100,8 @@ function v3Card(data = {}) {
             creator_notes: '',
             creator: 'card-tester',
             character_version: '1.0',
-            example_dialogue: 'Hero: hi\nGuide: hello',
+            mes_example: 'Hero: hi\nGuide: hello',
+            group_only_greetings: [],
             alternate_greetings: [],
             tags: ['fantasy'],
             extensions: {},
@@ -373,7 +376,7 @@ describe('normalizeCardCharacter', () => {
     });
 
     it('imports a real nested V3 card (spec chara_card_v3) from data', () => {
-        const card = v3Card({ example_dialogue: 'V3: hello', tags: 'a, b' });
+        const card = v3Card({ mes_example: 'V3: hello', tags: 'a, b' });
         const result = normalizeCardCharacter(card);
         assert.ok('value' in result);
         const value = /** @type {{ value: Record<string, unknown> }} */ (result).value;
@@ -382,6 +385,73 @@ describe('normalizeCardCharacter', () => {
         assert.equal(value.first_message, 'Hello!');
         assert.equal(value.example_dialogue, 'V3: hello');
         assert.deepEqual(value.tags, ['a', 'b']);
+    });
+
+    it('prefers the standard mes_example over legacy example_dialogue; keeps legacy alone', () => {
+        const both = v3Card({ example_dialogue: 'legacy value' });
+        const mixed = normalizeCardCharacter(both);
+        assert.ok('value' in mixed);
+        // The fixture's standard mes_example wins over the legacy field.
+        assert.equal(/** @type {{ value: Record<string, unknown> }} */ (mixed).value.example_dialogue, 'Hero: hi\nGuide: hello');
+
+        const legacy = v3Card({ mes_example: undefined });
+        legacy.data.example_dialogue = 'legacy only';
+        const legacyResult = normalizeCardCharacter(legacy);
+        assert.ok('value' in legacyResult);
+        assert.equal(/** @type {{ value: Record<string, unknown> }} */ (legacyResult).value.example_dialogue, 'legacy only');
+    });
+
+    it('imports the standard CCv3 main icon asset from data.assets', () => {
+        const card = v3Card({
+            assets: [{ type: 'icon', name: 'main', uri: `data:image/png;base64,${PNG_1x1.toString('base64')}`, ext: 'png' }],
+        });
+        const result = normalizeCardCharacter(card);
+        assert.ok('value' in result);
+        assert.deepEqual(/** @type {{ avatarBuffer: Buffer }} */ (result).avatarBuffer, PNG_1x1);
+    });
+
+    it('prefers the standard main icon asset over the legacy avatar field', () => {
+        const other = Buffer.concat([PNG_1x1, Buffer.from([0x00, 0x01, 0x02, 0x03])]);
+        const card = v3Card({
+            avatar: `data:image/png;base64,${other.toString('base64')}`,
+            assets: [{ type: 'icon', name: 'main', uri: `data:image/png;base64,${PNG_1x1.toString('base64')}`, ext: 'png' }],
+        });
+        const result = normalizeCardCharacter(card);
+        assert.ok('value' in result);
+        assert.deepEqual(/** @type {{ avatarBuffer: Buffer }} */ (result).avatarBuffer, PNG_1x1);
+    });
+
+    it('ignores non-main assets and still accepts a legacy avatar field', () => {
+        const card = v3Card({
+            avatar: `data:image/png;base64,${PNG_1x1.toString('base64')}`,
+            assets: [
+                { type: 'background', name: 'bg', uri: 'https://example.com/bg.png' },
+                { type: 'icon', name: 'other', uri: 'https://example.com/other.png' },
+            ],
+        });
+        const result = normalizeCardCharacter(card);
+        assert.ok('value' in result);
+        assert.deepEqual(/** @type {{ avatarBuffer: Buffer }} */ (result).avatarBuffer, PNG_1x1);
+    });
+
+    it('rejects a remote or malformed main icon asset instead of fetching it', () => {
+        const remote = normalizeCardCharacter(v3Card({
+            assets: [{ type: 'icon', name: 'main', uri: 'https://example.com/main.png', ext: 'png' }],
+        }));
+        assert.ok('error' in remote);
+        assert.match(remote.error, /main icon/);
+
+        const notBase64 = normalizeCardCharacter(v3Card({
+            assets: [{ type: 'icon', name: 'main', uri: 'data:text/plain;base64,not-an-image' }],
+        }));
+        assert.ok('error' in notBase64);
+        assert.match(notBase64.error, /main icon/);
+
+        const oversize = normalizeCardCharacter(v3Card({
+            assets: [{ type: 'icon', name: 'main', uri: `data:image/png;base64,${'A'.repeat(MAX_CARD_AVATAR_SOURCE_LENGTH + 1)}` }],
+        }));
+        assert.ok('error' in oversize);
+        assert.match(oversize.error, /main icon/);
     });
 
     it('prefers nested data fields over duplicated top-level fields (hybrid ST files)', () => {
@@ -633,9 +703,15 @@ describe('buildExportCard', () => {
         assert.equal(data.scenario, 'scenario');
         assert.equal(data.first_mes, 'Hi!');
         assert.equal(data.system_prompt, 'You are Alice.');
-        assert.equal(data.example_dialogue, 'Alice: Hello');
+        assert.equal(data.mes_example, 'Alice: Hello');
+        assert.equal(data.example_dialogue, undefined); // never the nonstandard field
+        assert.deepEqual(data.group_only_greetings, []);
         assert.deepEqual(data.tags, ['a', 'b']);
-        assert.equal(data.avatar, 'data:image/png;base64,AAA=');
+        // The avatar is the standard CCv3 main icon asset, not data.avatar.
+        assert.deepEqual(data.assets, [
+            { type: 'icon', name: 'main', uri: 'data:image/png;base64,AAA=', ext: 'png' },
+        ]);
+        assert.equal(data.avatar, undefined);
         // OpenParlor metadata lives in the standard extension slot, not in
         // the character-facing data or at the card top level.
         assert.deepEqual(data.extensions, {
@@ -661,11 +737,14 @@ describe('buildExportCard', () => {
         assert.equal(data.creator_notes, '');
         assert.equal(data.creator, '');
         assert.equal(data.character_version, '');
-        assert.equal(data.example_dialogue, '');
+        assert.equal(data.mes_example, '');
+        assert.equal(data.example_dialogue, undefined); // never the nonstandard field
+        assert.deepEqual(data.group_only_greetings, []);
         assert.deepEqual(data.alternate_greetings, []);
         assert.deepEqual(data.tags, []);
         assert.deepEqual(data.extensions, {});
         assert.equal(data.avatar, undefined);
+        assert.equal(data.assets, undefined);
         assert.equal(new TavernCardValidator(card).validate(), 3);
     });
 
@@ -686,6 +765,15 @@ describe('buildExportCard', () => {
         });
         const parsed = parseCardBuffer(Buffer.from(JSON.stringify(card), 'utf8'));
         assert.ok('card' in parsed);
+        const exportedData = /** @type {Record<string, unknown>} */ (card.data);
+        // Explicit CCv3 standard shape assertions: the permissive upstream
+        // validator alone would also accept the nonstandard fields.
+        assert.equal(exportedData.mes_example, 'RT: hello');
+        assert.equal(exportedData.example_dialogue, undefined);
+        assert.deepEqual(exportedData.group_only_greetings, []);
+        assert.equal(exportedData.avatar, undefined);
+        assert.equal(exportedData.assets, undefined);
+        assert.equal(new TavernCardValidator(card).validate(), 3);
         const normalized = normalizeCardCharacter(/** @type {{ card: object }} */ (parsed).card);
         assert.ok('value' in normalized);
         const value = /** @type {{ value: Record<string, unknown> }} */ (normalized).value;
@@ -1011,6 +1099,13 @@ describe('character card export (HTTP)', () => {
         assert.equal(data.name, 'Export Me');
         assert.equal(data.description, 'd');
         assert.equal(data.first_mes, 'f');
+        // CCv3 standard shape, asserted explicitly (the upstream validator is
+        // permissive enough that it alone would not catch nonstandard fields).
+        assert.equal(data.mes_example, '');
+        assert.equal(data.example_dialogue, undefined);
+        assert.deepEqual(data.group_only_greetings, []);
+        assert.equal(data.avatar, undefined);
+        assert.equal(data.assets, undefined); // no avatar file on disk
         assert.equal(data.extensions.openparlor.temperature, 0.9);
         assert.equal(data.extensions.openparlor.time_aware, true);
         assert.equal(new TavernCardValidator(card).validate(), 3);
@@ -1024,12 +1119,16 @@ describe('character card export (HTTP)', () => {
         })).json();
         const res = await fetch(`${baseUrl}/api/openparlor/characters/${created.id}/export`);
         assert.equal(res.status, 200);
-        assert.equal(/** @type {Record<string, unknown>} */ ((await res.json()).data).avatar, undefined);
+        const ghostData = /** @type {Record<string, unknown>} */ ((await res.json()).data);
+        assert.equal(ghostData.avatar, undefined);
+        assert.equal(ghostData.assets, undefined);
 
         const outside = realPersistence.createCharacter(directories, 'alice', { name: 'Lurker', avatar_url: '/etc/passwd' });
         const res2 = await fetch(`${baseUrl}/api/openparlor/characters/${outside.id}/export`);
         assert.equal(res2.status, 200);
-        assert.equal(/** @type {Record<string, unknown>} */ ((await res2.json()).data).avatar, undefined);
+        const lurkerData = /** @type {Record<string, unknown>} */ ((await res2.json()).data);
+        assert.equal(lurkerData.avatar, undefined);
+        assert.equal(lurkerData.assets, undefined);
     });
 
     it('rejects export without authentication and for other users\' characters', async () => {
@@ -1055,6 +1154,9 @@ describe('character card export (HTTP)', () => {
     });
 
     it('round-trips an imported card through export and re-import', async () => {
+        const iconUri = `data:image/png;base64,${PNG_1x1.toString('base64')}`;
+        // Import uses the standard CCv3 shape: mes_example and the avatar as
+        // a data.assets main icon (no legacy example_dialogue/avatar fields).
         const original = v3Card({
             name: 'Round Trip',
             description: 'd',
@@ -1062,9 +1164,9 @@ describe('character card export (HTTP)', () => {
             scenario: 's',
             first_mes: 'Hi!',
             system_prompt: 'sp',
-            example_dialogue: 'RT: hello',
+            mes_example: 'RT: hello',
             tags: ['one', 'two'],
-            avatar: `data:image/png;base64,${PNG_1x1.toString('base64')}`,
+            assets: [{ type: 'icon', name: 'main', uri: iconUri, ext: 'png' }],
             extensions: { openparlor: { temperature: 0.3, max_tokens: 512, time_aware: false, tts_voice: 'bf_emma' } },
         });
         const first = await (await fetch(`${baseUrl}/api/openparlor/characters/import`, {
@@ -1073,16 +1175,19 @@ describe('character card export (HTTP)', () => {
         })).json();
 
         const exported = await (await fetch(`${baseUrl}/api/openparlor/characters/${first.id}/export`)).json();
-        // The export is a standard nested Tavern Card V3, not a nonstandard
+        // The export is a standard nested Character Card V3, not a nonstandard
         // OpenParlor-only shape.
         assert.equal(exported.spec, 'chara_card_v3');
         assert.equal(exported.spec_version, '3.0');
         assert.equal(new TavernCardValidator(exported).validate(), 3);
         assert.equal(exported.name, undefined);
         assert.equal(exported.data.name, 'Round Trip');
-        assert.ok(typeof exported.data.avatar === 'string' && exported.data.avatar.startsWith('data:image/png;base64,'));
-        const avatarBytes = Buffer.from(/** @type {string} */ (exported.data.avatar).split(',', 2)[1], 'base64');
-        assert.deepEqual(avatarBytes, PNG_1x1);
+        assert.equal(exported.data.mes_example, 'RT: hello');
+        assert.equal(exported.data.example_dialogue, undefined);
+        assert.deepEqual(exported.data.group_only_greetings, []);
+        assert.equal(exported.data.avatar, undefined);
+        // The avatar round-trips as the standard main icon asset.
+        assert.deepEqual(exported.data.assets, [{ type: 'icon', name: 'main', uri: iconUri, ext: 'png' }]);
         assert.deepEqual(exported.data.extensions.openparlor, {
             temperature: 0.3, max_tokens: 512, time_aware: false, tts_voice: 'bf_emma',
         });
