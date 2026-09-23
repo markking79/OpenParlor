@@ -7,6 +7,13 @@
 // - The microphone never streams continuously to STT. A lightweight energy
 //   VAD runs entirely in the browser; only a completed utterance blob is
 //   submitted to the existing /api/openparlor/stt/transcribe endpoint.
+// - Utterance audio comes from the same mono Float32 PCM frames the Web
+//   Audio graph already produces (never from a MediaRecorder container): a
+//   bounded pre-roll ring keeps the last few hundred ms while listening, and
+//   a confirmed utterance is finalized as a standalone WAV (mono, signed
+//   16-bit PCM) that ffmpeg/faster-whisper can always decode. Arbitrary
+//   middle segments of a WebM/Opus MediaRecorder stream are not guaranteed
+//   to be independently decodable, so PCM is the only safe source.
 // - The VAD is transport-agnostic: it consumes fixed-size frames
 //   ({ samples, sampleRate }) produced by an AudioWorklet (or a
 //   ScriptProcessor fallback) and exposes processFrame/hold/release/reset.
@@ -122,7 +129,7 @@ const DEFAULT_VAD_OPTIONS = {
  *   endSilenceMs?: number,
  *   maxUtteranceMs?: number,
  *   preRollMs?: number,
- *   onSpeechStart?: () => void,
+ *   onSpeechStart?: (lookbackMs: number) => void,
  *   onSpeechEnd?: (reason: 'silence'|'max-duration') => void,
  * }} [opts]
  * @returns {{
@@ -178,7 +185,13 @@ export function createEnergyVad(opts = {}) {
                     // Approximate the true speech onset: the sustained
                     // streak began speechStreakMs ago.
                     utteranceStartMs = Math.max(0, clockMs - speechStreakMs);
-                    if (onSpeechStart) onSpeechStart();
+                    if (onSpeechStart) {
+                        // Tell the caller how far back the confirmed speech
+                        // reaches so a capture layer can rewind its pre-roll
+                        // to (onset - preRoll) instead of losing the first
+                        // startSustainMs of the utterance.
+                        onSpeechStart(Math.min(speechStreakMs, clockMs));
+                    }
                 }
             } else {
                 speechStreakMs = 0;
@@ -221,6 +234,199 @@ export function createEnergyVad(opts = {}) {
     };
 }
 
+// ─── PCM utterance capture + WAV encoding ───────────────────────────────────
+// Hands-free utterances are built from the mono Float32 PCM frames the Web
+// Audio graph already posts (AudioWorklet preferred, ScriptProcessor
+// fallback). While listening, a bounded rolling ring keeps only the most
+// recent (preRollMs + maxLookbackMs) of audio. When the VAD confirms speech,
+// begin(lookbackMs) starts the utterance with that pre-roll rewound to the
+// VAD's estimated onset, and every subsequent frame is appended until
+// end() finalizes the utterance (bounded by maxUtteranceMs). Frames are
+// copied on entry: ScriptProcessor reuses its input buffer, so holding a
+// reference would silently corrupt the ring.
+
+/**
+ * Encodes mono Float32 samples as a valid standalone WAV blob
+ * (RIFF/WAVE, PCM format 1, mono, 16 bits/sample, little-endian).
+ * Samples are clamped to [-1, 1] before conversion to signed 16-bit;
+ * non-finite samples become silence. The sample rate is taken from the
+ * caller (i.e. the Web Audio frames), never hard-coded.
+ * @param {ArrayLike<number>} [samples]
+ * @param {number} [sampleRate]
+ * @returns {Blob} a `audio/wav` blob
+ */
+export function encodeWavBlob(samples, sampleRate) {
+    const n = samples && samples.length > 0 ? samples.length : 0;
+    const rate = Number.isFinite(sampleRate) && sampleRate > 0 ? Math.round(sampleRate) : 48000;
+    const dataSize = n * 2;
+    const buffer = new ArrayBuffer(44 + dataSize);
+    const view = new DataView(buffer);
+    const writeAscii = (offset, text) => {
+        for (let i = 0; i < text.length; i += 1) view.setUint8(offset + i, text.charCodeAt(i));
+    };
+    writeAscii(0, 'RIFF');
+    view.setUint32(4, 36 + dataSize, true);
+    writeAscii(8, 'WAVE');
+    writeAscii(12, 'fmt ');
+    view.setUint32(16, 16, true);          // fmt chunk size
+    view.setUint16(20, 1, true);           // audio format: PCM
+    view.setUint16(22, 1, true);           // channels: mono
+    view.setUint32(24, rate, true);        // sample rate
+    view.setUint32(28, rate * 2, true);    // byte rate
+    view.setUint16(32, 2, true);           // block align
+    view.setUint16(34, 16, true);          // bits per sample
+    writeAscii(36, 'data');
+    view.setUint32(40, dataSize, true);
+    for (let i = 0; i < n; i += 1) {
+        let v = samples[i];
+        if (!Number.isFinite(v)) v = 0;
+        if (v > 1) v = 1; else if (v < -1) v = -1;
+        view.setInt16(44 + i * 2, Math.round(v * 32767), true);
+    }
+    return new Blob([buffer], { type: 'audio/wav' });
+}
+
+/**
+ * Bounded PCM utterance buffer for hands-free mode.
+ *
+ * Deterministic and frame-driven (no wall clock): each processFrame advances
+ * the capture by the frame's own sample count, so tests can assert exact
+ * sample counts. The pre-roll ring is capped at preRollMs + maxLookbackMs
+ * (maxLookbackMs must cover the VAD's startSustainMs so the estimated speech
+ * onset is always inside the ring); the active utterance is capped at
+ * maxUtteranceMs (oldest frames drop if the VAD ever fails to endpoint).
+ *
+ * @param {{
+ *   preRollMs?: number,
+ *   maxLookbackMs?: number,
+ *   maxUtteranceMs?: number,
+ * }} [opts]
+ * @returns {{
+ *   processFrame: (frame: { samples: ArrayLike<number>, sampleRate?: number }) => void,
+ *   begin: (lookbackMs?: number) => void,
+ *   end: () => ({ samples: Float32Array, sampleRate: number, durationMs: number }) | null,
+ *   discard: () => void,
+ *   isActive: boolean,
+ *   sampleRate: number,
+ *   bufferedSamples: number,
+ * }}
+ */
+export function createPcmUtteranceCapture(opts = {}) {
+    const {
+        preRollMs = 300,
+        maxLookbackMs = 1000,
+        maxUtteranceMs = 15000,
+    } = opts;
+
+    let sampleRate = 0;
+    let ring = [];           // Float32Array copies of recent frames, oldest first
+    let ringSamples = 0;
+    let utterance = null;    // Float32Array copies while an utterance is active
+    let utteranceSamples = 0;
+    let ringCap = 0;
+    let utteranceCap = 0;
+
+    function noteRate(rate) {
+        if (sampleRate === 0) {
+            sampleRate = rate;
+            ringCap = Math.ceil(((preRollMs + maxLookbackMs) / 1000) * rate);
+            utteranceCap = Math.ceil((maxUtteranceMs / 1000) * rate);
+        }
+    }
+
+    function pushRing(frame) {
+        const copy = new Float32Array(frame.samples);
+        ring.push(copy);
+        ringSamples += copy.length;
+        while (ring.length > 1 && ringSamples > ringCap) {
+            ringSamples -= ring[0].length;
+            ring.shift();
+        }
+    }
+
+    function processFrame(frame) {
+        if (!frame || !frame.samples || frame.samples.length === 0) return;
+        const rate = frame.sampleRate > 0 ? frame.sampleRate : 48000;
+        noteRate(rate);
+        if (utterance === null) {
+            pushRing(frame);
+            return;
+        }
+        const copy = new Float32Array(frame.samples);
+        utterance.push(copy);
+        utteranceSamples += copy.length;
+        while (utterance.length > 1 && utteranceSamples > utteranceCap) {
+            utteranceSamples -= utterance[0].length;
+            utterance.shift();
+        }
+    }
+
+    // Starts capturing. The utterance is seeded with the last
+    // (preRollMs + lookbackMs) of the pre-roll ring, so it begins at the
+    // estimated speech onset minus the configured pre-roll. If the ring is
+    // shallower than that (speech started right after the session began),
+    // everything the ring holds is used.
+    function begin(lookbackMs) {
+        if (utterance !== null) return;
+        if (sampleRate === 0 || ring.length === 0) {
+            utterance = [];
+            utteranceSamples = 0;
+            return;
+        }
+        const lookback = Number.isFinite(lookbackMs) && lookbackMs > 0 ? lookbackMs : 0;
+        const reach = Math.ceil(((preRollMs + lookback) / 1000) * sampleRate);
+        const picked = [];
+        let pickedSamples = 0;
+        for (let i = ring.length - 1; i >= 0 && pickedSamples < reach; i -= 1) {
+            picked.push(ring[i]);
+            pickedSamples += ring[i].length;
+        }
+        picked.reverse();
+        utterance = picked;
+        utteranceSamples = pickedSamples;
+    }
+
+    // Finalizes the active utterance (or returns null when nothing is
+    // active or nothing was captured). The pre-roll ring is left intact so
+    // the next utterance keeps a rolling pre-roll.
+    function end() {
+        if (utterance === null) return null;
+        const merged = new Float32Array(utteranceSamples);
+        let offset = 0;
+        for (const chunk of utterance) {
+            merged.set(chunk, offset);
+            offset += chunk.length;
+        }
+        utterance = null;
+        utteranceSamples = 0;
+        if (merged.length === 0) return null;
+        return {
+            samples: merged,
+            sampleRate,
+            durationMs: (merged.length / sampleRate) * 1000,
+        };
+    }
+
+    // Discards the active utterance AND the pre-roll ring. Used when a
+    // session ends, a conversation is invalidated, or TTS playback begins,
+    // so stale (or AI) audio can never leak into the next utterance.
+    function discard() {
+        utterance = null;
+        utteranceSamples = 0;
+        ring = [];
+        ringSamples = 0;
+    }
+
+    return {
+        processFrame,
+        begin,
+        end,
+        discard,
+        get isActive() { return utterance !== null; },
+        get sampleRate() { return sampleRate; },
+        get bufferedSamples() { return ringSamples; },
+    };
+}
 
 /**
  * Hands-Free conversation state machine.
@@ -234,9 +440,12 @@ export function createEnergyVad(opts = {}) {
  * - startListening/stopListening: browser mic + audio-analysis session
  *   (startListening must release any partial resources it opened on
  *   rejection; stopListening must be safe to call when nothing is active);
- * - getUtteranceBlob(sinceMs): finalize the recorded utterance blob
- *   covering audio from sinceMs (pre-roll included) to now;
  * - transcribe(blob): the EXISTING STT endpoint path, returning text or null;
+ *   the blob is a standalone WAV produced by the internal PCM utterance
+ *   capture (see createPcmUtteranceCapture / encodeWavBlob);
+ * - captureFactory/captureOptions: injection seams for the PCM utterance
+ *   capture (default: createPcmUtteranceCapture, pre-roll and 15-second cap
+ *   aligned with the VAD options);
  * - onSendText(text): the EXISTING chat send pipeline.
  *
  * TTS cooperation (half-duplex): the app calls markSpeakingStart() when AI
@@ -250,16 +459,15 @@ export function createEnergyVad(opts = {}) {
  *   getEpoch?: () => number,
  *   startListening?: () => Promise<void>,
  *   stopListening?: () => void,
- *   getUtteranceBlob?: (sinceMs: number) => Blob | null,
- *   clearUtteranceBuffer?: () => void,
  *   transcribe?: (blob: Blob) => Promise<string | null>,
  *   onSendText?: (text: string) => Promise<void>,
  *   setTimeoutFn?: (fn: () => void, ms: number) => number,
  *   clearTimeoutFn?: (id: number) => void,
- *   now?: () => number,
  *   errorRecoveryMs?: number,
  *   vadFactory?: (opts: object) => object,
  *   vadOptions?: object,
+ *   captureFactory?: (opts: object) => object,
+ *   captureOptions?: object,
  *   onStateChange?: (state: string, info: { error?: string }) => void,
  * }} [deps]
  * @returns {{
@@ -275,6 +483,7 @@ export function createEnergyVad(opts = {}) {
  *   stateInfo: { error?: string },
  *   isActive: boolean,
  *   vad: object,
+ *   capture: object,
  * }}
  */
 export function createHandsFreeController(deps = {}) {
@@ -283,23 +492,21 @@ export function createHandsFreeController(deps = {}) {
         getEpoch = () => 0,
         startListening = async () => {},
         stopListening = () => {},
-        getUtteranceBlob = null,
-        clearUtteranceBuffer = null,
         transcribe = async () => null,
         onSendText = async () => {},
         setTimeoutFn = setTimeout,
         clearTimeoutFn = clearTimeout,
-        now = () => Date.now(),
         errorRecoveryMs = 3000,
         vadFactory = createEnergyVad,
         vadOptions = {},
+        captureFactory = createPcmUtteranceCapture,
+        captureOptions = {},
         onStateChange = null,
     } = deps;
 
     let state = HANDSFREE_STATES.OFF;
     let stateInfo = {};
     let sessionGen = 0;
-    let utteranceStartAt = 0;
     let inFlight = null;
     let errorTimer = null;
     let speakSessionGen = null;
@@ -308,6 +515,16 @@ export function createHandsFreeController(deps = {}) {
         ...vadOptions,
         onSpeechStart: handleSpeechStart,
         onSpeechEnd: handleSpeechEnd,
+    });
+
+    // The PCM utterance capture is driven by the exact same frames the VAD
+    // consumes (see onAudioFrame), which is what makes the pre-roll and the
+    // 15-second cap deterministic. Pre-roll and max-utterance defaults are
+    // aligned with the VAD options; captureOptions may override any of them.
+    const capture = captureFactory({
+        preRollMs: vadOptions.preRollMs,
+        maxUtteranceMs: vadOptions.maxUtteranceMs,
+        ...captureOptions,
     });
 
     function setState(next, info = {}) {
@@ -331,7 +548,7 @@ export function createHandsFreeController(deps = {}) {
         const hadUtterance = inFlight !== null || vad.isActive;
         inFlight = null;
         vad.reset();
-        if (hadUtterance && clearUtteranceBuffer) clearUtteranceBuffer();
+        if (hadUtterance) capture.discard();
     }
 
 
@@ -356,6 +573,9 @@ export function createHandsFreeController(deps = {}) {
             stopListening();
             return;
         }
+        // A (re-)opened mic session starts with a clean pre-roll so audio
+        // from a previous session can never seed the first utterance.
+        capture.discard();
         setState(HANDSFREE_STATES.LISTENING);
     }
 
@@ -413,10 +633,12 @@ export function createHandsFreeController(deps = {}) {
     }
 
 
-    function handleSpeechStart() {
+    function handleSpeechStart(lookbackMs) {
         if (state !== HANDSFREE_STATES.LISTENING) return;
         if (!canUseConversation()) return;
-        utteranceStartAt = now();
+        // Begin the utterance with the pre-roll rewound to the VAD's
+        // estimated speech onset (lookbackMs back from now).
+        capture.begin(lookbackMs);
         setState(HANDSFREE_STATES.HEARING);
     }
 
@@ -428,15 +650,16 @@ export function createHandsFreeController(deps = {}) {
             return;
         }
         if (inFlight) return; // defensive: an utterance is already in flight
-        const startAt = utteranceStartAt;
-        const preRoll = typeof vad.preRollMs === 'number' ? vad.preRollMs : 0;
         let blob = null;
-        if (getUtteranceBlob) {
-            try {
-                blob = getUtteranceBlob(startAt - preRoll);
-            } catch {
-                blob = null;
+        try {
+            const utterance = capture.end();
+            if (utterance && utterance.samples.length > 0) {
+                // A standalone WAV (mono, PCM16) that ffmpeg/faster-whisper
+                // can always decode — unlike mid-stream WebM/Opus chunks.
+                blob = encodeWavBlob(utterance.samples, utterance.sampleRate);
             }
+        } catch {
+            blob = null;
         }
         if (!blob) {
             setState(HANDSFREE_STATES.LISTENING);
@@ -447,7 +670,6 @@ export function createHandsFreeController(deps = {}) {
         const flight = {
             conversationId: getConversationId(),
             epoch: getEpoch(),
-            startAt,
         };
         inFlight = flight;
         setState(HANDSFREE_STATES.TRANSCRIBING);
@@ -507,6 +729,12 @@ export function createHandsFreeController(deps = {}) {
 
     function onAudioFrame(frame) {
         if (state === HANDSFREE_STATES.OFF) return;
+        // The capture layer sees every frame BEFORE the VAD: the very frame
+        // that confirms speech must already be in the pre-roll ring when
+        // begin() rewinds into it. While the AI is speaking (SPEAKING) the
+        // capture is starved entirely, so TTS audio can never enter an
+        // utterance or its pre-roll.
+        if (state !== HANDSFREE_STATES.SPEAKING) capture.processFrame(frame);
         vad.processFrame(frame);
     }
 
@@ -523,6 +751,7 @@ export function createHandsFreeController(deps = {}) {
         get stateInfo() { return stateInfo; },
         get isActive() { return state !== HANDSFREE_STATES.OFF; },
         get vad() { return vad; },
+        get capture() { return capture; },
     };
 }
 

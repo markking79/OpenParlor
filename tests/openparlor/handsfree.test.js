@@ -1,10 +1,13 @@
 // ─── TASK-VOICE-HANDSFREE-001: hands-free conversation mode ──────────────────
 // Unit tests for the browser-local half-duplex voice loop:
 // - createEnergyVad: deterministic, frame-driven RMS endpointing
+// - createPcmUtteranceCapture: bounded pre-roll ring + capped utterance
+//   buffer built from mono Float32 PCM frames
+// - encodeWavBlob: standalone RIFF/WAVE (mono, signed 16-bit PCM) output
 // - createHandsFreeController: state machine, conversation/epoch guards,
-//   TTS cooperation, device loss, and transient-error auto-recovery
-// - createContinuousRecorder: ring-buffer timeslice recording, collectBlob,
-//   clearBuffer, and mic failure handling
+//   TTS cooperation, device loss, transient-error auto-recovery, and the
+//   WAV utterance pipeline (tests assert on the exact WAV bytes that reach
+//   the transcribe() dependency)
 // Every browser API is an injected fake; nothing here touches a real mic.
 
 import { describe, it } from 'node:test';
@@ -16,11 +19,12 @@ import {
     computeFrameRms,
     createEnergyVad,
     createHandsFreeController,
+    createPcmUtteranceCapture,
+    encodeWavBlob,
     handsFreeStatusText,
     normalizeHandsFreePreference,
 } from '../../public/openparlor/handsfree.js';
 import {
-    createContinuousRecorder,
     createGroupPlaybackQueue,
     createPlaybackController,
 } from '../../public/openparlor/audio.js';
@@ -282,26 +286,21 @@ function makeController(overrides = {}) {
         epoch: 1,
         startCalls: 0,
         stopCalls: 0,
-        clearCalls: 0,
         sent: [],
-        blobSince: [],
+        blobs: [], // the WAV blobs the controller handed to transcribe()
         events: [],
     };
     const timers = makeFakeTimers();
-    let nowValue = 1000;
     const controller = createHandsFreeController({
         getConversationId: () => env.convId,
         getEpoch: () => env.epoch,
         startListening: async () => { env.startCalls += 1; },
         stopListening: () => { env.stopCalls += 1; },
-        getUtteranceBlob: (sinceMs) => {
-            env.blobSince.push(sinceMs);
-            return new Blob(['utterance']);
+        transcribe: async (blob) => {
+            env.blobs.push(blob);
+            return 'hello world';
         },
-        clearUtteranceBuffer: () => { env.clearCalls += 1; },
-        transcribe: async () => 'hello world',
         onSendText: async (text) => { env.sent.push(text); },
-        now: () => nowValue,
         setTimeoutFn: timers.setTimeout,
         clearTimeoutFn: timers.clearTimeout,
         onStateChange: (state) => { env.events.push(state); },
@@ -415,15 +414,29 @@ describe('createHandsFreeController utterance pipeline', () => {
             HANDSFREE_STATES.TRANSCRIBING,
             HANDSFREE_STATES.WAITING,
         ]);
-        // The blob request covers the utterance minus the VAD pre-roll.
-        assert.deepEqual(env.blobSince, [700], 'sinceMs = 1000 (start) - 300 (pre-roll)');
+        // The transcribed blob is a standalone WAV: the utterance started
+        // right after enable, so the pre-roll ring held only the 200 ms of
+        // loud frames at begin time; endpointing added 900 ms of silence.
+        const wav = await parseWav(env.blobs[0]);
+        assert.equal(wav.type, 'audio/wav');
+        assert.equal(wav.sampleRate, SAMPLE_RATE);
+        assert.equal(wav.channels, 1);
+        assert.equal(wav.bitsPerSample, 16);
+        assert.equal(wav.dataLen, 1100 * (SAMPLE_RATE / 1000) * 2);
+        assert.equal(wav.pcm[0], Math.round(0.1 * 32767), 'the loud onset leads the WAV');
         controller.markResponseComplete();
         assert.equal(controller.state, HANDSFREE_STATES.LISTENING);
     });
 
-    it('returns to listening when there is no utterance blob', async () => {
+    it('returns to listening when the capture yields no audio', async () => {
         const { controller, env, talkAndStop } = makeController({
-            getUtteranceBlob: () => null,
+            captureFactory: () => ({
+                processFrame: () => {},
+                begin: () => {},
+                end: () => null,
+                discard: () => {},
+                get isActive() { return false; },
+            }),
         });
         await controller.enable();
         talkAndStop();
@@ -474,12 +487,28 @@ describe('createHandsFreeController utterance pipeline', () => {
         assert.equal(controller.state, HANDSFREE_STATES.TRANSCRIBING);
         controller.invalidate();
         assert.equal(controller.state, HANDSFREE_STATES.LISTENING);
-        assert.equal(env.clearCalls, 1, 'the in-flight utterance buffer was cleared');
         await flush(); // the discarded transcribe call happens in a microtask
         resolveTranscribe('late');
         await flush();
         assert.deepEqual(env.sent, []);
         assert.equal(controller.state, HANDSFREE_STATES.LISTENING);
+    });
+
+    it('invalidate() discards buffered speech so it cannot be resubmitted', async () => {
+        const { controller, env, talkAndStop } = makeController();
+        await controller.enable();
+        feed(controller, 30, silentFrame);
+        feed(controller, 20, loudFrame);
+        assert.equal(controller.state, HANDSFREE_STATES.HEARING);
+        controller.invalidate(); // drop the in-progress utterance
+        assert.equal(controller.state, HANDSFREE_STATES.LISTENING);
+        feed(controller, 90, silentFrame);
+        talkAndStop();
+        await flush();
+        assert.equal(env.blobs.length, 1, 'only the post-invalidation utterance is sent');
+        const wav = await parseWav(env.blobs[0]);
+        const loud = wav.pcm.filter((v) => Math.abs(v) >= 1000).length;
+        assert.equal(loud, 20 * FRAME_SAMPLES, 'the discarded speech did not leak in');
     });
 
     it('invalidate() with no conversation left goes off', async () => {
@@ -498,6 +527,30 @@ describe('createHandsFreeController utterance pipeline', () => {
         assert.equal(controller.state, HANDSFREE_STATES.LISTENING);
         assert.deepEqual(env.events, [HANDSFREE_STATES.LISTENING, HANDSFREE_STATES.LISTENING]);
     });
+
+    it('repeated hands-free cycles stay bounded and produce identical WAV sizes', async () => {
+        const { controller, env, talkAndStop } = makeController();
+        await controller.enable();
+        const dataLens = [];
+        for (let cycle = 0; cycle < 3; cycle += 1) {
+            feed(controller, 30, silentFrame);
+            talkAndStop();
+            await flush();
+            const wav = await parseWav(env.blobs[cycle]);
+            dataLens.push(wav.dataLen);
+            controller.markResponseComplete();
+        }
+        assert.equal(env.blobs.length, 3, 'one independent WAV per cycle');
+        // Every cycle captures exactly 300 ms of pre-roll, 200 ms of speech,
+        // and 900 ms of endpointing silence — no growth across cycles.
+        const expectedBytes = 1400 * (SAMPLE_RATE / 1000) * 2;
+        assert.deepEqual(dataLens, [expectedBytes, expectedBytes, expectedBytes]);
+        assert.ok(
+            controller.capture.bufferedSamples <= 1300 * (SAMPLE_RATE / 1000),
+            'the pre-roll ring is bounded',
+        );
+        assert.equal(env.sent.length, 3, 'every cycle sent its text');
+    });
 });
 describe('createHandsFreeController TTS cooperation', () => {
     it('markSpeakingStart() discards an in-flight utterance and holds the VAD', async () => {
@@ -507,14 +560,35 @@ describe('createHandsFreeController TTS cooperation', () => {
         assert.equal(controller.state, HANDSFREE_STATES.HEARING);
         controller.markSpeakingStart();
         assert.equal(controller.state, HANDSFREE_STATES.SPEAKING);
-        assert.equal(env.clearCalls, 1, 'the in-flight utterance was discarded');
         // While speaking, even a complete utterance must be ignored.
         feed(controller, 20, loudFrame);
         feed(controller, 90, silentFrame);
         assert.equal(controller.state, HANDSFREE_STATES.SPEAKING);
         await flush();
         assert.deepEqual(env.sent, []);
-        assert.equal(env.blobSince.length, 0);
+        assert.equal(env.blobs.length, 0);
+    });
+
+    it('TTS hold never leaks AI audio into the next utterance', async () => {
+        const { controller, env } = makeController();
+        await controller.enable();
+        feed(controller, 30, silentFrame); // pre-roll before TTS
+        controller.markSpeakingStart();
+        feed(controller, 50, () => frame(0.5)); // TTS leaking into the mic
+        controller.markSpeakingEnd();
+        feed(controller, 30, silentFrame);
+        feed(controller, 20, loudFrame); // a new real user utterance
+        feed(controller, 90, silentFrame);
+        await flush();
+        assert.equal(env.blobs.length, 1, 'only the post-TTS utterance is transcribed');
+        const wav = await parseWav(env.blobs[0]);
+        const loud = wav.pcm.filter((v) => Math.abs(v) >= 1000).length;
+        assert.equal(loud, 20 * FRAME_SAMPLES, 'exactly the 200 ms user utterance');
+        assert.equal(
+            wav.pcm.filter((v) => Math.abs(v) >= 10000).length,
+            0,
+            'no TTS-amplitude sample made it into the WAV',
+        );
     });
 
     it('markSpeakingEnd() resumes listening and the loop works again', async () => {
@@ -625,244 +699,227 @@ describe('createHandsFreeController device loss and recovery', () => {
         assert.equal(controller.state, HANDSFREE_STATES.OFF);
     });
 });
-// ─── createContinuousRecorder ────────────────────────────────────────────────
+// ─── WAV encoding + PCM utterance capture ────────────────────────────────────
 
-function makeFakeMedia() {
-    const stopped = [];
-    const stream = {
-        getTracks: () => [{ stop: () => { stopped.push('stopped'); } }],
+// Parses a WAV blob produced by encodeWavBlob into header fields + samples.
+async function parseWav(blob) {
+    const buf = await blob.arrayBuffer();
+    const view = new DataView(buf);
+    const tag = (offset) => String.fromCharCode(
+        view.getUint8(offset), view.getUint8(offset + 1),
+        view.getUint8(offset + 2), view.getUint8(offset + 3),
+    );
+    return {
+        type: blob.type,
+        size: blob.size,
+        riff: tag(0),
+        riffSize: view.getUint32(4, true),
+        wave: tag(8),
+        fmt: tag(12),
+        fmtSize: view.getUint32(16, true),
+        format: view.getUint16(20, true),
+        channels: view.getUint16(22, true),
+        sampleRate: view.getUint32(24, true),
+        byteRate: view.getUint32(28, true),
+        blockAlign: view.getUint16(32, true),
+        bitsPerSample: view.getUint16(34, true),
+        data: tag(36),
+        dataLen: view.getUint32(40, true),
+        pcm: new Int16Array(buf.slice(44)),
     };
-    const getUserMediaCalls = [];
-    const instances = [];
-    const Ctor = class FakeMediaRecorder {
-        constructor(s, options) {
-            this.stream = s;
-            this.options = options || {};
-            this.state = 'inactive';
-            this.ondataavailable = null;
-            instances.push(this);
-        }
-        start(timeslice) {
-            this.state = 'recording';
-            this.timeslice = timeslice;
-        }
-        stop() {
-            this.state = 'inactive';
-        }
-        static isTypeSupported(mime) {
-            return mime === 'audio/webm';
-        }
-    };
-    const getUserMedia = async (constraints) => {
-        getUserMediaCalls.push(constraints);
-        return stream;
-    };
-    return { Ctor, getUserMedia, getUserMediaCalls, instances, stopped, stream };
 }
 
-describe('createContinuousRecorder', () => {
-    it('starts recording with the timeslice and reports state changes', async () => {
-        const m = makeFakeMedia();
-        const states = [];
-        const rec = createContinuousRecorder({
-            getUserMedia: m.getUserMedia,
-            MediaRecorderCtor: m.Ctor,
-            onStateChange: (s) => { states.push(s); },
-        });
-        assert.equal(rec.state, 'idle');
-        assert.equal(rec.isRecording, false);
-        await rec.start();
-        assert.equal(rec.state, 'recording');
-        assert.equal(rec.isRecording, true);
-        assert.equal(m.instances.length, 1);
-        assert.equal(m.instances[0].timeslice, 250, 'default timeslice');
-        assert.deepEqual(states, ['recording']);
-        rec.stop();
-        assert.equal(rec.state, 'idle');
-        assert.deepEqual(m.stopped, ['stopped'], 'the mic track is stopped');
+describe('encodeWavBlob', () => {
+    it('writes a valid RIFF/WAVE header for mono PCM16', async () => {
+        const wav = await parseWav(encodeWavBlob(new Float32Array([0.25, -0.25]), 16000));
+        assert.equal(wav.type, 'audio/wav');
+        assert.equal(wav.riff, 'RIFF');
+        assert.equal(wav.riffSize, 36 + 4, 'RIFF size = file size minus the first 8 bytes');
+        assert.equal(wav.wave, 'WAVE');
+        assert.equal(wav.fmt, 'fmt ');
+        assert.equal(wav.fmtSize, 16);
+        assert.equal(wav.format, 1, 'PCM');
+        assert.equal(wav.channels, 1, 'mono');
+        assert.equal(wav.sampleRate, 16000);
+        assert.equal(wav.byteRate, 32000);
+        assert.equal(wav.blockAlign, 2);
+        assert.equal(wav.bitsPerSample, 16);
+        assert.equal(wav.data, 'data');
+        assert.equal(wav.dataLen, 4);
+        assert.equal(wav.size, 48, '44-byte header + 2 samples');
+        assert.deepEqual([...wav.pcm], [8192, -8192]);
     });
 
-    it('collectBlob() returns the chunks since the given time and prunes them', async () => {
-        const m = makeFakeMedia();
-        let t = 0;
-        const rec = createContinuousRecorder({
-            getUserMedia: m.getUserMedia,
-            MediaRecorderCtor: m.Ctor,
-            now: () => t,
-        });
-        await rec.start();
-        const r = m.instances[0];
-        t = 0; r.ondataavailable({ data: new Blob(['a']) });
-        t = 100; r.ondataavailable({ data: new Blob(['b']) });
-        t = 200; r.ondataavailable({ data: new Blob(['c']) });
-        const blob = rec.collectBlob(50);
-        assert.ok(blob instanceof Blob);
-        assert.equal(blob.type, 'audio/webm');
-        assert.equal(blob.size, 2, 'only chunks at/after sinceMs (b + c)');
-        assert.equal(rec.collectBlob(100), null, 'consumed chunks are removed from the ring');
-        t = 300; r.ondataavailable({ data: new Blob(['d']) });
-        assert.equal(rec.collectBlob(250).size, 1, 'a later utterance only sees new audio');
-    });
-
-    it('collectBlob() returns null without consuming anything on a miss', async () => {
-        const m = makeFakeMedia();
-        let t = 0;
-        const rec = createContinuousRecorder({
-            getUserMedia: m.getUserMedia,
-            MediaRecorderCtor: m.Ctor,
-            now: () => t,
-        });
-        await rec.start();
-        const r = m.instances[0];
-        r.ondataavailable({ data: new Blob(['a']) });
-        assert.equal(rec.collectBlob(50), null, 'no chunk at/after sinceMs');
-        assert.equal(rec.collectBlob(0).size, 1, 'the chunk is still in the ring');
-    });
-
-    it('collectBlob() returns null on an empty ring', async () => {
-        const m = makeFakeMedia();
-        const rec = createContinuousRecorder({
-            getUserMedia: m.getUserMedia,
-            MediaRecorderCtor: m.Ctor,
-        });
-        await rec.start();
-        assert.equal(rec.collectBlob(0), null);
-    });
-
-    it('clearBuffer() empties the ring', async () => {
-        const m = makeFakeMedia();
-        const rec = createContinuousRecorder({
-            getUserMedia: m.getUserMedia,
-            MediaRecorderCtor: m.Ctor,
-        });
-        await rec.start();
-        const r = m.instances[0];
-        r.ondataavailable({ data: new Blob(['a']) });
-        rec.clearBuffer();
-        assert.equal(rec.collectBlob(0), null);
-    });
-
-    it('ignores empty dataavailable events', async () => {
-        const m = makeFakeMedia();
-        const rec = createContinuousRecorder({
-            getUserMedia: m.getUserMedia,
-            MediaRecorderCtor: m.Ctor,
-        });
-        await rec.start();
-        const r = m.instances[0];
-        r.ondataavailable({ data: new Blob([]) });
-        r.ondataavailable({ data: null });
-        assert.equal(rec.collectBlob(0), null);
-    });
-
-    it('prunes ring entries older than maxBufferMs', async () => {
-        const m = makeFakeMedia();
-        let t = 0;
-        const rec = createContinuousRecorder({
-            getUserMedia: m.getUserMedia,
-            MediaRecorderCtor: m.Ctor,
-            now: () => t,
-            maxBufferMs: 100,
-        });
-        await rec.start();
-        const r = m.instances[0];
-        t = 0; r.ondataavailable({ data: new Blob(['old']) });
-        t = 200; r.ondataavailable({ data: new Blob(['new']) });
-        assert.equal(rec.collectBlob(0).size, 3, 'only the recent chunk survived');
-    });
-
-    it('falls back to the fallback constraint when the first request fails', async () => {
-        const m = makeFakeMedia();
-        let call = 0;
-        const rec = createContinuousRecorder({
-            getUserMedia: async () => {
-                call += 1;
-                if (call === 1) throw new Error('constraint rejected');
-                return m.stream;
-            },
-            MediaRecorderCtor: m.Ctor,
-            fallbackConstraint: { audio: true },
-        });
-        await rec.start();
-        assert.equal(rec.state, 'recording');
-        assert.equal(call, 2);
-    });
-
-    it('rejects start on a mic permission denial, preserving the error name', async () => {
-        const m = makeFakeMedia();
-        const rec = createContinuousRecorder({
-            getUserMedia: async () => {
-                const e = new Error('denied');
-                e.name = 'NotAllowedError';
-                throw e;
-            },
-            MediaRecorderCtor: m.Ctor,
-        });
-        await assert.rejects(rec.start(), (e) => {
-            assert.equal(e.name, 'NotAllowedError', 'name preserved so the controller maps permission-denied');
-            assert.equal(e.message, 'Microphone permission denied.');
-            return true;
-        });
-        assert.equal(rec.state, 'error');
-        assert.equal(rec.error, 'Microphone permission denied.');
-    });
-
-    it('rejects start when the mic is unavailable', async () => {
-        const rec = createContinuousRecorder({
-            getUserMedia: async () => { throw new Error('no device'); },
-            MediaRecorderCtor: makeFakeMedia().Ctor,
-        });
-        await assert.rejects(rec.start(), /Microphone unavailable\./);
-        assert.equal(rec.state, 'error');
-        assert.equal(rec.error, 'Microphone unavailable.');
-    });
-
-    it('rejects start when MediaRecorder is unavailable', async () => {
-        const rec = createContinuousRecorder({
-            getUserMedia: makeFakeMedia().getUserMedia,
-            MediaRecorderCtor: null,
-        });
-        await assert.rejects(rec.start(), /MediaRecorder is not supported in this browser\./);
-        assert.equal(rec.state, 'error');
-        assert.equal(rec.error, 'MediaRecorder is not supported in this browser.');
-    });
-
-    it('rejects start when the MediaRecorder constructor or start() throws', async () => {
-        const m = makeFakeMedia();
-        class ThrowingRecorder extends m.Ctor {
-            start() { throw new Error('boom'); }
+    it('takes the sample rate from the argument, not a hard-coded value', async () => {
+        for (const rate of [16000, 44100, 48000]) {
+            const wav = await parseWav(encodeWavBlob(new Float32Array(100), rate));
+            assert.equal(wav.sampleRate, rate);
+            assert.equal(wav.byteRate, rate * 2);
         }
-        const rec = createContinuousRecorder({
-            getUserMedia: m.getUserMedia,
-            MediaRecorderCtor: ThrowingRecorder,
-        });
-        await assert.rejects(rec.start(), /Could not start the microphone\./);
-        assert.equal(rec.state, 'error');
-        assert.equal(rec.error, 'Could not start the microphone.');
     });
 
-    it('borrows a shared stream without stopping its tracks', async () => {
-        const m = makeFakeMedia();
-        const rec = createContinuousRecorder({
-            getUserMedia: () => Promise.resolve(m.stream),
-            MediaRecorderCtor: m.Ctor,
-            ownsStream: false,
-        });
-        await rec.start();
-        assert.equal(rec.state, 'recording');
-        rec.stop();
-        assert.equal(m.stopped.length, 0, 'a borrowed stream is never stopped by the recorder');
-        assert.equal(rec.state, 'idle');
+    it('writes exact RIFF/data lengths for the sample count', async () => {
+        const samples = new Float32Array(1000).fill(0.1);
+        const wav = await parseWav(encodeWavBlob(samples, 16000));
+        assert.equal(wav.dataLen, 2000);
+        assert.equal(wav.riffSize, 36 + 2000);
+        assert.equal(wav.size, 44 + 2000);
+        assert.equal(wav.pcm.length, 1000);
     });
 
-    it('stop() is safe when nothing is active', () => {
-        const m = makeFakeMedia();
-        const rec = createContinuousRecorder({
-            getUserMedia: m.getUserMedia,
-            MediaRecorderCtor: m.Ctor,
-        });
-        rec.stop();
-        assert.equal(rec.state, 'idle');
+    it('clamps to [-1, 1], converts to signed PCM16, and maps non-finite values to silence', async () => {
+        const wav = await parseWav(encodeWavBlob(new Float32Array([
+            1, -1, 2, -3, 0.5, -0.5, 0, NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY,
+        ]), 16000));
+        assert.deepEqual([...wav.pcm], [32767, -32767, 32767, -32767, 16384, -16383, 0, 0, 0, 0]);
+    });
+
+    it('encodes empty input as a header-only WAV', async () => {
+        const wav = await parseWav(encodeWavBlob(new Float32Array(0), 16000));
+        assert.equal(wav.size, 44);
+        assert.equal(wav.dataLen, 0);
+        assert.equal(wav.pcm.length, 0);
+    });
+});
+
+// ─── createPcmUtteranceCapture ───────────────────────────────────────────────
+
+describe('createPcmUtteranceCapture', () => {
+    it('keeps the pre-roll ring bounded while listening', () => {
+        const cap = createPcmUtteranceCapture();
+        for (let i = 0; i < 500; i += 1) cap.processFrame(loudFrame());
+        // 5 s of frames fed in, but the ring is capped at pre-roll (300 ms)
+        // plus the maximum onset lookback (1000 ms).
+        assert.equal(cap.bufferedSamples, 1300 * (SAMPLE_RATE / 1000));
+        assert.equal(cap.sampleRate, SAMPLE_RATE);
+        assert.equal(cap.isActive, false);
+    });
+
+    it('retains the configured pre-roll before speech starts', () => {
+        const cap = createPcmUtteranceCapture();
+        for (let i = 0; i < 30; i += 1) cap.processFrame(silentFrame()); // 300 ms
+        cap.begin(0);
+        const out = cap.end();
+        assert.equal(out.samples.length, 300 * (SAMPLE_RATE / 1000));
+        assert.equal(out.sampleRate, SAMPLE_RATE);
+        assert.ok(out.durationMs > 299 && out.durationMs < 301);
+        assert.ok([...out.samples].every((v) => Math.abs(v - 0.001) < 1e-6));
+    });
+
+    it('discards audio older than the pre-roll window', () => {
+        const cap = createPcmUtteranceCapture();
+        for (let i = 0; i < 100; i += 1) cap.processFrame(frame(0.0001)); // 1 s
+        cap.begin(0);
+        const out = cap.end();
+        assert.equal(out.samples.length, 300 * (SAMPLE_RATE / 1000), 'only the last 300 ms remain, not the full second');
+    });
+
+    it('includes the VAD onset lookback requested at begin()', () => {
+        const cap = createPcmUtteranceCapture();
+        for (let i = 0; i < 30; i += 1) cap.processFrame(silentFrame());
+        for (let i = 0; i < 20; i += 1) cap.processFrame(loudFrame()); // 200 ms loud
+        cap.begin(200); // speech confirmed 200 ms into the loud run
+        const out = cap.end();
+        assert.equal(out.samples.length, 500 * (SAMPLE_RATE / 1000));
+        // The first 300 ms must be silence, the last 200 ms the loud onset.
+        assert.ok([...out.samples.slice(0, 4800)].every((v) => Math.abs(v - 0.001) < 1e-6));
+        assert.ok([...out.samples.slice(4800)].every((v) => Math.abs(v - 0.1) < 1e-6));
+    });
+
+    it('retains every frame from begin() until end()', () => {
+        const cap = createPcmUtteranceCapture();
+        for (let i = 0; i < 30; i += 1) cap.processFrame(silentFrame());
+        cap.begin(0);
+        for (let i = 0; i < 50; i += 1) cap.processFrame(loudFrame());
+        const out = cap.end();
+        assert.equal(out.samples.length, 800 * (SAMPLE_RATE / 1000));
+        assert.equal(cap.isActive, false, 'the utterance is consumed by end()');
+    });
+
+    it('hard-caps the active utterance at the max duration', () => {
+        const cap = createPcmUtteranceCapture();
+        cap.begin(0);
+        for (let i = 0; i < 2000; i += 1) cap.processFrame(loudFrame()); // 20 s
+        const out = cap.end();
+        assert.equal(out.samples.length, 15000 * (SAMPLE_RATE / 1000), 'oldest frames drop, newest are kept');
+    });
+
+    it('discard() clears the active utterance and the pre-roll ring', () => {
+        const cap = createPcmUtteranceCapture();
+        for (let i = 0; i < 30; i += 1) cap.processFrame(silentFrame());
+        cap.begin(0);
+        for (let i = 0; i < 20; i += 1) cap.processFrame(loudFrame());
+        cap.discard();
+        assert.equal(cap.isActive, false);
+        assert.equal(cap.bufferedSamples, 0);
+        assert.equal(cap.end(), null);
+    });
+
+    it('end() without an active utterance returns null, and at most once per utterance', () => {
+        const cap = createPcmUtteranceCapture();
+        cap.processFrame(silentFrame());
+        assert.equal(cap.end(), null);
+        cap.begin(0);
+        cap.end();
+        assert.equal(cap.end(), null, 'a finished utterance is consumed exactly once');
+    });
+
+    it('begin() while active is a no-op', () => {
+        const cap = createPcmUtteranceCapture();
+        for (let i = 0; i < 30; i += 1) cap.processFrame(silentFrame());
+        cap.begin(0);
+        cap.begin(200); // must not re-seed or extend the first utterance
+        for (let i = 0; i < 20; i += 1) cap.processFrame(loudFrame());
+        const out = cap.end();
+        assert.equal(out.samples.length, 500 * (SAMPLE_RATE / 1000));
+    });
+
+    it('takes the sample rate from the frames it is fed', () => {
+        const cap = createPcmUtteranceCapture();
+        const f = (amp) => ({ samples: new Float32Array(441).fill(amp), sampleRate: 44100 });
+        for (let i = 0; i < 5; i += 1) cap.processFrame(f(0.001));
+        cap.begin(0);
+        cap.processFrame(f(0.1));
+        const out = cap.end();
+        assert.equal(out.sampleRate, 44100);
+        assert.equal(out.samples.length, 6 * 441);
+    });
+
+    it('copies frames on entry (ScriptProcessor reuses its input buffer)', () => {
+        const cap = createPcmUtteranceCapture();
+        const reused = new Float32Array(FRAME_SAMPLES).fill(0.001);
+        cap.processFrame({ samples: reused, sampleRate: SAMPLE_RATE });
+        reused.fill(0.5); // the "input buffer" is overwritten with the next audio
+        cap.begin(0);
+        const out = cap.end();
+        assert.ok(out.samples.every((v) => Math.abs(v - 0.001) < 1e-6), 'the earlier audio was snapshotted');
+    });
+
+    it('ignores invalid frames', () => {
+        const cap = createPcmUtteranceCapture();
+        cap.processFrame(null);
+        cap.processFrame({});
+        cap.processFrame({ samples: new Float32Array(0) });
+        assert.equal(cap.bufferedSamples, 0);
+        cap.begin(0);
+        cap.processFrame(null);
+        assert.equal(cap.end(), null, 'no samples were ever captured');
+    });
+
+    it('consecutive utterances are independent', () => {
+        const cap = createPcmUtteranceCapture();
+        for (let i = 0; i < 30; i += 1) cap.processFrame(silentFrame());
+        cap.begin(0);
+        for (let i = 0; i < 20; i += 1) cap.processFrame(loudFrame());
+        const first = cap.end();
+        for (let i = 0; i < 30; i += 1) cap.processFrame(silentFrame());
+        cap.begin(0);
+        for (let i = 0; i < 10; i += 1) cap.processFrame(loudFrame());
+        const second = cap.end();
+        assert.equal(first.samples.length, 500 * (SAMPLE_RATE / 1000));
+        assert.equal(second.samples.length, 400 * (SAMPLE_RATE / 1000));
+        first.samples[0] = 0.9; // mutating one result must not affect the other
+        assert.notEqual(second.samples[0], 0.9);
     });
 });
 
@@ -1095,71 +1152,5 @@ describe('playback × hands-free integration (real controllers)', () => {
         assert.equal(calls, 0, 'a failed start must not complete itself');
         failing.stop();
         assert.equal(calls, 0, 'and a later stop must not fire the discarded callback');
-    });
-});
-
-// ─── Recorder startup failure × Hands-Free (integration) ───────────────────
-// A continuous-recorder startup failure must reject startListening so the
-// controller lands in a controlled error state — never LISTENING — while the
-// app-level teardown (mirrored here) stops the shared mic stream exactly
-// once so the microphone indicator goes off.
-
-describe('recorder startup failure × hands-free (integration)', () => {
-    function makeSharedMicWiring(getUserMedia, MediaRecorderCtor) {
-        const track = { stopped: 0, stop() { this.stopped += 1; } };
-        const sharedStream = { getTracks: () => [track] };
-        const recorder = createContinuousRecorder({
-            getUserMedia,
-            MediaRecorderCtor,
-            ownsStream: false,
-        });
-        const startListening = async () => {
-            try {
-                await recorder.start();
-            } catch (e) {
-                recorder.stop();
-                for (const t of sharedStream.getTracks()) t.stop();
-                throw e;
-            }
-        };
-        return { track, startListening, recorder };
-    }
-
-    it('never reports LISTENING when the continuous recorder fails to start', async () => {
-        const states = [];
-        const { track, startListening, recorder } = makeSharedMicWiring(
-            () => Promise.resolve({ getTracks: () => [track] }),
-            null, // unsupported MediaRecorder → start() must reject
-        );
-        const hf = createHandsFreeController({
-            getConversationId: () => 'conv-1',
-            startListening,
-            stopListening: () => {},
-            onStateChange: (s) => { states.push(s); },
-        });
-        await hf.enable();
-        assert.equal(hf.state, HANDSFREE_STATES.ERROR, 'a failed recorder must leave a controlled error state');
-        assert.equal(hf.stateInfo.error, 'microphone');
-        assert.equal(states[states.length - 1], HANDSFREE_STATES.ERROR, 'the final reported state is error, not listening');
-        assert.equal(track.stopped, 1, 'the shared mic track stops exactly once (indicator off)');
-        assert.equal(recorder.state, 'idle', 'the recorder is torn down');
-    });
-
-    it('maps a recorder permission denial to permission-denied', async () => {
-        const deny = new Error('denied');
-        deny.name = 'NotAllowedError';
-        const { track, startListening } = makeSharedMicWiring(
-            () => Promise.reject(deny),
-            makeFakeMedia().Ctor,
-        );
-        const hf = createHandsFreeController({
-            getConversationId: () => 'conv-1',
-            startListening,
-            stopListening: () => {},
-        });
-        await hf.enable();
-        assert.equal(hf.state, HANDSFREE_STATES.ERROR);
-        assert.equal(hf.stateInfo.error, 'permission-denied', 'the preserved error name selects the denial message');
-        assert.equal(track.stopped, 1, 'the shared mic track stops exactly once (indicator off)');
     });
 });

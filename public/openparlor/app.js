@@ -77,7 +77,6 @@ import { normalizeMemory, normalizeMemorySource, validateMemoryForm } from './me
 import { createFirstTokenEstimator, estimateResponseStartProgress, formatResponseStartProgress } from './progress.js';
 import { fetchDeferredPrerequisite, normalizeHealthStatus, normalizeModelStatus } from './settings.js';
 import {
-    createContinuousRecorder,
     createGroupPlaybackQueue,
     createPlaybackController,
     createRecorderController,
@@ -2184,11 +2183,12 @@ if (typeof document !== 'undefined') {
     // ── Hands-free conversation mode (TASK-VOICE-HANDSFREE-001) ─────────────
     //
     // Browser-local half-duplex voice loop. The microphone never streams to
-    // STT: an energy VAD fed by AudioWorklet frames detects utterances, the
-    // continuous recorder finalizes each utterance as a blob, and the blob
-    // goes through the EXISTING transcription controller → STT endpoint →
-    // auto send. Enabling always requires an explicit user gesture; the
-    // persisted preference only remembers that hands-free was preferred.
+    // STT: an energy VAD fed by AudioWorklet PCM frames detects utterances, a
+    // bounded PCM capture finalizes each utterance as a standalone WAV, and
+    // the WAV goes through the EXISTING transcription controller → STT
+    // endpoint → auto send. Enabling always requires an explicit user
+    // gesture; the persisted preference only remembers that hands-free was
+    // preferred.
 
     const HANDSFREE_PREF_KEY = 'openparlor-hands-free';
 
@@ -2207,9 +2207,10 @@ if (typeof document !== 'undefined') {
     }
 
     // One Hands-Free session owns exactly ONE browser microphone capture
-    // (handsFreeStream), shared between the MediaRecorder utterance buffer
-    // and the Web Audio / VAD graph. The tracks are stopped exactly once,
-    // by stopHandsFreeStream() inside teardownHandsFreeAudio().
+    // (handsFreeStream), consumed by the Web Audio / VAD graph, which also
+    // produces the PCM frames the utterance capture encodes into WAVs. The
+    // tracks are stopped exactly once, by stopHandsFreeStream() inside
+    // teardownHandsFreeAudio().
     let handsFreeAudio = null;
     let handsFreeStream = null;
 
@@ -2271,7 +2272,6 @@ if (typeof document !== 'undefined') {
     // failure paths without double-stopping the shared stream's tracks.
     function teardownHandsFreeAudio() {
         stopHandsFreeAudio();
-        handsFreeRecorder.stop();
         stopHandsFreeStream();
     }
 
@@ -2325,22 +2325,14 @@ if (typeof document !== 'undefined') {
         handsFreeAudio = { ctx, source, node, sink, workletUrl };
     }
 
-    // The recorder does not open its own microphone: it borrows the shared
-    // hands-free stream and must not stop tracks it does not own.
-    const handsFreeRecorder = createContinuousRecorder({
-        getUserMedia: () => Promise.resolve(handsFreeStream),
-        ownsStream: false,
-    });
-
     handsfree = createHandsFreeController({
         getConversationId: () => (currentConversation ? currentConversation.id : ''),
         getEpoch: () => selectionEpoch,
         startListening: async () => {
-            // Acquire the single shared mic capture, then hand the same
-            // stream to both consumers.
+            // Acquire the single shared mic capture, then build the Web
+            // Audio graph that feeds the VAD and the PCM utterance capture.
             await acquireHandsFreeStream();
             try {
-                await handsFreeRecorder.start();
                 await startHandsFreeAudio();
             } catch (e) {
                 teardownHandsFreeAudio();
@@ -2350,8 +2342,6 @@ if (typeof document !== 'undefined') {
         stopListening: () => {
             teardownHandsFreeAudio();
         },
-        getUtteranceBlob: (sinceMs) => handsFreeRecorder.collectBlob(sinceMs),
-        clearUtteranceBuffer: () => handsFreeRecorder.clearBuffer(),
         transcribe: async (blob) => {
             voiceTurnTimer.markRecordingEnd();
             return transcription.transcribe(blob);
