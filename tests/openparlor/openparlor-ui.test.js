@@ -21,7 +21,7 @@ import {
     createTranscriptionController,
     createVoiceTurnTimer,
 } from '../../public/openparlor/openparlor.js';
-import { validateConversationTitle, createScrollScheduler, normalizeSidebarCollapsed, createSidebarState } from '../../public/openparlor/app.js';
+import { validateConversationTitle, createScrollScheduler, normalizeSidebarCollapsed, createSidebarState, shouldShowMemorySection, createMemoryRefreshGuard } from '../../public/openparlor/app.js';
 
 // ─── formatRelativeTime ─────────────────────────────────────────────────────
 
@@ -1785,5 +1785,81 @@ describe('createSidebarState', () => {
             setItem: () => { throw new Error('denied'); },
         }, keys);
         assert.doesNotThrow(() => state.set('left', true));
+    });
+});
+
+// ─── shouldShowMemorySection (DOGFOOD-006) ────────────────────────────────────
+
+describe('shouldShowMemorySection', () => {
+    test('returns true when conversation, character, and memories all present', () => {
+        assert.equal(shouldShowMemorySection({ hasConversation: true, hasCharacter: true, memoryCount: 1 }), true);
+    });
+
+    test('returns false when no conversation is selected', () => {
+        assert.equal(shouldShowMemorySection({ hasConversation: false, hasCharacter: true, memoryCount: 3 }), false);
+    });
+
+    test('returns false when conversation has no character', () => {
+        assert.equal(shouldShowMemorySection({ hasConversation: true, hasCharacter: false, memoryCount: 2 }), false);
+    });
+
+    test('returns false when there are zero memories', () => {
+        assert.equal(shouldShowMemorySection({ hasConversation: true, hasCharacter: true, memoryCount: 0 }), false);
+    });
+
+    test('returns false when all conditions are absent', () => {
+        assert.equal(shouldShowMemorySection({ hasConversation: false, hasCharacter: false, memoryCount: 0 }), false);
+    });
+
+    test('returns true for large memory count', () => {
+        assert.equal(shouldShowMemorySection({ hasConversation: true, hasCharacter: true, memoryCount: 100 }), true);
+    });
+});
+
+// ─── createMemoryRefreshGuard (DOGFOOD-006) ───────────────────────────────────
+
+describe('createMemoryRefreshGuard', () => {
+    test('initial generation is not current (no begin called)', () => {
+        const guard = createMemoryRefreshGuard();
+        assert.equal(guard.isCurrent(0), false);
+    });
+
+    test('begin returns incrementing generations', () => {
+        const guard = createMemoryRefreshGuard();
+        assert.equal(guard.begin(), 1);
+        assert.equal(guard.begin(), 2);
+        assert.equal(guard.begin(), 3);
+    });
+
+    test('latest generation is current', () => {
+        const guard = createMemoryRefreshGuard();
+        const g1 = guard.begin();
+        const g2 = guard.begin();
+        assert.equal(guard.isCurrent(g2), true);
+    });
+
+    test('superseded generation is not current', () => {
+        const guard = createMemoryRefreshGuard();
+        const g1 = guard.begin();
+        guard.begin(); // supersede g1
+        assert.equal(guard.isCurrent(g1), false);
+    });
+
+    test('simulates stale response being discarded', () => {
+        const guard = createMemoryRefreshGuard();
+        // First refresh begins
+        const gen1 = guard.begin();
+        // Second refresh begins (user switched conversation)
+        const gen2 = guard.begin();
+        // First response arrives — should be discarded
+        assert.equal(guard.isCurrent(gen1), false, 'stale response must be rejected');
+        // Second response arrives — should be accepted
+        assert.equal(guard.isCurrent(gen2), true, 'current response must be accepted');
+    });
+
+    test('single refresh without supersede remains current', () => {
+        const guard = createMemoryRefreshGuard();
+        const gen = guard.begin();
+        assert.equal(guard.isCurrent(gen), true);
     });
 });

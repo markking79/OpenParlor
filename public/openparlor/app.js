@@ -52,6 +52,23 @@ export function createSidebarState(storage, keys) {
     }
     return { get, set };
 }
+
+export function shouldShowMemorySection({ hasConversation, hasCharacter, memoryCount }) {
+    return hasConversation && hasCharacter && memoryCount > 0;
+}
+
+export function createMemoryRefreshGuard() {
+    let generation = 0;
+    return {
+        begin() {
+            return ++generation;
+        },
+        isCurrent(gen) {
+            return gen === generation;
+        },
+    };
+}
+
 import { createNdjsonParser, createStreamMessageCollector, normalizeConversation, resolveMessageCharacterId } from './conversations.js';
 import { buildCardExportFilename, normalizeCharacter, sanitizeCharacterInput, validateCharacterForm } from './characters.js';
 import { normalizeMemory, normalizeMemorySource, validateMemoryForm } from './memory.js';
@@ -1100,27 +1117,17 @@ if (typeof document !== 'undefined') {
     // ── Memory panel ───────────────────────────────────────────────────────
 
     const memoryPanel = document.getElementById('memoryPanel');
+    const memorySection = document.getElementById('memorySection');
+    const memoryRefreshGuard = createMemoryRefreshGuard();
     let memories = [];
     let editingMemoryId = null;
 
-    async function fetchMemories(characterId) {
-        if (!characterId) {
-            memories = [];
-            return;
-        }
-        try {
-            const res = await fetch('/api/openparlor/memories?character_id=' + encodeURIComponent(characterId));
-            if (!res.ok) throw new Error('Failed to load memories');
-            const data = await res.json();
-            memories = (Array.isArray(data) ? data : []).map(normalizeMemory).filter(Boolean);
-            memories.sort((a, b) => {
-                if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
-                return b.importance - a.importance;
-            });
-        } catch {
-            memories = [];
-        }
+    function invalidateMemoryState() {
+        memoryRefreshGuard.begin();
+        memories = [];
+        renderMemoryPanel();
     }
+
 
     async function updateMemoryApi(id, body) {
         const token = await getCsrfToken();
@@ -1164,32 +1171,17 @@ if (typeof document !== 'undefined') {
 
     function renderMemoryPanel() {
         if (!memoryPanel) return;
+
+        const visible = shouldShowMemorySection({
+            hasConversation: !!currentConversation,
+            hasCharacter: !!(currentConversation && currentConversation.characterId),
+            memoryCount: memories.length,
+        });
+
+        if (memorySection) memorySection.hidden = !visible;
+        if (!visible) return;
+
         memoryPanel.innerHTML = '';
-
-        if (!currentConversation) {
-            const el = document.createElement('div');
-            el.className = 'state-empty';
-            el.textContent = 'Select a conversation to view memories.';
-            memoryPanel.appendChild(el);
-            return;
-        }
-
-        const charId = currentConversation.characterId;
-        if (!charId) {
-            const el = document.createElement('div');
-            el.className = 'state-empty';
-            el.textContent = 'No character selected.';
-            memoryPanel.appendChild(el);
-            return;
-        }
-
-        if (memories.length === 0) {
-            const el = document.createElement('div');
-            el.className = 'state-empty';
-            el.textContent = 'No memories yet.';
-            memoryPanel.appendChild(el);
-            return;
-        }
 
         for (const mem of memories) {
             const row = document.createElement('div');
@@ -1371,11 +1363,32 @@ if (typeof document !== 'undefined') {
     }
 
     async function refreshMemoryPanel() {
-        if (!currentConversation) {
-            renderMemoryPanel();
-            return;
+        // Immediately clear visible state so prior-conversation memories
+        // cannot linger while the new fetch is in flight.
+        memories = [];
+        renderMemoryPanel();
+
+        if (!currentConversation || !currentConversation.characterId) return;
+
+        const gen = memoryRefreshGuard.begin();
+        const charId = currentConversation.characterId;
+
+        try {
+            const res = await fetch('/api/openparlor/memories?character_id=' + encodeURIComponent(charId));
+            if (!res.ok) throw new Error('Failed to load memories');
+            const data = await res.json();
+            // Stale guard: discard if a newer refresh started or conversation changed.
+            if (!memoryRefreshGuard.isCurrent(gen)) return;
+            if (!currentConversation || currentConversation.characterId !== charId) return;
+            memories = (Array.isArray(data) ? data : []).map(normalizeMemory).filter(Boolean);
+            memories.sort((a, b) => {
+                if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+                return b.importance - a.importance;
+            });
+        } catch {
+            if (!memoryRefreshGuard.isCurrent(gen)) return;
+            memories = [];
         }
-        await fetchMemories(currentConversation.characterId);
         renderMemoryPanel();
     }
 
@@ -1541,6 +1554,7 @@ if (typeof document !== 'undefined') {
             updatePlaybackButtons();
             updateRecorderUI();
             updateTranscriptionStatus();
+            invalidateMemoryState();
         }
 
         try {
@@ -1587,6 +1601,7 @@ if (typeof document !== 'undefined') {
         groupQueue.clear();
         playback.stop();
         voiceTurnTimer.cancel();
+        invalidateMemoryState();
         try {
             renderState(messagesEl, 'loading', 'Loading…');
             await fetchConversation(id);
@@ -1611,6 +1626,7 @@ if (typeof document !== 'undefined') {
 
         try {
             newChatButton.disabled = true;
+            invalidateMemoryState();
             const conv = await createConversation(charId, title);
             conversations.unshift(conv);
             currentConversation = conv;
