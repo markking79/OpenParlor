@@ -703,7 +703,17 @@ export function createHandsFreeController(deps = {}) {
 
     function markSpeakingStart() {
         if (state === HANDSFREE_STATES.OFF) return;
-        if (state !== HANDSFREE_STATES.SPEAKING) discardUtterance();
+        // When transitioning to speaking, discard any in-flight utterance and
+        // clear the pre‑roll ring so that stale user audio from before TTS does
+        // not leak into the next recording. This is required for the
+        // "stale pre‑roll survives across TTS" finding.
+        if (state !== HANDSFREE_STATES.SPEAKING) {
+            discardUtterance();
+            // Ensure the capture ring is cleared even if there was no active
+            // utterance. This guarantees that any audio captured while the
+            // mic was listening before TTS is not carried over.
+            capture.discard();
+        }
         vad.hold();
         speakSessionGen = sessionGen;
         setState(HANDSFREE_STATES.SPEAKING);

@@ -591,6 +591,31 @@ describe('createHandsFreeController TTS cooperation', () => {
         );
     });
 
+    it('stale pre‑roll is cleared when entering speaking', async () => {
+        const { controller, env } = makeController();
+        await controller.enable();
+        // Feed sub‑VAD audio that would normally sit in the pre‑roll ring.
+        feed(controller, 30, silentFrame); // 300 ms of low‑amplitude audio
+        controller.markSpeakingStart();
+        // No TTS audio is needed for this test; the important part is that
+        // the pre‑roll ring is cleared.
+        controller.markSpeakingEnd();
+        // Begin a new real utterance. It should start with a clean pre‑roll.
+        feed(controller, 20, loudFrame); // user speech
+        feed(controller, 90, silentFrame); // endpointing silence
+        await flush();
+        assert.equal(env.blobs.length, 1, 'one utterance should be transcribed');
+        const wav = await parseWav(env.blobs[0]);
+        // The total number of samples should correspond to 200 ms of speech
+        // plus 900 ms of silence: 110 frames × FRAME_SAMPLES = 17600 samples.
+        const expectedSamples = 110 * FRAME_SAMPLES;
+        assert.equal(
+            wav.pcm.length,
+            expectedSamples,
+            'pre‑roll cleared, only user utterance captured',
+        );
+    });
+
     it('markSpeakingEnd() resumes listening and the loop works again', async () => {
         const { controller, env, talkAndStop } = makeController();
         await controller.enable();
