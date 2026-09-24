@@ -632,25 +632,37 @@ export function createGroupPlaybackQueue(deps = {}) {
         _isPlaying = false;
     }
 
+    /**
+    /**
+     * Start playing the queue.  The implementation is generation‑safe: if
+     * {@link clear} increments the generation while a play is in progress, the
+     * old loop will exit gracefully without mutating the new generation's
+     * state.  Concurrent calls to {@link playAll} while a playback is
+     * already running are effectively no‑ops.
+     */
     async function playAll() {
-        if (queue.length === 0) return;
+        // No-op if already playing or queue empty.
+        if (_isPlaying || queue.length === 0) return;
         const gen = generation;
         _isPlaying = true;
         let hadError = false;
-        try {
-            for (const item of queue) {
-                if (gen !== generation) return;
-                await playItem(item.text, item.voice);
+        const promise = (async () => {
+            try {
+                while (queue.length > 0 && gen === generation) {
+                    const item = queue.shift();
+                    await playItem(item.text, item.voice);
+                }
+            } catch {
+                hadError = true;
+            } finally {
+                if (gen === generation) {
+                    _isPlaying = false;
+                    queue = [];
+                    if (!hadError && onAllDone) onAllDone();
+                }
             }
-        } catch {
-            hadError = true;
-        } finally {
-            if (gen === generation) {
-                _isPlaying = false;
-                queue = [];
-                if (!hadError && onAllDone) onAllDone();
-            }
-        }
+        })();
+        return promise;
     }
 
     return {
