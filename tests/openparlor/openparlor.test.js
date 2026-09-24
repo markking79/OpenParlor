@@ -1168,6 +1168,136 @@ describe('createGroupPlaybackQueue', () => {
         assert.equal(doneCalled, false);
         assert.equal(queue.isPlaying, false);
     });
+
+    // ---------------------------------------------------------------------
+    // Group playback concurrency tests
+    // ---------------------------------------------------------------------
+    describe('createGroupPlaybackQueue concurrency', () => {
+        it('concurrent playAll calls do not duplicate playback', async () => {
+            const played = [];
+            let onAllDoneCount = 0;
+            const queue = createGroupPlaybackQueue({
+                playItem: async (text, voice) => {
+                    if (text === 'first') {
+                        // Simulate async work that allows the second playAll to start.
+                        await new Promise(r => setTimeout(r, 10));
+                    }
+                    played.push({ text, voice });
+                },
+                onAllDone: () => { onAllDoneCount += 1; },
+            });
+            queue.enqueue('first', 'v1');
+            queue.enqueue('second', 'v2');
+            queue.enqueue('third', 'v3');
+            const p1 = queue.playAll();
+            const p2 = queue.playAll();
+            await Promise.all([p1, p2]);
+            assert.deepEqual(played, [
+                { text: 'first', voice: 'v1' },
+                { text: 'second', voice: 'v2' },
+                { text: 'third', voice: 'v3' },
+            ]);
+            assert.equal(onAllDoneCount, 1);
+            assert.equal(queue.isPlaying, false);
+            assert.equal(queue.pending, 0);
+        });
+
+        it('enqueue during playback is consumed once', async () => {
+            const played = [];
+            const queue = createGroupPlaybackQueue({
+                playItem: async (text, voice) => {
+                    played.push({ text, voice });
+                    if (text === 'first') {
+                        queue.enqueue('second', 'v2');
+                    }
+                },
+            });
+            queue.enqueue('first', 'v1');
+            await queue.playAll();
+            assert.deepEqual(played, [
+                { text: 'first', voice: 'v1' },
+                { text: 'second', voice: 'v2' },
+            ]);
+        });
+
+        it('clear while old playItem awaiting does not reset new generation', async () => {
+            const played = [];
+            let onAllDoneCalled = false;
+            const queue = createGroupPlaybackQueue({
+                playItem: async (text, voice) => {
+                    if (text === 'first') {
+                        // Long delay to allow clear to be called.
+                        await new Promise(r => setTimeout(r, 50));
+                    }
+                    played.push({ text, voice });
+                },
+                onAllDone: () => { onAllDoneCalled = true; },
+            });
+            queue.enqueue('first', 'v1');
+            const playPromise = queue.playAll();
+            // Ensure the first item has started.
+            await new Promise(r => setTimeout(r, 10));
+            queue.clear();
+            // After clear, queue should be empty and not playing.
+            assert.equal(queue.isPlaying, false);
+            assert.equal(queue.pending, 0);
+            await playPromise;
+            // onAllDone should not have been called because generation changed.
+            assert.equal(onAllDoneCalled, false);
+        });
+
+        it('new enqueue + playAll after clear starts a new generation', async () => {
+            const played = [];
+            const queue = createGroupPlaybackQueue({
+                playItem: async (text, voice) => {
+                    played.push({ text, voice });
+                },
+            });
+            queue.enqueue('first', 'v1');
+            await queue.playAll();
+            queue.clear();
+            queue.enqueue('second', 'v2');
+            queue.enqueue('third', 'v3');
+            await queue.playAll();
+            assert.deepEqual(played, [
+                { text: 'first', voice: 'v1' },
+                { text: 'second', voice: 'v2' },
+                { text: 'third', voice: 'v3' },
+            ]);
+        });
+    });
+
+    // ---------------------------------------------------------------------
+    // Concurrency & re‑entrancy safety
+    // ---------------------------------------------------------------------
+    it('concurrent playAll calls process each item once and call onAllDone once', async () => {
+        const played = [];
+        let onAllDoneCount = 0;
+        const queue = createGroupPlaybackQueue({
+            playItem: async (text, voice) => {
+                // Simulate async work for the first item.
+                if (text === 'first') {
+                    // Enqueue a new item during playback.
+                    queue.enqueue('second', 'v2');
+                    await new Promise(r => setTimeout(r, 10));
+                }
+                played.push({ text, voice });
+            },
+            onAllDone: () => { onAllDoneCount += 1; },
+        });
+        queue.enqueue('first', 'v1');
+        // Start two concurrent playAll calls.
+        const [p1, p2] = await Promise.all([queue.playAll(), queue.playAll()]);
+        await p1;
+        await p2;
+        // Ensure each item played once.
+        assert.deepEqual(played, [
+            { text: 'first', voice: 'v1' },
+            { text: 'second', voice: 'v2' },
+        ]);
+        // onAllDone should be called only once.
+        assert.equal(onAllDoneCount, 1);
+    });
 });
 
 describe('normalizeModelStatus', () => {
@@ -1800,7 +1930,7 @@ describe('createPlaybackController', () => {
 
     it('should call onEnded when audio ends naturally', async () => {
         const mockAudio = createMockAudio('blob:test');
-        let endedCalled = false;
+        let endedCalled = 0;
 
         const controller = createPlaybackController({
             fetchFn: async () => ({ ok: true, blob: async () => new Blob(['audio']) }),
@@ -1809,11 +1939,13 @@ describe('createPlaybackController', () => {
             audioFactory: () => mockAudio,
         });
 
-        controller.onEnded = () => { endedCalled = true; };
-        await controller.play('Hello', 'voice-a');
+        await controller.play('Hello', 'voice-a', () => { endedCalled++; });
+        assert.equal(endedCalled, 0, 'starting playback must not complete it');
         mockAudio._fire('ended');
-        assert.equal(endedCalled, true);
+        assert.equal(endedCalled, 1, 'callback fires exactly once on natural end');
         assert.equal(controller.isPlaying, false);
+        mockAudio._fire('ended');
+        assert.equal(endedCalled, 1, 'a duplicate end event must not re-fire');
     });
 
     it('should send CSRF token with TTS synthesis request when provider is configured', async () => {

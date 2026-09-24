@@ -67,6 +67,9 @@
                 <button id="voiceModeButton" class="voice-mode-btn" aria-pressed="false" hidden>
                     Voice: Off
                 </button>
+                <button id="handsFreeButton" class="handsfree-btn" aria-pressed="false" hidden>
+                    Hands-free: Off
+                </button>
             </header>
 
             <div id="participantsBar" class="participants-bar" hidden>
@@ -92,6 +95,7 @@
                         <span id="recordingIndicator" class="recording-indicator" aria-label="Recording" hidden></span>
                     </div>
                     <span id="recorderError" class="recorder-error" role="status" aria-live="polite" hidden></span>
+                    <span id="handsFreeStatus" class="handsfree-status" role="status" aria-live="polite" hidden></span>
                     <span id="transcriptionStatus" class="transcription-status" role="status" aria-live="polite" hidden></span>
                     <textarea
                         id="messageInput"

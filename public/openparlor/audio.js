@@ -106,6 +106,7 @@ export function selectSupportedMime(candidates, isTypeSupported) {
  *   cancel: () => void,
  * }}
  */
+
 export function createRecorderController(deps = {}) {
     const {
         getUserMedia = (constraints) => navigator.mediaDevices.getUserMedia(constraints),
@@ -445,11 +446,22 @@ export function createVoiceTurnTimer(deps = {}) {
  *   audioFactory?: (url: string) => { play: () => Promise<void>, pause: () => void, src: string }
  * }} [deps]
  * @returns {{
- *   play: (text: string, voice: string) => Promise<string>,
+ *   play: (text: string, voice: string, onEnded?: () => void) => Promise<string | null>,
  *   stop: () => void,
- *   replay: (text: string, voice: string) => Promise<string>,
+ *   replay: (text: string, voice: string, onEnded?: () => void) => Promise<string | null>,
  *   isPlaying: boolean
  * }}
+ *
+ * Completion-callback contract: `play()`/`replay()` first tear down any
+ * current playback, then arm the new `onEnded` callback tagged with the new
+ * generation — so the previous teardown can never consume the new
+ * playback's callback, and the callback is in place before the new audio
+ * can complete. The armed callback fires exactly once, and only when the
+ * playback actually started: on the audio's natural 'ended' event, or when
+ * stop() is called explicitly while it is the current playback. A replaced
+ * playback (superseded by a newer play) or a failed start discards its
+ * callback without firing it — in the failed case the Promise rejects, and
+ * in the replaced case it resolves null.
  */
 export function createPlaybackController(deps = {}) {
     const {
@@ -464,10 +476,10 @@ export function createPlaybackController(deps = {}) {
     let currentUrl = null;
     let _isPlaying = false;
     let generation = 0;
-    let _onEnded = null;
+    let endHandler = null;
+    let endHandlerGen = 0;
 
-    function stop() {
-        generation++;
+    function releaseAudio() {
         if (currentAudio) {
             currentAudio.pause();
             currentAudio.src = '';
@@ -478,55 +490,101 @@ export function createPlaybackController(deps = {}) {
             currentUrl = null;
         }
         _isPlaying = false;
-        if (_onEnded) {
-            const cb = _onEnded;
-            _onEnded = null;
-            cb();
-        }
     }
 
-    async function play(text, voice) {
-        stop();
+    function stop() {
+        generation += 1;
+        const ended = endHandler;
+        const endedGen = endHandlerGen;
+        endHandler = null;
+        endHandlerGen = 0;
+        releaseAudio();
+        // An explicit stop resolves the playback that was current until
+        // this call (armed at generation-1) exactly once. A callback armed
+        // at any other generation (e.g. by an in-flight superseded play)
+        // is stale and is dropped.
+        if (ended && endedGen === generation - 1) ended();
+    }
+
+    function cancelCurrent() {
+        // Replacement inside play(): tear down the previous playback
+        // (audio + object URL) without firing its completion callback —
+        // it was superseded, not completed or explicitly stopped, so the
+        // incoming playback takes over the speaking phase untouched.
+        generation += 1;
+        endHandler = null;
+        endHandlerGen = 0;
+        releaseAudio();
+    }
+
+    async function play(text, voice, onEnded) {
+        cancelCurrent();
         const gen = generation;
-        const headers = { 'Content-Type': 'application/json' };
-        if (getCsrfToken) {
-            const token = await getCsrfToken();
-            if (token) headers['X-CSRF-Token'] = token;
+        if (typeof onEnded === 'function') {
+            // Armed only after the previous playback is fully torn down, so
+            // this stop() call can never consume the new playback's
+            // callback, and a stale callback can never outlive this attempt.
+            endHandler = onEnded;
+            endHandlerGen = gen;
         }
-        const res = await fetchFn('/api/openparlor/tts/synthesize', {
-            method: 'POST',
-            headers,
-            body: JSON.stringify({ text, voice }),
-        });
-        if (gen !== generation) return null;
-        if (!res.ok) {
-            const err = await res.json().catch(() => ({}));
-            throw new Error(normalizeServiceError(err, 'Synthesis failed'));
-        }
-        const blob = await res.blob();
-        if (gen !== generation) return null;
-        currentUrl = createObjectURL(blob);
-        currentAudio = audioFactory(currentUrl);
-        const audio = currentAudio;
-        if (typeof audio.addEventListener === 'function') {
-            audio.addEventListener('ended', () => {
-                if (currentAudio === audio) {
-                    stop();
-                }
-            }, { once: true });
-        }
-        _isPlaying = true;
+        let audio = null;
         try {
+            const headers = { 'Content-Type': 'application/json' };
+            if (getCsrfToken) {
+                const token = await getCsrfToken();
+                if (token) headers['X-CSRF-Token'] = token;
+            }
+            const res = await fetchFn('/api/openparlor/tts/synthesize', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({ text, voice }),
+            });
+            if (gen !== generation) return null;
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                throw new Error(normalizeServiceError(err, 'Synthesis failed'));
+            }
+            const blob = await res.blob();
+            if (gen !== generation) return null;
+            currentUrl = createObjectURL(blob);
+            currentAudio = audioFactory(currentUrl);
+            audio = currentAudio;
+            if (typeof audio.addEventListener === 'function') {
+                audio.addEventListener('ended', () => {
+                    if (currentAudio !== audio) return; // replaced or stopped
+                    const url = currentUrl;
+                    currentAudio = null;
+                    currentUrl = null;
+                    _isPlaying = false;
+                    if (url) revokeObjectURL(url);
+                    const ended = endHandler;
+                    if (ended && endHandlerGen === gen) {
+                        endHandler = null;
+                        endHandlerGen = 0;
+                        ended();
+                    }
+                }, { once: true });
+            }
+            _isPlaying = true;
             await audio.play();
+            return currentUrl;
         } catch (error) {
-            if (currentAudio === audio) stop();
+            // Starting failed: this attempt never produced playback, so its
+            // callback must not fire now or later — it is discarded, and the
+            // caller is notified by the rejection itself.
+            if (endHandlerGen === gen) {
+                endHandler = null;
+                endHandlerGen = 0;
+            }
+            if (audio !== null && currentAudio === audio) {
+                stop();
+            }
             throw error;
         }
-        return currentUrl;
     }
 
-    function replay(text, voice) {
-        return play(text, voice);
+    function replay(text, voice, onEnded) {
+        return play(text, voice, onEnded);
     }
 
     return {
@@ -534,8 +592,6 @@ export function createPlaybackController(deps = {}) {
         stop,
         replay,
         get isPlaying() { return _isPlaying; },
-        set onEnded(fn) { _onEnded = fn; },
-        get onEnded() { return _onEnded; },
     };
 }
 
@@ -576,25 +632,37 @@ export function createGroupPlaybackQueue(deps = {}) {
         _isPlaying = false;
     }
 
+    /**
+    /**
+     * Start playing the queue.  The implementation is generation‑safe: if
+     * {@link clear} increments the generation while a play is in progress, the
+     * old loop will exit gracefully without mutating the new generation's
+     * state.  Concurrent calls to {@link playAll} while a playback is
+     * already running are effectively no‑ops.
+     */
     async function playAll() {
-        if (queue.length === 0) return;
+        // No-op if already playing or queue empty.
+        if (_isPlaying || queue.length === 0) return;
         const gen = generation;
         _isPlaying = true;
         let hadError = false;
-        try {
-            for (const item of queue) {
-                if (gen !== generation) return;
-                await playItem(item.text, item.voice);
+        const promise = (async () => {
+            try {
+                while (queue.length > 0 && gen === generation) {
+                    const item = queue.shift();
+                    await playItem(item.text, item.voice);
+                }
+            } catch {
+                hadError = true;
+            } finally {
+                if (gen === generation) {
+                    _isPlaying = false;
+                    queue = [];
+                    if (!hadError && onAllDone) onAllDone();
+                }
             }
-        } catch {
-            hadError = true;
-        } finally {
-            if (gen === generation) {
-                _isPlaying = false;
-                queue = [];
-                if (!hadError && onAllDone) onAllDone();
-            }
-        }
+        })();
+        return promise;
     }
 
     return {
