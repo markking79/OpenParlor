@@ -673,3 +673,358 @@ export function createGroupPlaybackQueue(deps = {}) {
         get pending() { return queue.length; },
     };
 }
+
+// ─── VOICE-002 streaming TTS: incremental sentence splitter ──────────────────────────────────────────────────────────
+
+/**
+ * Forced-break length for streaming TTS input. Buffers without a natural
+ * sentence boundary are broken at this length, preferring a whitespace
+ * position and hard-cutting only when none exists.
+ */
+const SENTENCE_SPLITTER_MAX_LENGTH = 300;
+
+/**
+ * Case-insensitive trailing abbreviations whose final period must not be
+ * treated as a sentence boundary. The candidate checked is the word
+ * immediately preceding the period (including any internal periods) plus the
+ * period itself, e.g. "U.S." for the text "U.S. government".
+ */
+const SENTENCE_SPLITTER_ABBREVIATIONS = new Set([
+    'mr.', 'mrs.', 'ms.', 'dr.', 'prof.', 'st.', 'sr.', 'jr.', 'vs.', 'etc.',
+    'e.g.', 'i.e.', 'u.s.', 'u.k.', 'a.m.', 'p.m.', 'no.', 'fig.',
+    'approx.', 'inc.', 'ltd.', 'co.', 'gen.', 'capt.', 'sgt.',
+]);
+
+/**
+ * All sentence-terminating characters. A run (cluster) of these characters
+ * counts as a single boundary.
+ */
+const SENTENCE_SPLITTER_TERMS = new Set(['.', '!', '?', '…', '。', '！', '？']);
+
+/**
+ * Terminators that end a sentence immediately without requiring confirmed
+ * following whitespace (CJK text and ellipses do not get trailing spaces).
+ */
+const SENTENCE_SPLITTER_IMMEDIATE_TERMS = new Set(['…', '。', '！', '？']);
+
+/**
+ * Closing quotes and brackets absorbed into the sentence that precedes them.
+ */
+const SENTENCE_SPLITTER_CLOSERS = new Set([
+    '"', String.fromCharCode(39), '”', '’', ')', ']', '}', '」', '』', '）', '】', '》',
+]);
+
+/**
+ * Region definitions dropped entirely from spoken output, in scan order.
+ */
+const SENTENCE_SPLITTER_BLOCKS = [
+    { name: 'fence', open: '```', close: '```' },
+    { name: 'think', open: '<' + 'think>', close: '</' + 'think>' },
+    { name: 'analysis', open: '<analysis>', close: '</analysis>' },
+];
+
+/**
+ * Creates an incremental sentence splitter for streaming TTS input.
+ *
+ * Text arrives in arbitrary chunks (for example SSE deltas). `feed` appends
+ * a chunk and returns only the sentences that became newly completed;
+ * unfinished text stays internal. `finish` flushes the final remainder
+ * exactly once and is idempotent; `feed` calls after `finish` are ignored.
+ * No text range is ever emitted twice.
+ *
+ * Sentence boundaries:
+ * - `.`, `!`, `?`, `…`, `。`, `！`, `？`; clusters such as `?!` or `!!!`
+ *   form a single boundary.
+ * - ASCII terminators (`.`, `!`, `?`) require confirmed following
+ *   whitespace — or `finish` — so decimals such as `3.5` and protected
+ *   abbreviations such as `Mr.` or `U.S.` never split early.
+ * - `…` and the CJK terminators end a sentence immediately.
+ * - Newlines end a sentence.
+ * - Closing quotes/brackets after a terminator are absorbed into the
+ *   sentence, e.g. `"Hello."` is one sentence.
+ * - A buffer without a natural boundary is force-broken at 300 characters,
+ *   preferring the last whitespace inside the first 300 characters; a hard
+ *   cut at 300 is used only when no whitespace exists.
+ *
+ * Dropped entirely, including across chunk boundaries:
+ * - triple-backtick fenced code blocks
+ * - think marker blocks (see SENTENCE_SPLITTER_BLOCKS)
+ * - `<analysis>...</analysis>` blocks
+ *
+ * An unterminated block at `finish` time is dropped; text that appeared
+ * before its opening marker is still flushed.
+ *
+ * @returns {{
+ *   feed: (chunk: string) => string[],
+ *   finish: () => string[],
+ * }}
+ */
+export function createSentenceSplitter() {
+    let buffer = '';
+    let pendingPrefix = '';
+    let inBlock = null;
+    let finished = false;
+
+    /**
+     * Finds the earliest block opening marker inside text.
+     * @param {string} text
+     * @returns {{ block: object, index: number } | null}
+     */
+    function findBlockOpen(text) {
+        let best = null;
+        for (const block of SENTENCE_SPLITTER_BLOCKS) {
+            const index = text.indexOf(block.open);
+            if (index !== -1 && (best === null || index < best.index)) {
+                best = { block: block, index: index };
+            }
+        }
+        return best;
+    }
+
+    /**
+     * True when the word immediately before the period cluster (including
+     * any internal periods) is a protected abbreviation, e.g. "U.S" for
+     * "U.S.".
+     * @param {number} clusterStart
+     * @returns {boolean}
+     */
+    function isProtectedAbbreviation(clusterStart) {
+        let start = clusterStart;
+        while (start > 0 && /[A-Za-z0-9.]/.test(buffer.charAt(start - 1))) {
+            start -= 1;
+        }
+        const candidate = buffer.slice(start, clusterStart) + '.';
+        return SENTENCE_SPLITTER_ABBREVIATIONS.has(candidate.toLowerCase());
+    }
+
+    /**
+     * Finds the earliest confirmed sentence cut inside buffer[0..safeEnd).
+     * Returns null when no cut is confirmed — including a terminator that is
+     * still waiting for confirming whitespace at the buffer end.
+     * @param {number} safeEnd
+     * @param {boolean} endConfirmed
+     * @returns {{ end: number, text: string } | null}
+     */
+    function findNaturalCut(safeEnd, endConfirmed) {
+        let i = 0;
+        while (i < safeEnd) {
+            const ch = buffer.charAt(i);
+            if (ch === '\n' || ch === '\r') {
+                let end = i + 1;
+                if (ch === '\r' && buffer.charAt(i + 1) === '\n') {
+                    end += 1;
+                }
+                return { end: end, text: buffer.slice(0, i) };
+            }
+            if (!SENTENCE_SPLITTER_TERMS.has(ch)) {
+                i += 1;
+                continue;
+            }
+            let clusterEnd = i + 1;
+            while (clusterEnd < buffer.length && SENTENCE_SPLITTER_TERMS.has(buffer.charAt(clusterEnd))) {
+                clusterEnd += 1;
+            }
+            let j = clusterEnd;
+            while (j < buffer.length && SENTENCE_SPLITTER_CLOSERS.has(buffer.charAt(j))) {
+                j += 1;
+            }
+            let immediate = false;
+            let periodOnly = true;
+            for (let k = i; k < clusterEnd; k += 1) {
+                if (buffer.charAt(k) !== '.') {
+                    periodOnly = false;
+                }
+                if (SENTENCE_SPLITTER_IMMEDIATE_TERMS.has(buffer.charAt(k))) {
+                    immediate = true;
+                }
+            }
+            let confirmed;
+            if (immediate) {
+                confirmed = true;
+            } else if (j === buffer.length) {
+                confirmed = endConfirmed;
+            } else {
+                confirmed = /\s/.test(buffer.charAt(j));
+            }
+            if (confirmed && periodOnly && isProtectedAbbreviation(i)) {
+                confirmed = false;
+            }
+            if (confirmed) {
+                return { end: j, text: buffer.slice(0, j) };
+            }
+            if (!immediate && j === buffer.length && !endConfirmed) {
+                return null;
+            }
+            i = clusterEnd;
+        }
+        return null;
+    }
+
+    /**
+     * Joins text kept before a removed block with text kept after it,
+     * inserting one space when both sides are non-whitespace so words never
+     * run together.
+     * @param {string} prefix
+     * @param {string} suffix
+     * @returns {string}
+     */
+    function joinAfterRemoval(prefix, suffix) {
+        if (prefix === '' || suffix === '') {
+            return prefix + suffix;
+        }
+        const last = prefix.charAt(prefix.length - 1);
+        const first = suffix.charAt(0);
+        if (!/\s/.test(last) && !/\s/.test(first)) {
+            return prefix + ' ' + suffix;
+        }
+        return prefix + suffix;
+    }
+
+    /**
+     * Chooses a forced break position inside the first 300 characters of
+     * text: the last whitespace position when present, else a hard cut at
+     * the limit (stepped back one code unit to keep a surrogate pair intact).
+     * @param {string} text
+     * @returns {number}
+     */
+    function forcedBreakPosition(text) {
+        const limit = SENTENCE_SPLITTER_MAX_LENGTH;
+        for (let i = Math.min(limit, text.length) - 1; i >= 0; i -= 1) {
+            if (/\s/.test(text.charAt(i))) {
+                return i > 0 ? i : limit;
+            }
+        }
+        if (limit < text.length && isHighSurrogate(text.charAt(limit - 1)) && isLowSurrogate(text.charAt(limit))) {
+            return limit - 1;
+        }
+        return limit;
+    }
+
+    function isHighSurrogate(ch) {
+        const code = ch.charCodeAt(0);
+        return code >= 0xd800 && code <= 0xdbff;
+    }
+
+    function isLowSurrogate(ch) {
+        const code = ch.charCodeAt(0);
+        return code >= 0xdc00 && code <= 0xdfff;
+    }
+
+    /**
+     * Drives the split loop until no more progress is possible and returns
+     * the sentences emitted during this pass.
+     * @param {boolean} endConfirmed
+     * @returns {string[]}
+     */
+    function process(endConfirmed) {
+        const emitted = [];
+        for (;;) {
+            if (inBlock !== null) {
+                const closeIndex = buffer.indexOf(inBlock.close);
+                if (closeIndex === -1) {
+                    // The close marker may still arrive, possibly split
+                    // across chunks, so keep only the longest tail that is
+                    // a prefix of it; the rest is dropped block content.
+                    const close = inBlock.close;
+                    let keep = 0;
+                    const maxLen = Math.min(buffer.length, close.length - 1);
+                    for (let len = maxLen; len > 0; len -= 1) {
+                        if (buffer.slice(buffer.length - len) === close.slice(0, len)) {
+                            keep = len;
+                            break;
+                        }
+                    }
+                    buffer = buffer.slice(buffer.length - keep);
+                    break;
+                }
+                buffer = joinAfterRemoval(pendingPrefix, buffer.slice(closeIndex + inBlock.close.length));
+                pendingPrefix = '';
+                inBlock = null;
+                continue;
+            }
+            const open = findBlockOpen(buffer);
+            const safeEnd = open !== null ? open.index : buffer.length;
+            const cut = findNaturalCut(Math.min(safeEnd, SENTENCE_SPLITTER_MAX_LENGTH), endConfirmed);
+            if (cut !== null) {
+                const text = cut.text.trim();
+                if (text !== '') {
+                    emitted.push(text);
+                }
+                buffer = buffer.slice(cut.end);
+                continue;
+            }
+            if (open !== null) {
+                const closeIndex = buffer.indexOf(open.block.close, open.index + open.block.open.length);
+                if (closeIndex === -1) {
+                    pendingPrefix = buffer.slice(0, open.index);
+                    buffer = buffer.slice(open.index + open.block.open.length);
+                    inBlock = open.block;
+                    break;
+                }
+                buffer = joinAfterRemoval(buffer.slice(0, open.index), buffer.slice(closeIndex + open.block.close.length));
+                continue;
+            }
+            if (buffer.length >= SENTENCE_SPLITTER_MAX_LENGTH) {
+                const pos = forcedBreakPosition(buffer);
+                const text = buffer.slice(0, pos).trim();
+                if (text !== '') {
+                    emitted.push(text);
+                }
+                buffer = buffer.slice(pos);
+                continue;
+            }
+            break;
+        }
+        return emitted;
+    }
+
+    /**
+     * Appends a chunk to the stream and returns the newly completed
+     * speakable sentences. Calls after `finish` are ignored.
+     * @param {string} chunk
+     * @returns {string[]}
+     */
+    function feed(chunk) {
+        if (finished || typeof chunk !== 'string') {
+            return [];
+        }
+        buffer += chunk;
+        return process(false);
+    }
+
+    /**
+     * Flushes the final remainder exactly once. Idempotent: later calls
+     * return an empty array.
+     * @returns {string[]}
+     */
+    function finish() {
+        if (finished) {
+            return [];
+        }
+        finished = true;
+        const emitted = process(true);
+        // Content still inside an open block was never speakable, so only
+        // the held prefix (text before the open marker) is flushed.
+        let rest = inBlock !== null ? pendingPrefix : buffer;
+        pendingPrefix = '';
+        buffer = '';
+        inBlock = null;
+        // A held prefix (from an unterminated block) can still exceed the
+        // forced length, so apply the same 300-character rule here.
+        while (rest.length >= SENTENCE_SPLITTER_MAX_LENGTH) {
+            const pos = forcedBreakPosition(rest);
+            const piece = rest.slice(0, pos).trim();
+            if (piece !== '') {
+                emitted.push(piece);
+            }
+            rest = rest.slice(pos);
+        }
+        const tail = rest.trim();
+        if (tail !== '') {
+            emitted.push(tail);
+        }
+        return emitted;
+    }
+
+    return { feed, finish };
+}
