@@ -295,6 +295,67 @@ export function createStreamingTurnState(deps) {
     });
 }
 
+/**
+ * Single app-level TTS ownership teardown (VOICE-002 Step 2D).
+ *
+ * Every path that takes audio ownership (manual Play/Replay/Stop, new send,
+ * conversation switch/delete/new, toggle-off, recording start) must route
+ * through stopActiveTts() so the teardown ordering is identical everywhere:
+ *
+ *   1. cancelStreamingTurn(reason)
+ *      The streaming owner is made terminal first. Its internal teardown
+ *      stops the playback it owns and settles Hands-Free for the dead turn
+ *      (exactly once, via its own settle path).
+ *   2. groupQueue.clear()
+ *      The legacy queue is invalidated: pending items never play, and the
+ *      in-flight playAll loop exits on wake WITHOUT onAllDone (its
+ *      generation changed), so a stale queue can never end a newer
+ *      Hands-Free speaking phase.
+ *   3. playback.stop()
+ *      Deliberately AFTER clear(): stop() FIRES the currently armed
+ *      completion callback, which is what deterministically settles an
+ *      active legacy playItem promise. Without it, a replacement play()
+ *      would suppress that callback via cancelCurrent() and the playItem
+ *      promise (and its queue loop) would never settle. A second stop()
+ *      after a streaming cancel is a no-op (no armed callback left).
+ *   4. timer.cancel()
+ *      onAllDone cannot cancel the per-turn timer (step 2 invalidated the
+ *      loop), so teardown owns it; idempotent.
+ *   5. options.markSpeakingEnd
+ *      Explicit Hands-Free speaking end for owners whose normal
+ *      completion is skipped by the generation bump (legacy queue, manual
+ *      playback). No-op when Hands-Free is not in SPEAKING, so callers may
+ *      pass it unconditionally where the streaming owner has already
+ *      settled (new send). Callers that hand Hands-Free to invalidate()
+ *      (conversation switch/delete/new) omit it.
+ *   6. refreshButtons()
+ *
+ * The whole sequence is synchronous: by the time a caller starts new
+ * playback afterwards, every old owner is terminal and no old callback can
+ * touch the new owner's playback or Hands-Free state.
+ *
+ * @param {{
+ *   cancelStreamingTurn: (reason: string) => void,
+ *   groupQueue: { clear: () => void },
+ *   playback: { stop: () => void },
+ *   timer?: { cancel: () => void },
+ *   markSpeakingEnd?: () => void,
+ *   refreshButtons?: () => void,
+ * }} deps
+ * @returns {{ stopActiveTts: (reason: string, options?: { markSpeakingEnd?: boolean }) => void }}
+ */
+export function createTtsOwnershipController(deps) {
+    function stopActiveTts(reason, options = {}) {
+        deps.cancelStreamingTurn(reason);
+        deps.groupQueue.clear();
+        deps.playback.stop();
+        if (deps.timer) deps.timer.cancel();
+        if (options.markSpeakingEnd && deps.markSpeakingEnd) deps.markSpeakingEnd();
+        if (deps.refreshButtons) deps.refreshButtons();
+    }
+    return { stopActiveTts };
+}
+
 import { createNdjsonParser, createStreamMessageCollector, normalizeConversation, resolveMessageCharacterId } from './conversations.js';
 import { createStreamingTtsSession } from './streaming-tts.js';
 import { buildCardExportFilename, normalizeCharacter, sanitizeCharacterInput, validateCharacterForm } from './characters.js';
@@ -473,6 +534,22 @@ if (typeof document !== 'undefined') {
     let streamingTurn = null;
     const isDev = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
     const voiceTurnTimer = createVoiceTurnTimer();
+
+    // Single TTS ownership teardown path (VOICE-002 Step 2D). Every handler
+    // that takes audio ownership routes through stopActiveTts() so the
+    // teardown ordering is identical everywhere (see its doc comment).
+    const ttsOwnership = createTtsOwnershipController({
+        cancelStreamingTurn: (reason) => {
+            if (streamingTurn) streamingTurn.cancel(reason);
+        },
+        groupQueue: groupQueue,
+        playback: playback,
+        timer: voiceTurnTimer,
+        markSpeakingEnd: () => {
+            if (handsfree) handsfree.markSpeakingEnd();
+        },
+        refreshButtons: updatePlaybackButtons,
+    });
 
     // Estimated response-start progress (DOGFOOD-007). pendingStart tracks
     // the speaker currently awaiting its first visible token; the window is
@@ -847,8 +924,11 @@ if (typeof document !== 'undefined') {
                         if (willSpeak && hf) hf.markSpeakingEnd();
                     };
                     try {
-                        if (streamingTurn) streamingTurn.cancel('manual-playback');
-                        groupQueue.clear();
+                        // Ownership teardown (Step 2D): the previous owner
+                        // (streaming session, legacy queue, or manual
+                        // playback) is fully terminal before the manual
+                        // playback arms its own completion callback.
+                        ttsOwnership.stopActiveTts('manual-playback');
                         if (willSpeak) hf.markSpeakingStart();
                         await playback.play(msg.content, voice, endSpeaking);
                         updatePlaybackButtons();
@@ -863,11 +943,11 @@ if (typeof document !== 'undefined') {
                 stopBtn.setAttribute('aria-label', 'Stop playback');
                 stopBtn.textContent = '■';
                 stopBtn.addEventListener('click', () => {
-                    if (streamingTurn) streamingTurn.cancel('playback-stop');
-                    groupQueue.clear();
-                    playback.stop();
-                    if (handsfree) handsfree.markSpeakingEnd();
-                    updatePlaybackButtons();
+                    // AUDIO ownership Stop only (Step 2D): terminates
+                    // whichever TTS owner is active (streaming session,
+                    // legacy queue, or manual playback). The visible
+                    // LLM-generation Stop remains Step 2E.
+                    ttsOwnership.stopActiveTts('playback-stop', { markSpeakingEnd: true });
                 });
 
                 const replayBtn = document.createElement('button');
@@ -884,8 +964,10 @@ if (typeof document !== 'undefined') {
                         if (willSpeak && hf) hf.markSpeakingEnd();
                     };
                     try {
-                        if (streamingTurn) streamingTurn.cancel('manual-playback');
-                        groupQueue.clear();
+                        // Same ownership teardown as Play (Step 2D): the
+                        // previous owner is fully terminal before the
+                        // replay arms its own completion callback.
+                        ttsOwnership.stopActiveTts('manual-playback');
                         if (willSpeak) hf.markSpeakingStart();
                         await playback.replay(msg.content, voice, endSpeaking);
                         updatePlaybackButtons();
@@ -1871,10 +1953,7 @@ if (typeof document !== 'undefined') {
                 streamAbortController.abort();
                 streamAbortController = null;
             }
-            if (streamingTurn) streamingTurn.cancel('conversation-deleted');
-            groupQueue.clear();
-            playback.stop();
-            voiceTurnTimer.cancel();
+            ttsOwnership.stopActiveTts('conversation-deleted');
             recorder.cancel();
             if (handsfree) handsfree.invalidate();
             isSending = false;
@@ -1928,12 +2007,10 @@ if (typeof document !== 'undefined') {
 
     async function selectConversation(id) {
         selectionEpoch++;
-        // Cancel any still-active streaming session before the epoch change
-        // makes it unresolvable (VOICE-002 Step 2C).
-        if (streamingTurn) streamingTurn.cancel('conversation-switch');
-        groupQueue.clear();
-        playback.stop();
-        voiceTurnTimer.cancel();
+        // Full ownership teardown (Step 2C/2D) before the epoch change
+        // makes the old turn unresolvable: streaming session, legacy queue,
+        // and current audio all terminate against the old identity.
+        ttsOwnership.stopActiveTts('conversation-switch');
         stopPendingStart();
         invalidateMemoryState();
         if (handsfree) handsfree.invalidate();
@@ -1965,9 +2042,12 @@ if (typeof document !== 'undefined') {
             stopPendingStart();
             const conv = await createConversation(charId, title);
             conversations.unshift(conv);
-            // Cancel before the identity change so the old turn's effects
-            // still resolve against the old (current) conversation (Step 2C).
-            if (streamingTurn) streamingTurn.cancel('new-conversation');
+            // Full ownership teardown BEFORE the identity change so the old
+            // turn's effects still resolve against the old (current)
+            // conversation (Step 2C/2D): streaming session, legacy queue,
+            // and current audio must all be terminal before the user enters
+            // the new conversation.
+            ttsOwnership.stopActiveTts('new-conversation');
             currentConversation = conv;
             if (handsfree) handsfree.invalidate();
             currentMessages = [];
@@ -2082,9 +2162,13 @@ if (typeof document !== 'undefined') {
         // exactly one markTtsReady(), even when the previous turn streamed.
         ttsMarkedForTurn = false;
         let hadStreamError = false;
-        if (streamingTurn && streamingTurn.mode === STREAMING_TURN_MODES.STREAMING) {
-            streamingTurn.cancel('superseded-send');
-        }
+        // Ownership takeover (Step 2D): the previous turn's audio — streamed,
+        // legacy-queued, or manual — is fully terminal before this turn
+        // initializes, so no old sentence, queue item, or callback can leak
+        // into the new turn. markSpeakingEnd ends an old non-streaming
+        // owner's speaking phase (no-op when the streaming owner already
+        // settled it or Hands-Free is not SPEAKING).
+        ttsOwnership.stopActiveTts('superseded-send', { markSpeakingEnd: true });
         streamingTurn = createStreamingTurnState({
             isCurrent: () => currentConversation
                 && currentConversation.id === sendConversationId
@@ -2370,11 +2454,7 @@ if (typeof document !== 'undefined') {
             const newState = !getAutoSpeakState(currentConversation.id);
             setAutoSpeakState(currentConversation.id, newState);
             if (!newState) {
-                if (streamingTurn) streamingTurn.cancel('auto-speak-disabled');
-                groupQueue.clear();
-                playback.stop();
-                if (handsfree) handsfree.markSpeakingEnd();
-                updatePlaybackButtons();
+                ttsOwnership.stopActiveTts('auto-speak-disabled', { markSpeakingEnd: true });
             }
             updateAutoSpeakButton();
         });
@@ -2386,11 +2466,7 @@ if (typeof document !== 'undefined') {
             const newState = !getVoiceModeState(currentConversation.id);
             setVoiceModeState(currentConversation.id, newState);
             if (!newState) {
-                if (streamingTurn) streamingTurn.cancel('voice-mode-disabled');
-                groupQueue.clear();
-                playback.stop();
-                if (handsfree) handsfree.markSpeakingEnd();
-                updatePlaybackButtons();
+                ttsOwnership.stopActiveTts('voice-mode-disabled', { markSpeakingEnd: true });
             }
             updateVoiceModeButton();
         });
@@ -2483,11 +2559,11 @@ if (typeof document !== 'undefined') {
             // Hands-free owns the microphone while active.
             if (handsfree && handsfree.state !== HANDSFREE_STATES.OFF) return;
             recordingInterruptionPending = true;
-            // An active streaming session must not resume over the
-            // user's recording (VOICE-002 Step 2C).
-            if (streamingTurn) streamingTurn.cancel('recording-start');
-            playback.stop();
-            updatePlaybackButtons();
+            // All speech output (streaming session, legacy queue, manual
+            // playback) must be fully stopped before the microphone starts
+            // (Step 2D); a stale TTS callback cannot touch Hands-Free
+            // during recording because Hands-Free is OFF here.
+            ttsOwnership.stopActiveTts('recording-start');
             try {
                 await recorder.start();
             } finally {
