@@ -71,7 +71,232 @@ export function createMemoryRefreshGuard() {
     };
 }
 
+export const STREAMING_TURN_MODES = Object.freeze({
+    UNDECIDED: 'undecided',
+    STREAMING: 'streaming',
+    LEGACY: 'legacy',
+    FAILED: 'failed',
+    STOPPED: 'stopped',
+    COMPLETE: 'complete',
+});
+
+/**
+ * Per-turn streaming TTS state machine (VOICE-002 Step 2C).
+ *
+ * Wraps exactly one streaming TTS session (created via deps.createSession,
+ * which must return a createStreamingTtsSession surface) across one
+ * assistant turn and makes the streaming-vs-legacy TTS decision exactly
+ * once, at the first speaker_start. The decision is final: later
+ * speaker_start records only route that speaker's voice, and stream errors,
+ * done, toggles, or conversation changes can never restart streaming or
+ * resurrect a settled session. The only streaming -> legacy transition is a
+ * successful zero-work handoff at the final done; once any sentence was
+ * streamed, the legacy full-response TTS path is forbidden for the turn.
+ *
+ * Identity safety: the session callbacks (onFirstAudioStart/onTurnEnd)
+ * re-check deps.isCurrent() and the captured session instance before
+ * applying app-level effects, so a stale turn can never move the Hands-Free
+ * state or the turn timer of a newer turn.
+ *
+ * @param {{
+ *   isCurrent: () => boolean,
+ *   isEligible: () => boolean,
+ *   resolveVoice: (characterId: string) => string,
+ *   createSession: (hooks: {
+ *     onFirstAudioStart: () => void,
+ *     onTurnEnd: (result: object) => void,
+ *   }) => object,
+ *   onFirstAudio: () => void,
+ *   onTurnSettled: (state: object, result: object) => void,
+ * }} deps
+ *   isCurrent: whether the identity captured at send time (conversation id
+ *     + selection epoch) still matches the app's current identity.
+ *   isEligible: whether streaming is allowed at decision time: auto-speak or
+ *     voice mode enabled, recorder not recording, no pending recording
+ *     interruption, and the stream has not already errored.
+ *   resolveVoice: maps a speaker_start character id to its TTS voice (''
+ *     when the character has none).
+ *   createSession: creates the turn's streaming session; the returned object
+ *     must expose the createStreamingTtsSession surface (startSpeaker,
+ *     feed, endSpeaker, finishInput, cancel, handoffToLegacy).
+ *   onFirstAudio: app-level effect for the first REAL audio of this turn
+ *     (mark TTS ready, Hands-Free WAITING -> SPEAKING).
+ *   onTurnSettled: app-level effect once this turn's audio has ended
+ *     (completion, failure, or explicit cancel): mark speaking end when
+ *     first audio started, otherwise complete a still-waiting response.
+ *     The factory passes its own state so the app can read
+ *     firstAudioStarted.
+ * @returns {{
+ *   get mode(): string,
+ *   get firstAudioStarted(): boolean,
+ *   onSpeakerStart: (characterId: string) => void,
+ *   onDelta: (text: string) => void,
+ *   onSpeakerEnd: () => void,
+ *   onStreamError: (reason?: string) => void,
+ *   onDone: () => { runLegacy: boolean, ttsHandled: boolean },
+ *   cancel: (reason: string) => void,
+ * }}
+ */
+export function createStreamingTurnState(deps) {
+    let mode = STREAMING_TURN_MODES.UNDECIDED;
+    let session = null;
+    let firstAudioStarted = false;
+    let doneHandled = false;
+
+    const state = {
+        get mode() { return mode; },
+        get firstAudioStarted() { return firstAudioStarted; },
+    };
+
+    // Applies the app-level settle effect only while this turn's identity is
+    // still the app's current identity.
+    function settleEffects(result) {
+        if (deps.isCurrent()) deps.onTurnSettled(state, result);
+    }
+
+    function onSpeakerStart(characterId) {
+        if (mode === STREAMING_TURN_MODES.STREAMING) {
+            // Decision is final: only route this speaker's voice. Never
+            // create a second session or re-decide.
+            if (session) session.startSpeaker(deps.resolveVoice(characterId));
+            return;
+        }
+        if (mode !== STREAMING_TURN_MODES.UNDECIDED) return; // terminal
+        if (deps.isCurrent() && deps.isEligible()) {
+            mode = STREAMING_TURN_MODES.STREAMING;
+            const created = deps.createSession({
+                onFirstAudioStart: () => {
+                    if (!deps.isCurrent() || session !== created) return;
+                    firstAudioStarted = true;
+                    deps.onFirstAudio();
+                },
+                onTurnEnd: (result) => {
+                    if (!deps.isCurrent() || session !== created) return;
+                    if (result.stopped) return; // settles via cancel()/onStreamError()
+                    session = null;
+                    mode = result.ok ? STREAMING_TURN_MODES.COMPLETE : STREAMING_TURN_MODES.FAILED;
+                    deps.onTurnSettled(state, result);
+                },
+            });
+            session = created;
+            created.startSpeaker(deps.resolveVoice(characterId));
+        } else {
+            // Ineligible or stale identity at the first speaker_start: the
+            // existing legacy full-response path is the only permitted
+            // source of audio for this turn.
+            mode = STREAMING_TURN_MODES.LEGACY;
+        }
+    }
+
+    function onDelta(text) {
+        // Raw incremental delta text, never the accumulated message content.
+        if (mode === STREAMING_TURN_MODES.STREAMING && session) session.feed(text);
+    }
+
+    function onSpeakerEnd() {
+        if (mode === STREAMING_TURN_MODES.STREAMING && session) session.endSpeaker();
+    }
+
+    // Abnormal input termination (stream error record, or the reader ended
+    // without a done record). Cancels the session and settles the
+    // app-level effects; a turn that already settled is untouched, and no
+    // legacy fallback is ever run afterwards.
+    function onStreamError(reason) {
+        if (mode !== STREAMING_TURN_MODES.STREAMING || !session) return;
+        mode = STREAMING_TURN_MODES.FAILED;
+        const current = session;
+        session = null;
+        current.cancel(reason || 'stream-error');
+        settleEffects({
+            ok: false,
+            stopped: true,
+            reason: reason || 'stream-error',
+            firstAudioStarted: firstAudioStarted,
+        });
+    }
+
+    function onDone() {
+        if (doneHandled) return { runLegacy: false, ttsHandled: true };
+        doneHandled = true;
+        if (mode === STREAMING_TURN_MODES.STREAMING && session) {
+            const current = session;
+            const summary = current.finishInput();
+            if (summary.sentenceCount > 0) {
+                // At least one streamed sentence: this turn's audio is owned
+                // by the streaming session until it settles. Legacy TTS is
+                // forbidden; ttsHandled keeps the app from treating the turn
+                // as a no-speak response (Hands-Free stays WAITING until the
+                // first real audio, then SPEAKING until the last audio ends).
+                return { runLegacy: false, ttsHandled: true };
+            }
+            if (current.handoffToLegacy()) {
+                // Zero-work handoff: the session produced no synthesis or
+                // playback work, so the legacy full-response path may run
+                // unchanged (it re-checks every app-level condition).
+                mode = STREAMING_TURN_MODES.LEGACY;
+                session = null;
+                return { runLegacy: true, ttsHandled: false };
+            }
+            // Unreachable in practice (a zero-sentence session always
+            // handoffs cleanly); fail closed: speak nothing, no legacy.
+            mode = STREAMING_TURN_MODES.FAILED;
+            session = null;
+            current.cancel('stream-handoff-failed');
+            settleEffects({
+                ok: false,
+                stopped: true,
+                reason: 'stream-handoff-failed',
+                firstAudioStarted: firstAudioStarted,
+            });
+            return { runLegacy: false, ttsHandled: true };
+        }
+        // Legacy/undecided: the existing shouldAutoSpeak check applies.
+        if (mode === STREAMING_TURN_MODES.FAILED || mode === STREAMING_TURN_MODES.STOPPED) {
+            // The turn's audio outcome already settled via onStreamError()
+            // or cancel(); mark it handled so the app's no-speak tail does
+            // not re-apply the settle effects. Never run legacy.
+            return { runLegacy: false, ttsHandled: true };
+        }
+        return {
+            runLegacy: mode === STREAMING_TURN_MODES.LEGACY || mode === STREAMING_TURN_MODES.UNDECIDED,
+            ttsHandled: false,
+        };
+    }
+
+    // External invalidation: conversation switch/delete, new conversation,
+    // voice toggle off. Cancels the session and settles the app-level
+    // effects only while this turn's identity is still the current one.
+    function cancel(reason) {
+        if (mode === STREAMING_TURN_MODES.STREAMING && session) {
+            mode = STREAMING_TURN_MODES.STOPPED;
+            const current = session;
+            session = null;
+            current.cancel(reason);
+            settleEffects({
+                ok: false,
+                stopped: true,
+                reason: reason,
+                firstAudioStarted: firstAudioStarted,
+            });
+            return;
+        }
+        if (mode === STREAMING_TURN_MODES.UNDECIDED || mode === STREAMING_TURN_MODES.LEGACY) {
+            mode = STREAMING_TURN_MODES.STOPPED;
+        }
+    }
+
+    return Object.assign(state, {
+        onSpeakerStart: onSpeakerStart,
+        onDelta: onDelta,
+        onSpeakerEnd: onSpeakerEnd,
+        onStreamError: onStreamError,
+        onDone: onDone,
+        cancel: cancel,
+    });
+}
+
 import { createNdjsonParser, createStreamMessageCollector, normalizeConversation, resolveMessageCharacterId } from './conversations.js';
+import { createStreamingTtsSession } from './streaming-tts.js';
 import { buildCardExportFilename, normalizeCharacter, sanitizeCharacterInput, validateCharacterForm } from './characters.js';
 import { normalizeMemory, normalizeMemorySource, validateMemoryForm } from './memory.js';
 import { createFirstTokenEstimator, estimateResponseStartProgress, formatResponseStartProgress } from './progress.js';
@@ -208,6 +433,33 @@ if (typeof document !== 'undefined') {
             if (handsfree) handsfree.markSpeakingEnd();
         },
     });
+    // Synthesize a single streamed sentence directly (VOICE-002 Step 2C).
+    // Unlike the group-queue path, each sentence is an independent request:
+    // the streaming session owns sequencing, so there is no shared queue
+    // state to coordinate here.
+    function synthesizeStreamingSentence({ text, voice, signal }) {
+        return getCsrfToken().then((token) => {
+            return fetch('/api/openparlor/tts/synthesize', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRF-Token': token,
+                },
+                body: JSON.stringify({ text: text, voice: voice }),
+                signal: signal,
+            });
+        }).then((response) => {
+            if (!response.ok) {
+                throw normalizeServiceError('Error synthesizing speech', response);
+            }
+            return response.blob();
+        }).then((blob) => {
+            if (!blob || blob.size === 0) {
+                throw new Error('Empty TTS response');
+            }
+            return blob;
+        });
+    }
     let selectionEpoch = 0;
     // Hands-free controller: declared before the group queue so playback
     // completion can resume listening; instantiated near the recorder
@@ -215,6 +467,10 @@ if (typeof document !== 'undefined') {
     let handsfree = null;
     let recordingInterruptionPending = false;
     let streamAbortController = null;
+    // Active per-turn streaming TTS state (VOICE-002 Step 2C). Re-created on
+    // every send; at most one instance exists at a time because sending is
+    // disabled while a turn is in flight.
+    let streamingTurn = null;
     const isDev = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
     const voiceTurnTimer = createVoiceTurnTimer();
 
@@ -591,6 +847,7 @@ if (typeof document !== 'undefined') {
                         if (willSpeak && hf) hf.markSpeakingEnd();
                     };
                     try {
+                        if (streamingTurn) streamingTurn.cancel('manual-playback');
                         groupQueue.clear();
                         if (willSpeak) hf.markSpeakingStart();
                         await playback.play(msg.content, voice, endSpeaking);
@@ -606,6 +863,7 @@ if (typeof document !== 'undefined') {
                 stopBtn.setAttribute('aria-label', 'Stop playback');
                 stopBtn.textContent = '■';
                 stopBtn.addEventListener('click', () => {
+                    if (streamingTurn) streamingTurn.cancel('playback-stop');
                     groupQueue.clear();
                     playback.stop();
                     if (handsfree) handsfree.markSpeakingEnd();
@@ -626,6 +884,7 @@ if (typeof document !== 'undefined') {
                         if (willSpeak && hf) hf.markSpeakingEnd();
                     };
                     try {
+                        if (streamingTurn) streamingTurn.cancel('manual-playback');
                         groupQueue.clear();
                         if (willSpeak) hf.markSpeakingStart();
                         await playback.replay(msg.content, voice, endSpeaking);
@@ -1612,6 +1871,7 @@ if (typeof document !== 'undefined') {
                 streamAbortController.abort();
                 streamAbortController = null;
             }
+            if (streamingTurn) streamingTurn.cancel('conversation-deleted');
             groupQueue.clear();
             playback.stop();
             voiceTurnTimer.cancel();
@@ -1668,6 +1928,9 @@ if (typeof document !== 'undefined') {
 
     async function selectConversation(id) {
         selectionEpoch++;
+        // Cancel any still-active streaming session before the epoch change
+        // makes it unresolvable (VOICE-002 Step 2C).
+        if (streamingTurn) streamingTurn.cancel('conversation-switch');
         groupQueue.clear();
         playback.stop();
         voiceTurnTimer.cancel();
@@ -1702,6 +1965,9 @@ if (typeof document !== 'undefined') {
             stopPendingStart();
             const conv = await createConversation(charId, title);
             conversations.unshift(conv);
+            // Cancel before the identity change so the old turn's effects
+            // still resolve against the old (current) conversation (Step 2C).
+            if (streamingTurn) streamingTurn.cancel('new-conversation');
             currentConversation = conv;
             if (handsfree) handsfree.invalidate();
             currentMessages = [];
@@ -1803,6 +2069,59 @@ if (typeof document !== 'undefined') {
         const abortController = new AbortController();
         streamAbortController = abortController;
 
+        // VOICE-002 Step 2C: per-turn streaming TTS state machine. The
+        // streaming-vs-legacy decision happens exactly once, at the first
+        // speaker_start, and identity guards (conversation id + selection
+        // epoch) keep stale turns from affecting the current one. If the
+        // previous turn's streaming session is still playing (the stream's
+        // done can arrive before its audio finishes), this send takes over
+        // audio ownership: cancel the old session so its sentences and
+        // callbacks cannot leak into this turn.
+        // Per-turn TTS-ready marker: fresh for every turn so that both the
+        // streaming first-audio path and the legacy first-item path each get
+        // exactly one markTtsReady(), even when the previous turn streamed.
+        ttsMarkedForTurn = false;
+        let hadStreamError = false;
+        if (streamingTurn && streamingTurn.mode === STREAMING_TURN_MODES.STREAMING) {
+            streamingTurn.cancel('superseded-send');
+        }
+        streamingTurn = createStreamingTurnState({
+            isCurrent: () => currentConversation
+                && currentConversation.id === sendConversationId
+                && selectionEpoch === sendEpoch,
+            isEligible: () => (getAutoSpeakState(sendConversationId) || getVoiceModeState(sendConversationId))
+                && recorder.state !== 'recording'
+                && !recordingInterruptionPending
+                && !hadStreamError,
+            resolveVoice: (characterId) => {
+                const char = findCharacter(characterId);
+                return char ? char.ttsVoice : '';
+            },
+            createSession: (hooks) => createStreamingTtsSession({
+                playback: playback,
+                synthesize: synthesizeStreamingSentence,
+                onFirstAudioStart: hooks.onFirstAudioStart,
+                onTurnEnd: hooks.onTurnEnd,
+            }),
+            onFirstAudio: () => {
+                if (!ttsMarkedForTurn) {
+                    ttsMarkedForTurn = true;
+                    voiceTurnTimer.markTtsReady();
+                }
+                // Hands-Free: the speaking phase starts on the first real
+                // audio, never on the NDJSON done record.
+                if (handsfree) handsfree.markSpeakingStart();
+            },
+            onTurnSettled: (state) => {
+                if (isDev) voiceTurnTimer.log();
+                voiceTurnTimer.cancel();
+                if (handsfree) {
+                    if (state.firstAudioStarted) handsfree.markSpeakingEnd();
+                    else handsfree.markResponseComplete();
+                }
+            },
+        });
+
         try {
             const token = await getCsrfToken();
             const response = await fetch('/api/openparlor/chat', {
@@ -1838,7 +2157,6 @@ if (typeof document !== 'undefined') {
             const reader = response.body.getReader();
             let processedCount = 0;
             let streamDone = false;
-            let hadStreamError = false;
 
             function processNewRecords() {
                 for (let i = processedCount; i < parser.records.length; i++) {
@@ -1851,6 +2169,10 @@ if (typeof document !== 'undefined') {
                     if (outcome === null) continue;
                     if (outcome.type === 'speaker_start') {
                         currentAssistantMsg = outcome.message;
+                        // VOICE-002 Step 2C: exactly one decision per turn,
+                        // made on the first speaker_start; later speakers
+                        // only route their voice to the same session.
+                        if (streamingTurn) streamingTurn.onSpeakerStart(outcome.message.character_id || currentConversation.characterId);
                         if (outcome.isNewMessage) {
                             currentMessages.push(currentAssistantMsg);
                             // Each speaker in a sequential reply waits for
@@ -1871,14 +2193,24 @@ if (typeof document !== 'undefined') {
                         renderMessages();
                         lastBubble = messagesEl.querySelector('.message:last-child .bubble');
                     } else if (outcome.type === 'delta') {
+                        // Raw incremental delta only — never the accumulated
+                        // message content, which would re-split everything.
+                        if (streamingTurn) streamingTurn.onDelta(record.text);
                         if (pendingStart && pendingStart.msg === currentAssistantMsg) {
                             completePendingStart(currentAssistantMsg, lastBubble);
                         }
                         voiceTurnTimer.markFirstToken();
                         if (lastBubble) lastBubble.textContent = currentAssistantMsg.content;
                         scrollMessages();
+                    } else if (outcome.type === 'speaker_end') {
+                        // Flush this speaker's unterminated tail now, with
+                        // this speaker's voice (raw protocol event).
+                        if (streamingTurn) streamingTurn.onSpeakerEnd();
                     } else if (outcome.type === 'error') {
                         hadStreamError = true;
+                        // A streamed turn has no legacy fallback: cancel the
+                        // session and settle the turn's audio effects.
+                        if (streamingTurn) streamingTurn.onStreamError('stream-error');
                         stopPendingStart();
                         if (lastBubble) lastBubble.textContent = currentAssistantMsg.content;
                         scrollMessages();
@@ -1896,17 +2228,32 @@ if (typeof document !== 'undefined') {
 
             parser.flush();
             processNewRecords();
-            if (streamDone) voiceTurnTimer.markStreamComplete();
+            // A stream that ended without a done record is an abnormal
+            // termination: a streaming session with open input would
+            // otherwise never settle (VOICE-002 Step 2C).
+            if (!streamDone && streamingTurn) streamingTurn.onStreamError('stream-ended');
+            // Stale-turn guard: a stream that outlives its conversation
+            // (switch/new conversation do not abort it) must not settle the
+            // current conversation's voice state (VOICE-002 Step 2C).
+            const turnIdentityCurrent = sendConversationId !== ''
+                && sendConversationId === (currentConversation ? currentConversation.id : '')
+                && sendEpoch === selectionEpoch;
+            if (streamDone && turnIdentityCurrent) voiceTurnTimer.markStreamComplete();
             // Final full render: the delta path only updates the live bubble
             // text, so completed messages need a re-render to gain their TTS
             // controls and server-identified speaker.
             renderMessages();
 
-            // Auto-speak: queue completed group replies for sequential playback
-            let ttsHandled = false;
-            ttsMarkedForTurn = false;
+            // Auto-speak: the streaming session (decided once at the first
+            // speaker_start) owns the turn's audio once any sentence was
+            // streamed; otherwise the legacy full-response queue runs
+            // unchanged. onDone() makes that handoff decision exactly once
+            // per turn (VOICE-002 Step 2C).
+            const turnDecision = streamingTurn ? streamingTurn.onDone() : { runLegacy: true, ttsHandled: false };
+            let ttsHandled = turnDecision.ttsHandled;
             if (
-                shouldAutoSpeak({
+                turnDecision.runLegacy
+                && shouldAutoSpeak({
                     sendConversationId,
                     currentConversationId: currentConversation ? currentConversation.id : '',
                     sendEpoch,
@@ -1918,6 +2265,7 @@ if (typeof document !== 'undefined') {
                     recordingActive: recorder.state === 'recording' || recordingInterruptionPending,
                 })
             ) {
+                ttsMarkedForTurn = false;
                 const turnMessages = currentMessages.slice(assistantMsgStartIndex);
                 for (const msg of turnMessages) {
                     if (!msg.content) continue;
@@ -1941,12 +2289,15 @@ if (typeof document !== 'undefined') {
                     updatePlaybackButtons();
                 }
             }
-            if (!ttsHandled) {
+            if (!ttsHandled && turnIdentityCurrent) {
                 if (isDev) voiceTurnTimer.log();
                 voiceTurnTimer.cancel();
                 if (handsfree) handsfree.markResponseComplete();
             }
         } catch (e) {
+            // Defensive: a thrown read error ends the stream abnormally; a
+            // streaming session with open input must not hang (Step 2C).
+            if (streamingTurn) streamingTurn.onStreamError('stream-exception');
             if (e && e.name === 'AbortError') {
                 stopPendingStart();
                 if (handsfree) handsfree.markResponseComplete();
@@ -2019,6 +2370,7 @@ if (typeof document !== 'undefined') {
             const newState = !getAutoSpeakState(currentConversation.id);
             setAutoSpeakState(currentConversation.id, newState);
             if (!newState) {
+                if (streamingTurn) streamingTurn.cancel('auto-speak-disabled');
                 groupQueue.clear();
                 playback.stop();
                 if (handsfree) handsfree.markSpeakingEnd();
@@ -2034,6 +2386,7 @@ if (typeof document !== 'undefined') {
             const newState = !getVoiceModeState(currentConversation.id);
             setVoiceModeState(currentConversation.id, newState);
             if (!newState) {
+                if (streamingTurn) streamingTurn.cancel('voice-mode-disabled');
                 groupQueue.clear();
                 playback.stop();
                 if (handsfree) handsfree.markSpeakingEnd();
@@ -2130,6 +2483,9 @@ if (typeof document !== 'undefined') {
             // Hands-free owns the microphone while active.
             if (handsfree && handsfree.state !== HANDSFREE_STATES.OFF) return;
             recordingInterruptionPending = true;
+            // An active streaming session must not resume over the
+            // user's recording (VOICE-002 Step 2C).
+            if (streamingTurn) streamingTurn.cancel('recording-start');
             playback.stop();
             updatePlaybackButtons();
             try {
