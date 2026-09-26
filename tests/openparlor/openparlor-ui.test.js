@@ -17,6 +17,7 @@ import {
     shouldAutoSendTranscription,
     createPlaybackController,
     shouldAutoSpeak,
+    shouldStopSpeechOnToggleOff,
     selectSupportedMime,
     createRecorderController,
     createTranscriptionController,
@@ -1186,6 +1187,51 @@ describe('toggle descriptions distinguish the two speech switches', () => {
             autoSpeakToggleDescription(false),
             voiceModeToggleDescription(false),
         );
+    });
+});
+
+// ─── Turning a speech toggle off ────────────────────────────────────────────
+//
+// Both toggles are OR-ed into the speak decision, so either can be why the
+// characters are audible. Both handlers used to stop ALL active TTS
+// unconditionally, which meant Voice: Off could cut off audio that Auto-speak
+// owned -- directly contradicting the tooltip added for the same report. The
+// rule is now "the last owner leaving turns the speakers off".
+describe('shouldStopSpeechOnToggleOff', () => {
+    test('stops when the other toggle is off (the last owner leaves)', () => {
+        assert.equal(shouldStopSpeechOnToggleOff(false), true,
+            'Auto-speak: Off with Voice: Off must stop playback');
+    });
+
+    test('does not stop while the other toggle still wants audio', () => {
+        assert.equal(shouldStopSpeechOnToggleOff(true), false,
+            'Voice: Off must not silence audio that Auto-speak owns');
+    });
+
+    test('treats a missing or malformed other-toggle state as off', () => {
+        for (const value of [undefined, null, 0, '', 'false', 'true', 1]) {
+            assert.equal(shouldStopSpeechOnToggleOff(value), true,
+                `a non-true value must not keep the speakers alive: ${String(value)}`);
+        }
+    });
+
+    // The reported scenario, stated as an explicit matrix so the regression
+    // cannot come back through either handler.
+    test('the reported toggle combinations behave consistently', () => {
+        // [autoSpeak, voice, turningOff, otherToggleEnabled, shouldStop]
+        const cases = [
+            [true, true, 'voice', true, false],
+            [true, true, 'autoSpeak', true, false],
+            [true, false, 'voice', true, false],
+            [false, true, 'autoSpeak', true, false],
+            [false, true, 'voice', false, true],
+            [false, false, 'autoSpeak', false, true],
+        ];
+        for (const [autoSpeak, voice, turningOff, otherEnabled, expected] of cases) {
+            const stop = shouldStopSpeechOnToggleOff(otherEnabled);
+            assert.equal(stop, expected,
+                `autoSpeak=${autoSpeak} voice=${voice} turningOff=${turningOff}`);
+        }
     });
 });
 

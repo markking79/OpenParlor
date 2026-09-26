@@ -21,6 +21,26 @@ export function normalizeVoiceModeState(raw) {
 }
 
 /**
+ * Decides whether turning one speech toggle off should stop the audio that is
+ * currently playing.
+ *
+ * Auto-speak and Voice are both OR-ed into the speak decision, so either one
+ * can be the reason the characters are audible. The two toggle handlers used to
+ * stop ALL active TTS unconditionally, which made Voice: Off silence audio
+ * that Auto-speak owned -- the same Voice: Off that the tooltip says leaves
+ * replies audible. That inconsistency is what made the control read as broken.
+ *
+ * The rule is "the last owner leaving turns the speakers off": stop only when
+ * no other enabled toggle still wants audio.
+ *
+ * @param {boolean} otherToggleEnabled State of the OTHER speech toggle
+ * @returns {boolean} true when nothing still wants audio and playback must stop
+ */
+export function shouldStopSpeechOnToggleOff(otherToggleEnabled) {
+    return otherToggleEnabled !== true;
+}
+
+/**
  * Describes the Auto-speak toggle for the tooltip and the accessible label.
  *
  * Auto-speak is the CHARACTERS' TTS switch, not a setting for the user's own

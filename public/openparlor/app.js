@@ -672,6 +672,7 @@ import {
     normalizeVoiceModeState,
     shouldAutoSendTranscription,
     shouldAutoSpeak,
+    shouldStopSpeechOnToggleOff,
     voiceModeToggleDescription,
 } from './audio.js';
 import {
@@ -2814,12 +2815,19 @@ if (typeof document !== 'undefined') {
         }
     });
 
+    // Both speech toggles are OR-ed into the speak decision, so either can be
+    // why the characters are audible. Turning one off must therefore stop
+    // playback only when the OTHER is also off -- "the last owner leaving
+    // turns the speakers off". Previously both handlers stopped all TTS
+    // unconditionally, so Voice: Off could cut off audio that Auto-speak
+    // owned, contradicting the tooltip that says replies stay audible.
     if (autoSpeakButton) {
         autoSpeakButton.addEventListener('click', () => {
             if (!currentConversation) return;
-            const newState = !getAutoSpeakState(currentConversation.id);
-            setAutoSpeakState(currentConversation.id, newState);
-            if (!newState) {
+            const conversationId = currentConversation.id;
+            const newState = !getAutoSpeakState(conversationId);
+            setAutoSpeakState(conversationId, newState);
+            if (!newState && shouldStopSpeechOnToggleOff(getVoiceModeState(conversationId))) {
                 ttsOwnership.stopActiveTts('auto-speak-disabled', { markSpeakingEnd: true });
             }
             updateAutoSpeakButton();
@@ -2829,9 +2837,13 @@ if (typeof document !== 'undefined') {
     if (voiceModeButton) {
         voiceModeButton.addEventListener('click', () => {
             if (!currentConversation) return;
-            const newState = !getVoiceModeState(currentConversation.id);
-            setVoiceModeState(currentConversation.id, newState);
-            if (!newState) {
+            const conversationId = currentConversation.id;
+            const newState = !getVoiceModeState(conversationId);
+            setVoiceModeState(conversationId, newState);
+            // Voice only owns the audio when Auto-speak is off. With
+            // Auto-speak on, Voice: Off concerns the user's input only and
+            // must leave the characters' playback running.
+            if (!newState && shouldStopSpeechOnToggleOff(getAutoSpeakState(conversationId))) {
                 ttsOwnership.stopActiveTts('voice-mode-disabled', { markSpeakingEnd: true });
             }
             updateVoiceModeButton();
