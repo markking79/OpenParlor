@@ -61,10 +61,22 @@
                     <h1 id="chatTitle">OpenParlor</h1>
                     <div class="chat-subtitle" id="chatSubtitle">Select a conversation to begin</div>
                 </div>
-                <button id="autoSpeakButton" class="auto-speak-btn" aria-pressed="false" hidden>
+                <!--
+                    Auto-speak controls the CHARACTERS' voice (their spoken
+                    replies). Voice controls YOUR voice (auto-sending your
+                    recorded speech, which also implies spoken replies). The
+                    two read as duplicate speech switches, so each carries a
+                    tooltip and an aria-label saying which one it is. The
+                    per-state text is refreshed by app.js.
+                -->
+                <button id="autoSpeakButton" class="auto-speak-btn" aria-pressed="false" hidden
+                    title="Auto-speak is Off: the characters reply as text only. This controls their voice, not yours."
+                    aria-label="Auto-speak is Off: the characters reply as text only. This controls their voice, not yours.">
                     Auto-speak: Off
                 </button>
-                <button id="voiceModeButton" class="voice-mode-btn" aria-pressed="false" hidden>
+                <button id="voiceModeButton" class="voice-mode-btn" aria-pressed="false" hidden
+                    title="Voice is Off: your recorded speech is transcribed into the message box for you to review and send. Replies are still spoken if Auto-speak is On."
+                    aria-label="Voice is Off: your recorded speech is transcribed into the message box for you to review and send. Replies are still spoken if Auto-speak is On.">
                     Voice: Off
                 </button>
                 <button id="handsFreeButton" class="handsfree-btn" aria-pressed="false" hidden>

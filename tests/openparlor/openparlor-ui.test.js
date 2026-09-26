@@ -1,6 +1,7 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+    autoSpeakToggleDescription,
     formatRelativeTime,
     normalizeConversation,
     normalizeCharacter,
@@ -23,6 +24,7 @@ import {
     createFirstTokenEstimator,
     estimateResponseStartProgress,
     formatResponseStartProgress,
+    voiceModeToggleDescription,
     DEFAULT_FIRST_TOKEN_MS,
     PROGRESS_CAP,
 } from '../../public/openparlor/openparlor.js';
@@ -1134,6 +1136,56 @@ describe('shouldAutoSendTranscription', () => {
 
     test('returns false when both are false', () => {
         assert.equal(shouldAutoSendTranscription({ voiceModeEnabled: false, transcriptionSucceeded: false }), false);
+    });
+});
+
+// ─── Toggle descriptions ────────────────────────────────────────────────────
+//
+// Reported confusion: with "Auto-speak: On" and "Voice: Off" the characters
+// still spoke, and "Voice: Off" reads like a master speech switch. The
+// wiring is correct (Auto-speak is the characters' TTS; Voice is the user's own
+// auto-send) and is unchanged here — these tests lock the wording that
+// explains it, so the two controls can never drift back into reading alike.
+describe('toggle descriptions distinguish the two speech switches', () => {
+    test('Auto-speak describes the characters, never the user', () => {
+        for (const enabled of [true, false]) {
+            const text = autoSpeakToggleDescription(enabled);
+            assert.match(text, /^Auto-speak is (On|Off):/);
+            assert.match(text, /characters/i, 'must name the characters as the speaker');
+            assert.match(text, /not yours/i, 'must say explicitly it is not the user');
+        }
+    });
+
+    test('Auto-speak reflects the current state', () => {
+        assert.match(autoSpeakToggleDescription(true), /is On/);
+        assert.match(autoSpeakToggleDescription(false), /is Off/);
+    });
+
+    test('Voice describes the user\'s own recorded speech', () => {
+        for (const enabled of [true, false]) {
+            const text = voiceModeToggleDescription(enabled);
+            assert.match(text, /^Voice is (On|Off):/);
+            assert.match(text, /your recorded speech/i, 'must name the user as the input side');
+        }
+    });
+
+    test('Voice Off warns that replies are still spoken via Auto-speak', () => {
+        // This is the exact report: Voice: Off did not stop the characters.
+        const text = voiceModeToggleDescription(false);
+        assert.match(text, /still spoken/i);
+        assert.match(text, /Auto-speak/);
+    });
+
+    test('the two descriptions are not interchangeable', () => {
+        assert.notEqual(
+            autoSpeakToggleDescription(true),
+            voiceModeToggleDescription(true),
+            'two controls must not share one description',
+        );
+        assert.notEqual(
+            autoSpeakToggleDescription(false),
+            voiceModeToggleDescription(false),
+        );
     });
 });
 

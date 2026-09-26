@@ -661,6 +661,7 @@ import { normalizeMemory, normalizeMemorySource, validateMemoryForm } from './me
 import { createFirstTokenEstimator, estimateResponseStartProgress, formatResponseStartProgress } from './progress.js';
 import { fetchDeferredPrerequisite, normalizeHealthStatus, normalizeModelStatus } from './settings.js';
 import {
+    autoSpeakToggleDescription,
     createGroupPlaybackQueue,
     createPlaybackController,
     createRecorderController,
@@ -671,6 +672,7 @@ import {
     normalizeVoiceModeState,
     shouldAutoSendTranscription,
     shouldAutoSpeak,
+    voiceModeToggleDescription,
 } from './audio.js';
 import {
     HANDSFREE_STATES,
@@ -934,6 +936,16 @@ if (typeof document !== 'undefined') {
         }
     }
 
+    // ── Toggle explanations ─────────────────────────────────────────────────
+    // "Auto-speak" and "Voice" read as two speech switches, but they control
+    // different things, and users reasonably read "Voice: Off" as "stop
+    // talking". The wording lives in audio.js so it is unit-testable; this
+    // only applies it. No behavior change — the wiring is unchanged.
+    function applyToggleDescription(button, description) {
+        button.title = description;
+        button.setAttribute('aria-label', description);
+    }
+
     function updateAutoSpeakButton() {
         if (!autoSpeakButton) return;
         if (!currentConversation) {
@@ -944,6 +956,7 @@ if (typeof document !== 'undefined') {
         const enabled = getAutoSpeakState(currentConversation.id);
         autoSpeakButton.setAttribute('aria-pressed', String(enabled));
         autoSpeakButton.textContent = enabled ? 'Auto-speak: On' : 'Auto-speak: Off';
+        applyToggleDescription(autoSpeakButton, autoSpeakToggleDescription(enabled));
     }
 
     // ── Voice mode state ───────────────────────────────────────────────────
@@ -976,6 +989,7 @@ if (typeof document !== 'undefined') {
         const enabled = getVoiceModeState(currentConversation.id);
         voiceModeButton.setAttribute('aria-pressed', String(enabled));
         voiceModeButton.textContent = enabled ? 'Voice: On' : 'Voice: Off';
+        applyToggleDescription(voiceModeButton, voiceModeToggleDescription(enabled));
     }
 
     // ── Rendering helpers ──────────────────────────────────────────────────
