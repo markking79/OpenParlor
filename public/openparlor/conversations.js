@@ -114,6 +114,29 @@ export function createNdjsonParser() {
  *   getMessages: () => Array<object>
  * }}
  */
+/**
+ * Removes a speaker label the model applied to its OWN reply.
+ *
+ * The server does this before storing a message, which is authoritative. This
+ * copy exists for the LIVE view: deltas are written to the bubble as they
+ * arrive, so without it the user watches a character quote itself in the third
+ * person and then see the text silently change on reload. The two are
+ * deliberately identical in behaviour.
+ *
+ * Only a LEADING label is removed, so a character saying "the [library] is
+ * closed" keeps its brackets.
+ *
+ * @param {string} content
+ * @returns {string}
+ */
+function stripSelfAppliedSpeakerLabel(content) {
+    if (typeof content !== 'string') return '';
+    return content.replace(
+        /^\s*\[\s*[^\]\n]{1,80}?\s+said\b[^\]\n]{0,40}?\]\s*:?\s*/i,
+        '',
+    );
+}
+
 export function createStreamMessageCollector() {
     const messages = [{ role: 'assistant', content: '' }];
     let current = messages[0];
@@ -134,6 +157,10 @@ export function createStreamMessageCollector() {
         }
         if (record.type === 'delta') {
             current.content += typeof record.text === 'string' ? record.text : '';
+            // Re-clean the ACCUMULATED text, not the delta: a label arrives
+            // split across chunks, so per-delta stripping would miss it until
+            // the very last character.
+            current.content = stripSelfAppliedSpeakerLabel(current.content);
             return { type: 'delta', message: current };
         }
         if (record.type === 'speaker_end') {

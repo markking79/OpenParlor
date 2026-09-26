@@ -45,6 +45,7 @@ function groupContextRule() {
         'This is a group conversation with more than one character.',
         'The person typing in the chat is the human user. They are NOT one of the named participants, they are not any character listed above, and you must never call them by a character\'s name, never treat their messages as another character\'s words, and never answer them as if they were a participant. Address them as "you", or without a name.',
         'Messages that begin with a label such as "[Doug said to the group]:" are another character\'s speech, not the human user\'s and not yours. They are included only so you know what the other characters have said.',
+        'Never write that label yourself, and never begin your reply with a name in brackets. The labels belong to the transcript, not to you. Speak only your own lines, in the first person, as yourself.',
         'Your own previous speech is the assistant message that carries no such label.',
     ].join(' ');
 }
@@ -242,6 +243,37 @@ export function buildPrompt({ character, conversation, history, newMessages, mem
     }
 
     return messages;
+}
+
+/**
+ * Strips a speaker label the model applied to its OWN output.
+ *
+ * The group transcript labels other characters' lines as
+ * `[Name said to the group]: ...` so a model can tell whose speech it is
+ * reading. Showing it that format teaches the format, and models reproduce it:
+ * a character was observed replying "[ Doug said to the group ]: Appreciate
+ * that, but you can just call me Doug" -- i.e. quoting itself in the third
+ * person -- and another turn put a co-character's line inside its own reply
+ * while that co-character's own bubble came out empty.
+ *
+ * The prompt now forbids the label explicitly, but an instruction is a request,
+ * not a guarantee. This is the guarantee: anything matching the label shape at
+ * the start of a reply is removed before the text is stored, so it can never
+ * reach the UI and can never be fed back into history as if it were content.
+ *
+ * Deliberately narrow. It only strips a leading bracketed "X said ..." label,
+ * because a character may legitimately say "the [library] is closed", and
+ * over-eager stripping would eat real speech.
+ *
+ * @param {unknown} content
+ * @returns {string}
+ */
+export function stripSelfAppliedSpeakerLabel(content) {
+    if (typeof content !== 'string') return '';
+    return content.replace(
+        /^\s*(?:\[\s*[^\]\n]{1,80}?\s+said\b[^\]\n]{0,40}?\]\s*:?|[^\S\n]*[^\n]{1,80}?\s+said to the group\s*:)\s*/i,
+        '',
+    );
 }
 
 export { MAX_HISTORY_MESSAGES, GLOBAL_BEHAVIOR };

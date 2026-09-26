@@ -3,7 +3,7 @@ import express from 'express';
 import { loadOpenParlorConfig } from './config.js';
 import { createModelProvider, ModelProviderError } from './model-provider.js';
 import * as persistence from './persistence.js';
-import { buildPrompt } from './prompt-builder.js';
+import { buildPrompt, stripSelfAppliedSpeakerLabel } from './prompt-builder.js';
 import { applyPromptBudget, resolvePromptBudget, resolveGenerationReserve } from './prompt-budget.js';
 import { sanitizeSummaryForPrompt, updateConversationSummary } from './conversation-summary.js';
 import { retrieveMemories } from './memory-retrieval.js';
@@ -292,9 +292,11 @@ export function createOpenParlorChatRouter({
                     const { participant, character, prompt } = speakerContexts[0];
                     const genOptions = getGenerationOptions(character);
                     const completion = await provider.chatCompletion(prompt, genOptions);
-                    const assistantContent = typeof completion?.choices?.[0]?.message?.content === 'string'
-                        ? completion.choices[0].message.content
-                        : JSON.stringify(completion);
+                    const assistantContent = stripSelfAppliedSpeakerLabel(
+                        typeof completion?.choices?.[0]?.message?.content === 'string'
+                            ? completion.choices[0].message.content
+                            : JSON.stringify(completion),
+                    );
                     const assistantMsg = persistence.appendMessage(user.directories, conversationId, participant.id, assistantContent, 'character');
                     response.json({ ...completion, conversation_id: conversationId });
                     const knownBy = conversation.participants
@@ -434,8 +436,13 @@ export function createOpenParlorChatRouter({
                             }
                         }
                         if (participant && speakerText) {
+                            // Never store a speaker label the model put on its
+                            // OWN line, or it reaches the UI and is fed back as
+                            // content on the next turn.
+                            const spoken = stripSelfAppliedSpeakerLabel(speakerText);
+                            speakerText = spoken;
                             try {
-                                const msg = persistence.appendMessage(user.directories, conversationId, participant.id, speakerText, 'character');
+                                const msg = persistence.appendMessage(user.directories, conversationId, participant.id, spoken, 'character');
                                 speakerMessageId = msg.id;
                                 speakerMessageAt = msg.created_at;
                             } catch (persistErr) {
