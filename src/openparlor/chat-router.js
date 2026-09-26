@@ -225,9 +225,19 @@ export function createOpenParlorChatRouter({
             for (const speaker of selectedSpeakers) {
                 const character = persistence.getCharacter(user.directories, speaker.character_id);
                 if (!character) continue;
-                const memoryLines = lastUserMsg
-                    ? retrieveMemories(user.directories, handle, character.id, lastUserMsg.content)
-                    : [];
+                // Memory is an enhancement, never a dependency. A corrupt
+                // memory file, an unreadable directory, or any other failure
+                // in the memory subsystem must degrade to "no memories" and
+                // let the conversation proceed. Without this guard a single
+                // bad memory record took down every chat request.
+                let memoryLines = [];
+                if (lastUserMsg) {
+                    try {
+                        memoryLines = retrieveMemories(user.directories, handle, character.id, lastUserMsg.content);
+                    } catch (err) {
+                        console.error('OpenParlor: memory retrieval failed', err);
+                    }
+                }
                 const prompt = applyPromptBudget(
                     buildPrompt({ character, conversation, history, newMessages: safeMessages, memories: memoryLines, participantContext, summary }),
                     resolvePromptBudget(modelConfig, resolveGenerationReserve(character)),
@@ -284,6 +294,9 @@ export function createOpenParlorChatRouter({
                         messages: extractionMessages,
                         source_message_id: assistantMsg.id,
                         known_by_character_ids: knownBy,
+                        // The turn's real time, so supersession compares what
+                        // the user SAid and when, not when extraction finished.
+                        source_timestamp: assistantMsg.created_at,
                         participants: participantContext?.map(p => ({ name: p.name })),
                         provider,
                     }).catch(err => {
@@ -305,7 +318,7 @@ export function createOpenParlorChatRouter({
                             ? completion.choices[0].message.content
                             : JSON.stringify(completion);
                         const msg = persistence.appendMessage(user.directories, conversationId, participant.id, content, 'character');
-                        responses.push({ character_id: character.id, participant_id: participant.id, content, message_id: msg.id });
+                        responses.push({ character_id: character.id, participant_id: participant.id, content, message_id: msg.id, created_at: msg.created_at });
                     } catch {
                         responses.push({ character_id: character.id, participant_id: participant.id, error: 'Chat completion failed' });
                     }
@@ -330,6 +343,7 @@ export function createOpenParlorChatRouter({
                         messages: extractionMessages,
                         source_message_id: resp.message_id,
                         known_by_character_ids: knownBy,
+                        source_timestamp: resp.created_at,
                         participants: participantContext?.map(p => ({ name: p.name })),
                         provider,
                     }).catch(err => {
@@ -374,6 +388,7 @@ export function createOpenParlorChatRouter({
                     let buffer = '';
                     let speakerText = '';
                     let speakerMessageId = null;
+                    let speakerMessageAt = null;
 
                     try {
                         const genOptions = getGenerationOptions(character);
@@ -403,6 +418,7 @@ export function createOpenParlorChatRouter({
                             try {
                                 const msg = persistence.appendMessage(user.directories, conversationId, participant.id, speakerText, 'character');
                                 speakerMessageId = msg.id;
+                                speakerMessageAt = msg.created_at;
                             } catch (persistErr) {
                                 console.error('OpenParlor: failed to persist assistant message', persistErr);
                             }
@@ -411,7 +427,7 @@ export function createOpenParlorChatRouter({
                             writeRecord({ type: 'speaker_end', character_id: character.id, participant_id: participant.id });
                         }
                         if (character && speakerMessageId && speakerText) {
-                            extractionResults.push({ character, content: speakerText, messageId: speakerMessageId });
+                            extractionResults.push({ character, content: speakerText, messageId: speakerMessageId, createdAt: speakerMessageAt });
                         }
                     } catch (streamError) {
                         hadStreamError = true;
@@ -434,7 +450,7 @@ export function createOpenParlorChatRouter({
                 response.off('close', abortStream);
             }
             response.end();
-            for (const { character, content, messageId } of extractionResults) {
+            for (const { character, content, messageId, createdAt } of extractionResults) {
                 const knownBy = conversation.participants
                     .filter(p => p.role === 'character')
                     .map(p => p.character_id)
@@ -451,6 +467,7 @@ export function createOpenParlorChatRouter({
                     messages: extractionMessages,
                     source_message_id: messageId,
                     known_by_character_ids: knownBy,
+                    source_timestamp: createdAt,
                     participants: participantContext?.map(p => ({ name: p.name })),
                     provider,
                 }).catch(err => {
