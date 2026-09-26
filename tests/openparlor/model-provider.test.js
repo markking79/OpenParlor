@@ -43,15 +43,26 @@ test('uses an optional API key and constructs non-streaming chat requests', asyn
 });
 
 // The thinking control is what keeps a reasoning model from spending tens of
-// seconds on `reasoning_content` that OpenParlor never renders.
-test('suppresses the thinking phase by default and honors an explicit opt-out', async () => {
+// seconds on `reasoning_content` that OpenParlor never renders. The caller
+// decides per turn (see model-thinking.js); unspecified means suppressed.
+test('suppresses the thinking phase unless the caller allows it', async () => {
     const on = mockFetch(json({ choices: [{ message: { content: 'ok' } }] }));
     await createModelProvider(config, { fetch: on.fetch }).chatCompletion([{ role: 'user', content: 'hi' }]);
     assert.deepEqual(JSON.parse(on.calls[0][1].body).chat_template_kwargs, { enable_thinking: false });
 
+    // A text turn that needs real reasoning asks for it explicitly.
     const off = mockFetch(json({ choices: [{ message: { content: 'ok' } }] }));
-    await createModelProvider({ ...config, disableThinking: false }, { fetch: off.fetch }).chatCompletion([{ role: 'user', content: 'hi' }]);
+    await createModelProvider(config, { fetch: off.fetch }).chatCompletion([{ role: 'user', content: 'solve x^2+1=0' }], { disableThinking: false });
     assert.equal(JSON.parse(off.calls[0][1].body).chat_template_kwargs, undefined);
+});
+
+test('the per-call thinking decision never leaks into the request body', async () => {
+    const mock = mockFetch(json({ choices: [{ message: { content: 'ok' } }] }));
+    const provider = createModelProvider(config, { fetch: mock.fetch });
+    await provider.chatCompletion([{ role: 'user', content: 'hi' }], { disableThinking: false, max_tokens: 256 });
+    const body = JSON.parse(mock.calls[0][1].body);
+    assert.equal(body.disableThinking, undefined);
+    assert.equal(body.max_tokens, 256);
 });
 
 test('an explicit caller chat_template_kwargs wins over the provider default', async () => {

@@ -32,13 +32,6 @@ export class OpenAICompatibleModelProvider {
             baseUrl: config.baseUrl.replace(/\/+$/, ''),
             model: typeof config.model === 'string' ? config.model : '',
             apiKey: typeof config.apiKey === 'string' ? config.apiKey : '',
-            // VOICE-005 follow-up: a reasoning model streams a long
-            // `reasoning_content` phase before its first visible token, and
-            // OpenParlor renders only `content`. On the local Qwen stack that
-            // is 20-60 seconds of dead air per turn, which makes a spoken
-            // conversation unusable. Turning the thinking phase off is what a
-            // roleplay turn wants; see #shouldControlThinking.
-            disableThinking: config.disableThinking !== false,
         };
         this.fetch = fetchImplementation;
     }
@@ -55,8 +48,8 @@ export class OpenAICompatibleModelProvider {
         return body.data;
     }
 
-    async chatCompletion(messages, { signal, ...options } = {}) {
-        const response = await this.#sendChat(messages, false, options, signal);
+    async chatCompletion(messages, { signal, disableThinking, ...options } = {}) {
+        const response = await this.#sendChat(messages, false, options, signal, disableThinking);
         let body;
         try {
             body = await response.json();
@@ -69,20 +62,26 @@ export class OpenAICompatibleModelProvider {
         return body;
     }
 
-    async streamChatCompletion(messages, { signal, ...options } = {}) {
-        const response = await this.#sendChat(messages, true, options, signal);
+    async streamChatCompletion(messages, { signal, disableThinking, ...options } = {}) {
+        const response = await this.#sendChat(messages, true, options, signal, disableThinking);
         if (!response.body) throw providerError('Malformed streaming chat response');
         return response.body;
     }
 
     /**
      * Whether this request should carry the chat-template thinking control.
-     * A server that has already rejected the field never receives it again,
-     * and a deployment can opt out entirely with `model.disableThinking: false`.
+     *
+     * The caller decides per turn (see model-thinking.js: a spoken turn cannot
+     * absorb an invisible reasoning phase, a text turn can and often needs it).
+     * A server that has already rejected the field never receives it again.
+     * An unspecified override keeps the conservative default of suppressing it.
+     *
+     * @param {unknown} override Per-call decision from the caller
      * @returns {boolean}
      */
-    #shouldControlThinking() {
-        return this.config.disableThinking && !thinkingControlUnsupportedServers.has(this.config.baseUrl);
+    #shouldControlThinking(override) {
+        const requested = typeof override === 'boolean' ? override : true;
+        return requested && !thinkingControlUnsupportedServers.has(this.config.baseUrl);
     }
 
     /**
@@ -98,10 +97,11 @@ export class OpenAICompatibleModelProvider {
      * @param {boolean} stream Whether to request a streamed response
      * @param {object} options Caller generation options
      * @param {AbortSignal} [signal] Abort signal
+     * @param {unknown} [disableThinking] Per-call thinking decision
      * @returns {Promise<Response>} The accepted response
      */
-    async #sendChat(messages, stream, options, signal) {
-        const controlThinking = this.#shouldControlThinking();
+    async #sendChat(messages, stream, options, signal, disableThinking) {
+        const controlThinking = this.#shouldControlThinking(disableThinking);
         const first = await this.#request('/chat/completions', {
             method: 'POST', signal, body: JSON.stringify(this.#chatBody(messages, stream, options, controlThinking)),
         });

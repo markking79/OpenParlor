@@ -8,6 +8,7 @@ import { applyPromptBudget, resolvePromptBudget, resolveGenerationReserve } from
 import { sanitizeSummaryForPrompt, updateConversationSummary } from './conversation-summary.js';
 import { retrieveMemories } from './memory-retrieval.js';
 import { normalizeResponseMode, normalizeVoiceResponseLength } from './response-style.js';
+import { shouldSuppressThinking } from './model-thinking.js';
 import { extractAndPersistMemories } from './memory-extractor.js';
 import { selectSpeakers } from './speaker-director.js';
 
@@ -176,6 +177,13 @@ export function createOpenParlorChatRouter({
         let conversation = null;
         let provider = null;
         let modelConfig = null;
+        // Whether THIS turn may run a reasoning phase before its first visible
+        // token. A spoken turn may not: the user has just finished talking and
+        // is waiting for the answer to be spoken aloud, so an invisible 20-60
+        // second reasoning phase reads as a broken app. A text turn may — the
+        // browser shows a first-token estimate, and a hard question genuinely
+        // needs the reasoning. See model-thinking.js.
+        let suppressThinking = true;
         if (conversationId) {
             conversation = persistence.getConversation(user.directories, conversationId);
             if (!conversation) {
@@ -191,6 +199,7 @@ export function createOpenParlorChatRouter({
                 const config = await loadConfig(user.directories);
                 provider = createProvider(config.model);
                 modelConfig = config.model;
+                suppressThinking = shouldSuppressThinking({ policy: config.model?.thinking, responseMode });
             } catch (error) {
                 if (error instanceof ModelProviderError) {
                     const status = typeof error.status === 'number' ? error.status : 503;
@@ -277,6 +286,7 @@ export function createOpenParlorChatRouter({
                 const config = await loadConfig(user.directories);
                 provider = createProvider(config.model);
                 modelConfig = config.model;
+                suppressThinking = shouldSuppressThinking({ policy: config.model?.thinking, responseMode });
             }
 
             if (!stream) {
@@ -291,7 +301,7 @@ export function createOpenParlorChatRouter({
                 if (speakerContexts.length === 1) {
                     const { participant, character, prompt } = speakerContexts[0];
                     const genOptions = getGenerationOptions(character);
-                    const completion = await provider.chatCompletion(prompt, genOptions);
+                    const completion = await provider.chatCompletion(prompt, { ...(genOptions || {}), disableThinking: suppressThinking });
                     const assistantContent = stripSelfAppliedSpeakerLabel(
                         typeof completion?.choices?.[0]?.message?.content === 'string'
                             ? completion.choices[0].message.content
@@ -334,7 +344,7 @@ export function createOpenParlorChatRouter({
                 for (const { participant, character, prompt } of speakerContexts) {
                     try {
                         const genOptions = getGenerationOptions(character);
-                        const completion = await provider.chatCompletion(prompt, genOptions);
+                        const completion = await provider.chatCompletion(prompt, { ...(genOptions || {}), disableThinking: suppressThinking });
                         const content = typeof completion?.choices?.[0]?.message?.content === 'string'
                             ? completion.choices[0].message.content
                             : JSON.stringify(completion);
@@ -413,7 +423,7 @@ export function createOpenParlorChatRouter({
 
                     try {
                         const genOptions = getGenerationOptions(character);
-                        const streamOpts = { signal: abortController.signal, ...(genOptions || {}) };
+                        const streamOpts = { signal: abortController.signal, ...(genOptions || {}), disableThinking: suppressThinking };
                         const result = await provider.streamChatCompletion(prompt, streamOpts);
                         for await (const chunk of result) {
                             buffer += decoder.decode(chunk, { stream: true });

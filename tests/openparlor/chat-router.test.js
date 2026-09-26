@@ -1253,7 +1253,9 @@ test('passes generation options as second argument to chatCompletion', async () 
             assert.equal(result.status, 200);
         });
 
-        assert.deepEqual(receivedOptions, { temperature: 0.5, max_tokens: 1024 });
+        // A text turn is allowed to think (model-thinking.js: 'auto'), so the
+        // router states that decision explicitly rather than leaving it implicit.
+        assert.deepEqual(receivedOptions, { temperature: 0.5, max_tokens: 1024, disableThinking: false });
     } finally {
         tmp.cleanup();
     }
@@ -1355,7 +1357,7 @@ test('ignores client-supplied temperature and max_tokens in chat request body', 
         });
 
         // Server-stored values win, not client-supplied
-        assert.deepEqual(receivedOptions, { temperature: 0.3, max_tokens: 512 });
+        assert.deepEqual(receivedOptions, { temperature: 0.3, max_tokens: 512, disableThinking: false });
     } finally {
         tmp.cleanup();
     }
@@ -1399,8 +1401,58 @@ test('cross-character isolation: each speaker gets its own generation options', 
         });
 
         assert.equal(mock.calls.length, 2);
-        assert.deepEqual(optionsByCall[0], { temperature: 0.2, max_tokens: 256 });
-        assert.deepEqual(optionsByCall[1], { temperature: 1.8, max_tokens: 4096 });
+        assert.deepEqual(optionsByCall[0], { temperature: 0.2, max_tokens: 256, disableThinking: false });
+        assert.deepEqual(optionsByCall[1], { temperature: 1.8, max_tokens: 4096, disableThinking: false });
+    } finally {
+        tmp.cleanup();
+    }
+});
+
+// A reasoning model streamed 20-60s of `reasoning_content` before its first
+// visible token, and OpenParlor renders only `content`. That is fatal in a
+// spoken turn and merely slow in a text turn, so the medium decides.
+test('suppresses the thinking phase for spoken turns and allows it for text turns', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const char = persistence.createCharacter(dirs, 'alice', { name: 'Styled' });
+        const conv = persistence.createConversation(dirs, 'alice', char.id, 'Test');
+
+        const optionsByMode = {};
+        const mock = {
+            calls: [],
+            provider: {
+                chatCompletion: async (messages, options) => {
+                    mock.calls.push({ messages, options });
+                    return completion;
+                },
+            },
+        };
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        for (const [label, responseMode, expected] of [
+            ['text', 'text', false],
+            ['voice', 'voice', true],
+            ['hands_free', 'hands_free', true],
+            ['unknown-mode', 'telepathy', false],
+        ]) {
+            mock.calls.length = 0;
+            await withChatServer({
+                loadConfig: async () => configuredConfig,
+                createProvider: () => mock.provider,
+                runMemoryExtraction: async () => [],
+            }, user, async baseUrl => {
+                const result = await postChat(baseUrl, {
+                    messages: [{ role: 'user', content: 'hello' }],
+                    conversation_id: conv.id,
+                    response_mode: responseMode,
+                });
+                assert.equal(result.status, 200);
+            });
+            optionsByMode[label] = mock.calls[0].options.disableThinking;
+            assert.equal(optionsByMode[label], expected, `${label} turn`);
+        }
     } finally {
         tmp.cleanup();
     }

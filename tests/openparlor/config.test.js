@@ -7,7 +7,7 @@ import { getOpenParlorConfigPath, loadOpenParlorConfig } from '../../src/openpar
 
 function disabledConfig() {
     return {
-        model: { provider: 'openai-compatible', baseUrl: '', model: '', maxContextTokens: 0, disableThinking: true },
+        model: { provider: 'openai-compatible', baseUrl: '', model: '', maxContextTokens: 0, thinking: 'auto' },
         stt: { provider: '', baseUrl: '', pythonExecutable: '', runnerPath: '', modelPath: '', modelCacheDir: '', maxAudioBytes: 0, timeoutMs: 0, language: '' },
         tts: { provider: '', baseUrl: '', voice: '' },
     };
@@ -74,13 +74,13 @@ describe('OpenParlor configuration loading', () => {
             const { tmpDir, directories } = makeDirs();
             try {
                 writeConfig(directories, JSON.stringify({
-                    model: { provider: 'openai-compatible', baseUrl: 'https://model.example.invalid/v1', model: 'llama3', maxContextTokens: 32768, disableThinking: true },
+                    model: { provider: 'openai-compatible', baseUrl: 'https://model.example.invalid/v1', model: 'llama3', maxContextTokens: 32768, thinking: 'auto' },
                     stt: { provider: 'faster-whisper', baseUrl: '', pythonExecutable: '/usr/bin/python3', runnerPath: '/srv/runner.py', modelPath: '/srv/model', modelCacheDir: '/srv/cache', maxAudioBytes: 1024, timeoutMs: 5000, language: 'en' },
                     tts: { provider: 'kokoro', baseUrl: 'https://tts.example.invalid/v1', voice: 'af_heart' },
                 }));
                 const result = await loadOpenParlorConfig(directories);
                 assert.deepEqual(result, {
-                    model: { provider: 'openai-compatible', baseUrl: 'https://model.example.invalid/v1', model: 'llama3', maxContextTokens: 32768, disableThinking: true },
+                    model: { provider: 'openai-compatible', baseUrl: 'https://model.example.invalid/v1', model: 'llama3', maxContextTokens: 32768, thinking: 'auto' },
                     stt: { provider: 'faster-whisper', baseUrl: '', pythonExecutable: '/usr/bin/python3', runnerPath: '/srv/runner.py', modelPath: '/srv/model', modelCacheDir: '/srv/cache', maxAudioBytes: 1024, timeoutMs: 5000, language: 'en' },
                     tts: { provider: 'kokoro', baseUrl: 'https://tts.example.invalid/v1', voice: 'af_heart' },
                 });
@@ -129,7 +129,7 @@ describe('OpenParlor configuration loading', () => {
                 }));
                 const result = await loadOpenParlorConfig(directories);
                 assert.deepEqual(result, {
-                    model: { provider: 'openai-compatible', baseUrl: 'https://model.example.invalid/v1', model: '', maxContextTokens: 0, disableThinking: true },
+                    model: { provider: 'openai-compatible', baseUrl: 'https://model.example.invalid/v1', model: '', maxContextTokens: 0, thinking: 'auto' },
                     stt: { provider: '', baseUrl: '', pythonExecutable: '', runnerPath: '', modelPath: '', modelCacheDir: '', maxAudioBytes: 0, timeoutMs: 0, language: '' },
                     tts: { provider: '', baseUrl: '', voice: 'af_heart' },
                 });
@@ -138,20 +138,17 @@ describe('OpenParlor configuration loading', () => {
             }
         });
 
-        test('normalizes model.disableThinking to the enabled default unless explicitly false', async () => {
+        test('normalizes model.thinking to a known policy', async () => {
             const { tmpDir, directories } = makeDirs();
             try {
-                // A reasoning model that thinks out loud stalls every spoken
-                // turn, so the safe default is to suppress it. Only an explicit
-                // boolean false opts back in.
-                for (const disableThinking of [undefined, null, 0, 1, 'false', {}, []]) {
-                    writeConfig(directories, JSON.stringify({ model: { disableThinking } }));
-                    assert.equal((await loadOpenParlorConfig(directories)).model.disableThinking, true);
+                for (const thinking of [undefined, null, 0, 'sometimes', {}, [], 'AUTO']) {
+                    writeConfig(directories, JSON.stringify({ model: { thinking } }));
+                    assert.equal((await loadOpenParlorConfig(directories)).model.thinking, 'auto');
                 }
-                writeConfig(directories, JSON.stringify({ model: { disableThinking: false } }));
-                assert.equal((await loadOpenParlorConfig(directories)).model.disableThinking, false);
-                writeConfig(directories, JSON.stringify({ model: { disableThinking: true } }));
-                assert.equal((await loadOpenParlorConfig(directories)).model.disableThinking, true);
+                for (const thinking of ['auto', 'always', 'never']) {
+                    writeConfig(directories, JSON.stringify({ model: { thinking } }));
+                    assert.equal((await loadOpenParlorConfig(directories)).model.thinking, thinking);
+                }
             } finally {
                 cleanup(tmpDir);
             }

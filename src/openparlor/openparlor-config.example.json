@@ -4,7 +4,7 @@
         "baseUrl": "http://127.0.0.1:PORT/v1",
         "model": "MODEL_NAME",
         "maxContextTokens": 0,
-        "disableThinking": true
+        "thinking": "auto"
     },
     "stt": {
         "provider": "PROVIDER_NAME",

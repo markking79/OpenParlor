@@ -435,7 +435,16 @@ export async function selectSpeakers({ participants = [], characters = [], userM
     const byCharacterId = new Map(charParticipants.map(p => [p.character_id, p]));
     try {
         const prompt = buildDirectorPrompt({ participants, characters, userMessage, recentMessages });
-        const completion = await provider.chatCompletion(prompt, { max_tokens: DIRECTOR_MAX_MODEL_TOKENS });
+        // This is a classification, not an answer: the director must name
+        // speakers inside a tiny budget. A reasoning model spends that budget on
+        // a `reasoning_content` phase OpenParlor never reads and returns an
+        // empty decision, which silently demoted every group turn to the
+        // deterministic fallback. The thinking phase is therefore always off
+        // here, regardless of the deployment's turn-level policy.
+        const completion = await provider.chatCompletion(prompt, {
+            max_tokens: DIRECTOR_MAX_MODEL_TOKENS,
+            disableThinking: true,
+        });
         const raw = typeof completion?.choices?.[0]?.message?.content === 'string'
             ? completion.choices[0].message.content
             : '';
