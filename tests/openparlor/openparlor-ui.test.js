@@ -490,6 +490,55 @@ describe('createPlaybackController', () => {
         return { deps, createdUrls, revokedUrls, getLastAudio: () => lastAudio };
     }
 
+    function makeEventMockAudio() {
+        const listeners = {};
+        const audio = {
+            src: '',
+            played: false,
+            paused: false,
+            async play() { this.played = true; },
+            pause() { this.paused = true; },
+            addEventListener(type, fn) {
+                if (!listeners[type]) listeners[type] = [];
+                listeners[type].push(fn);
+            },
+            emit(type) {
+                for (const fn of listeners[type] || []) {
+                    fn();
+                }
+            },
+        };
+        return audio;
+    }
+
+    function makeBlobDeps() {
+        const audios = [];
+        const createdBlobs = [];
+        const revokedUrls = [];
+        let fetchCalls = 0;
+
+        const deps = {
+            fetchFn: async () => {
+                fetchCalls += 1;
+                return { ok: true, blob: async () => new Blob(['fetched']) };
+            },
+            createObjectURL: (blob) => {
+                createdBlobs.push(blob);
+                const url = `blob:pb-${createdBlobs.length}`;
+                return url;
+            },
+            revokeObjectURL: (url) => { revokedUrls.push(url); },
+            audioFactory: (url) => {
+                const audio = makeEventMockAudio();
+                audio.src = url;
+                audios.push(audio);
+                return audio;
+            },
+        };
+
+        return { deps, audios, createdBlobs, revokedUrls, fetchCalls: () => fetchCalls };
+    }
+
     test('initial state is not playing', () => {
         const { deps } = makeDeps();
         const controller = createPlaybackController(deps);
@@ -724,6 +773,200 @@ describe('createPlaybackController', () => {
         assert.equal(result, null);
         assert.equal(audios.length, 0);
         assert.equal(controller.isPlaying, false);
+    });
+
+    // ─── playBlob (VOICE-002 Step 2A) ──────────────────────────────────────
+
+    test('playBlob plays the supplied Blob without any fetch', async () => {
+        const { deps, audios, createdBlobs, fetchCalls } = makeBlobDeps();
+        const controller = createPlaybackController(deps);
+        const blob = new Blob(['ready-audio']);
+        const url = await controller.playBlob(blob);
+
+        assert.equal(fetchCalls(), 0);
+        assert.equal(createdBlobs.length, 1);
+        assert.equal(createdBlobs[0], blob);
+        assert.equal(url, 'blob:pb-1');
+        assert.equal(audios.length, 1);
+        assert.equal(audios[0].src, 'blob:pb-1');
+        assert.equal(audios[0].played, true);
+        assert.equal(controller.isPlaying, true);
+    });
+
+    test('playBlob resolves only after playback has started', async () => {
+        let resolveStart;
+        const audio = {
+            src: '',
+            paused: false,
+            play: () => new Promise((resolve) => { resolveStart = resolve; }),
+            pause() { this.paused = true; },
+            addEventListener() {},
+        };
+        const deps = {
+            fetchFn: () => Promise.reject(new Error('playBlob must not fetch')),
+            createObjectURL: () => 'blob:pb-start',
+            revokeObjectURL: () => {},
+            audioFactory: (url) => { audio.src = url; return audio; },
+        };
+        const controller = createPlaybackController(deps);
+        const promise = controller.playBlob(new Blob(['x']));
+
+        let settled = false;
+        promise.then(() => { settled = true; });
+        await Promise.resolve();
+        assert.equal(settled, false, 'must not resolve before audio.play() settles');
+        assert.equal(controller.isPlaying, true);
+
+        resolveStart();
+        const url = await promise;
+        assert.equal(url, 'blob:pb-start');
+    });
+
+    test('playBlob natural end releases resources and fires onEnded exactly once', async () => {
+        const { deps, audios, revokedUrls } = makeBlobDeps();
+        const controller = createPlaybackController(deps);
+        let endedCalls = 0;
+        await controller.playBlob(new Blob(['s1']), () => { endedCalls += 1; });
+
+        audios[0].emit('ended');
+        assert.equal(endedCalls, 1);
+        assert.equal(controller.isPlaying, false);
+        assert.deepEqual(revokedUrls, ['blob:pb-1']);
+
+        audios[0].emit('ended');
+        assert.equal(endedCalls, 1, 'a repeated ended event must not fire the callback again');
+    });
+
+    test('playBlob works without an onEnded callback', async () => {
+        const { deps, audios, revokedUrls } = makeBlobDeps();
+        const controller = createPlaybackController(deps);
+        await controller.playBlob(new Blob(['s1']));
+
+        assert.equal(controller.isPlaying, true);
+        audios[0].emit('ended');
+        assert.equal(controller.isPlaying, false);
+        assert.deepEqual(revokedUrls, ['blob:pb-1']);
+    });
+
+    test('explicit stop during playBlob pauses audio, revokes URL, fires callback once', async () => {
+        const { deps, audios, revokedUrls } = makeBlobDeps();
+        const controller = createPlaybackController(deps);
+        let endedCalls = 0;
+        await controller.playBlob(new Blob(['s1']), () => { endedCalls += 1; });
+
+        controller.stop();
+        assert.equal(endedCalls, 1);
+        assert.equal(controller.isPlaying, false);
+        assert.equal(audios[0].paused, true);
+        assert.deepEqual(revokedUrls, ['blob:pb-1']);
+
+        audios[0].emit('ended');
+        assert.equal(endedCalls, 1, 'a late ended event after stop must not re-fire the callback');
+    });
+
+    test('a newer playBlob supersedes the previous one without completing it', async () => {
+        const { deps, audios, revokedUrls } = makeBlobDeps();
+        const controller = createPlaybackController(deps);
+        let firstCalls = 0;
+        let secondCalls = 0;
+
+        await controller.playBlob(new Blob(['s1']), () => { firstCalls += 1; });
+        await controller.playBlob(new Blob(['s2']), () => { secondCalls += 1; });
+
+        assert.deepEqual(revokedUrls, ['blob:pb-1']);
+        assert.equal(audios[0].paused, true);
+        assert.equal(firstCalls, 0, 'a superseded playback must not report completion');
+        assert.equal(audios[1].played, true);
+        assert.equal(controller.isPlaying, true);
+
+        audios[1].emit('ended');
+        assert.equal(secondCalls, 1);
+        assert.equal(firstCalls, 0);
+        assert.equal(controller.isPlaying, false);
+        assert.deepEqual(revokedUrls, ['blob:pb-1', 'blob:pb-2']);
+    });
+
+    test('legacy play() supersedes an active playBlob without completing it', async () => {
+        const { deps, audios, revokedUrls } = makeBlobDeps();
+        const controller = createPlaybackController(deps);
+        let firstCalls = 0;
+        let secondCalls = 0;
+
+        await controller.playBlob(new Blob(['s1']), () => { firstCalls += 1; });
+        const url = await controller.play('second', 'am_adam', () => { secondCalls += 1; });
+
+        assert.equal(url, 'blob:pb-2');
+        assert.deepEqual(revokedUrls, ['blob:pb-1']);
+        assert.equal(audios[0].paused, true);
+        assert.equal(firstCalls, 0, 'a superseded playBlob must not report completion');
+        assert.equal(audios[1].played, true);
+        assert.equal(controller.isPlaying, true);
+
+        audios[1].emit('ended');
+        assert.equal(secondCalls, 1);
+        assert.equal(firstCalls, 0);
+    });
+
+    test('playBlob supersedes an active legacy play() without completing it', async () => {
+        const { deps, audios, revokedUrls } = makeBlobDeps();
+        const controller = createPlaybackController(deps);
+        let firstCalls = 0;
+        let secondCalls = 0;
+
+        await controller.play('first', 'af_heart', () => { firstCalls += 1; });
+        const url = await controller.playBlob(new Blob(['s2']), () => { secondCalls += 1; });
+
+        assert.equal(url, 'blob:pb-2');
+        assert.deepEqual(revokedUrls, ['blob:pb-1']);
+        assert.equal(audios[0].paused, true);
+        assert.equal(firstCalls, 0, 'a superseded play must not report completion');
+        assert.equal(audios[1].played, true);
+        assert.equal(controller.isPlaying, true);
+
+        audios[1].emit('ended');
+        assert.equal(secondCalls, 1);
+        assert.equal(firstCalls, 0);
+    });
+
+    test('failed playBlob start rejects, discards callback, releases resources, stays usable', async () => {
+        const audios = [];
+        const revokedUrls = [];
+        let startFails = true;
+        const deps = {
+            fetchFn: async () => ({ ok: true, blob: async () => new Blob(['x']) }),
+            createObjectURL: () => `blob:pb-${audios.length + 1}`,
+            revokeObjectURL: (url) => { revokedUrls.push(url); },
+            audioFactory: (url) => {
+                const audio = makeEventMockAudio();
+                audio.src = url;
+                if (startFails) {
+                    audio.play = () => Promise.reject(new Error('play failed'));
+                }
+                startFails = false;
+                audios.push(audio);
+                return audio;
+            },
+        };
+        const controller = createPlaybackController(deps);
+        let failedCalls = 0;
+
+        await assert.rejects(
+            () => controller.playBlob(new Blob(['s1']), () => { failedCalls += 1; }),
+            /play failed/,
+        );
+        assert.equal(failedCalls, 0, 'a failed start must not fire the completion callback');
+        assert.equal(controller.isPlaying, false);
+        assert.deepEqual(revokedUrls, ['blob:pb-1']);
+        assert.equal(audios[0].paused, true);
+
+        // The controller must remain usable after a failed start.
+        let secondCalls = 0;
+        const url = await controller.playBlob(new Blob(['s2']), () => { secondCalls += 1; });
+        assert.equal(url, 'blob:pb-2');
+        assert.equal(controller.isPlaying, true);
+        audios[1].emit('ended');
+        assert.equal(secondCalls, 1);
+        assert.equal(failedCalls, 0);
     });
 });
 

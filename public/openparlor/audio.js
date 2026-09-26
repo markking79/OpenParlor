@@ -449,19 +449,23 @@ export function createVoiceTurnTimer(deps = {}) {
  *   play: (text: string, voice: string, onEnded?: () => void) => Promise<string | null>,
  *   stop: () => void,
  *   replay: (text: string, voice: string, onEnded?: () => void) => Promise<string | null>,
+ *   playBlob: (blob: Blob, onEnded?: () => void) => Promise<string | null>,
  *   isPlaying: boolean
  * }}
  *
- * Completion-callback contract: `play()`/`replay()` first tear down any
- * current playback, then arm the new `onEnded` callback tagged with the new
- * generation — so the previous teardown can never consume the new
- * playback's callback, and the callback is in place before the new audio
- * can complete. The armed callback fires exactly once, and only when the
- * playback actually started: on the audio's natural 'ended' event, or when
- * stop() is called explicitly while it is the current playback. A replaced
- * playback (superseded by a newer play) or a failed start discards its
- * callback without firing it — in the failed case the Promise rejects, and
- * in the replaced case it resolves null.
+ * Completion-callback contract: `play()`/`replay()`/`playBlob()` first tear
+ * down any current playback, then arm the new `onEnded` callback tagged
+ * with the new generation — so the previous teardown can never consume the
+ * new playback's callback, and the callback is in place before the new
+ * audio can complete. The armed callback fires exactly once, and only when
+ * the playback actually started: on the audio's natural 'ended' event, or
+ * when stop() is called explicitly while it is the current playback. A
+ * replaced playback (superseded by a newer play or playBlob) or a failed
+ * start discards its callback without firing it — in the failed case the
+ * Promise rejects, and in the replaced case it resolves null. `playBlob()`
+ * plays an already-synthesized Blob and never performs the synthesize
+ * fetch; object URLs created from such Blobs remain owned by this
+ * controller.
  */
 export function createPlaybackController(deps = {}) {
     const {
@@ -587,10 +591,72 @@ export function createPlaybackController(deps = {}) {
         return play(text, voice, onEnded);
     }
 
+    /**
+     * Plays an already-synthesized TTS Blob directly, skipping the
+     * synthesize fetch. Mirrors the playback portion of play(): supersedes
+     * any current playback, arms onEnded for the new generation, and
+     * resolves (with the object URL) only after audio playback has
+     * successfully started. Natural end and explicit stop settle the armed
+     * callback under the same contract as play(); a superseded or failed
+     * start never fires it.
+     * @param {Blob} blob
+     * @param {(() => void) | undefined} onEnded
+     * @returns {Promise<string | null>}
+     */
+    async function playBlob(blob, onEnded) {
+        cancelCurrent();
+        const gen = generation;
+        if (typeof onEnded === 'function') {
+            // Armed only after the previous playback is fully torn down, so
+            // this stop() call can never consume the new playback's
+            // callback, and a stale callback can never outlive this attempt.
+            endHandler = onEnded;
+            endHandlerGen = gen;
+        }
+        let audio = null;
+        try {
+            currentUrl = createObjectURL(blob);
+            currentAudio = audioFactory(currentUrl);
+            audio = currentAudio;
+            if (typeof audio.addEventListener === 'function') {
+                audio.addEventListener('ended', () => {
+                    if (currentAudio !== audio) return; // replaced or stopped
+                    const url = currentUrl;
+                    currentAudio = null;
+                    currentUrl = null;
+                    _isPlaying = false;
+                    if (url) revokeObjectURL(url);
+                    const ended = endHandler;
+                    if (ended && endHandlerGen === gen) {
+                        endHandler = null;
+                        endHandlerGen = 0;
+                        ended();
+                    }
+                }, { once: true });
+            }
+            _isPlaying = true;
+            await audio.play();
+            return currentUrl;
+        } catch (error) {
+            // Starting failed: this attempt never produced playback, so its
+            // callback must not fire now or later — it is discarded, and the
+            // caller is notified by the rejection itself.
+            if (endHandlerGen === gen) {
+                endHandler = null;
+                endHandlerGen = 0;
+            }
+            if (audio !== null && currentAudio === audio) {
+                stop();
+            }
+            throw error;
+        }
+    }
+
     return {
         play,
         stop,
         replay,
+        playBlob,
         get isPlaying() { return _isPlaying; },
     };
 }

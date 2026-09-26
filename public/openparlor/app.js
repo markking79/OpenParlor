@@ -71,7 +71,591 @@ export function createMemoryRefreshGuard() {
     };
 }
 
+export const STREAMING_TURN_MODES = Object.freeze({
+    UNDECIDED: 'undecided',
+    STREAMING: 'streaming',
+    LEGACY: 'legacy',
+    FAILED: 'failed',
+    STOPPED: 'stopped',
+    COMPLETE: 'complete',
+});
+
+/**
+ * Per-turn streaming TTS state machine (VOICE-002 Step 2C).
+ *
+ * Wraps exactly one streaming TTS session (created via deps.createSession,
+ * which must return a createStreamingTtsSession surface) across one
+ * assistant turn and makes the streaming-vs-legacy TTS decision exactly
+ * once, at the first speaker_start. The decision is final: later
+ * speaker_start records only route that speaker's voice, and stream errors,
+ * done, toggles, or conversation changes can never restart streaming or
+ * resurrect a settled session. The only streaming -> legacy transition is a
+ * successful zero-work handoff at the final done; once any sentence was
+ * streamed, the legacy full-response TTS path is forbidden for the turn.
+ *
+ * Identity safety: the session callbacks (onFirstAudioStart/onTurnEnd)
+ * re-check deps.isCurrent() and the captured session instance before
+ * applying app-level effects, so a stale turn can never move the Hands-Free
+ * state or the turn timer of a newer turn.
+ *
+ * @param {{
+ *   isCurrent: () => boolean,
+ *   isEligible: () => boolean,
+ *   resolveVoice: (characterId: string) => string,
+ *   createSession: (hooks: {
+ *     onFirstAudioStart: () => void,
+ *     onTurnEnd: (result: object) => void,
+ *   }) => object,
+ *   onFirstAudio: () => void,
+ *   onTurnSettled: (state: object, result: object) => void,
+ * }} deps
+ *   isCurrent: whether the identity captured at send time (conversation id
+ *     + selection epoch) still matches the app's current identity.
+ *   isEligible: whether streaming is allowed at decision time: auto-speak or
+ *     voice mode enabled, recorder not recording, no pending recording
+ *     interruption, and the stream has not already errored.
+ *   resolveVoice: maps a speaker_start character id to its TTS voice (''
+ *     when the character has none).
+ *   createSession: creates the turn's streaming session; the returned object
+ *     must expose the createStreamingTtsSession surface (startSpeaker,
+ *     feed, endSpeaker, finishInput, cancel, handoffToLegacy).
+ *   onFirstAudio: app-level effect for the first REAL audio of this turn
+ *     (mark TTS ready, Hands-Free WAITING -> SPEAKING).
+ *   onTurnSettled: app-level effect once this turn's audio has ended
+ *     (completion, failure, or explicit cancel): mark speaking end when
+ *     first audio started, otherwise complete a still-waiting response.
+ *     The factory passes its own state so the app can read
+ *     firstAudioStarted.
+ * @returns {{
+ *   get mode(): string,
+ *   get firstAudioStarted(): boolean,
+ *   onSpeakerStart: (characterId: string) => void,
+ *   onDelta: (text: string) => void,
+ *   onSpeakerEnd: () => void,
+ *   onStreamError: (reason?: string) => void,
+ *   onDone: () => { runLegacy: boolean, ttsHandled: boolean },
+ *   cancel: (reason: string) => void,
+ * }}
+ */
+export function createStreamingTurnState(deps) {
+    let mode = STREAMING_TURN_MODES.UNDECIDED;
+    let session = null;
+    let firstAudioStarted = false;
+    let doneHandled = false;
+
+    const state = {
+        get mode() { return mode; },
+        get firstAudioStarted() { return firstAudioStarted; },
+    };
+
+    // Applies the app-level settle effect only while this turn's identity is
+    // still the app's current identity.
+    function settleEffects(result) {
+        if (deps.isCurrent()) deps.onTurnSettled(state, result);
+    }
+
+    function onSpeakerStart(characterId) {
+        if (mode === STREAMING_TURN_MODES.STREAMING) {
+            // Decision is final: only route this speaker's voice. Never
+            // create a second session or re-decide.
+            if (session) session.startSpeaker(deps.resolveVoice(characterId));
+            return;
+        }
+        if (mode !== STREAMING_TURN_MODES.UNDECIDED) return; // terminal
+        if (deps.isCurrent() && deps.isEligible()) {
+            mode = STREAMING_TURN_MODES.STREAMING;
+            const created = deps.createSession({
+                onFirstAudioStart: () => {
+                    if (!deps.isCurrent() || session !== created) return;
+                    firstAudioStarted = true;
+                    deps.onFirstAudio();
+                },
+                onTurnEnd: (result) => {
+                    if (!deps.isCurrent() || session !== created) return;
+                    if (result.stopped) return; // settles via cancel()/onStreamError()
+                    session = null;
+                    mode = result.ok ? STREAMING_TURN_MODES.COMPLETE : STREAMING_TURN_MODES.FAILED;
+                    deps.onTurnSettled(state, result);
+                },
+            });
+            session = created;
+            created.startSpeaker(deps.resolveVoice(characterId));
+        } else {
+            // Ineligible or stale identity at the first speaker_start: the
+            // existing legacy full-response path is the only permitted
+            // source of audio for this turn.
+            mode = STREAMING_TURN_MODES.LEGACY;
+        }
+    }
+
+    function onDelta(text) {
+        // Raw incremental delta text, never the accumulated message content.
+        if (mode === STREAMING_TURN_MODES.STREAMING && session) session.feed(text);
+    }
+
+    function onSpeakerEnd() {
+        if (mode === STREAMING_TURN_MODES.STREAMING && session) session.endSpeaker();
+    }
+
+    // Abnormal input termination (stream error record, or the reader ended
+    // without a done record). Cancels the session and settles the
+    // app-level effects; a turn that already settled is untouched, and no
+    // legacy fallback is ever run afterwards.
+    function onStreamError(reason) {
+        if (mode !== STREAMING_TURN_MODES.STREAMING || !session) return;
+        mode = STREAMING_TURN_MODES.FAILED;
+        const current = session;
+        session = null;
+        current.cancel(reason || 'stream-error');
+        settleEffects({
+            ok: false,
+            stopped: true,
+            reason: reason || 'stream-error',
+            firstAudioStarted: firstAudioStarted,
+        });
+    }
+
+    function onDone() {
+        if (doneHandled) return { runLegacy: false, ttsHandled: true };
+        doneHandled = true;
+        if (mode === STREAMING_TURN_MODES.STREAMING && session) {
+            const current = session;
+            const summary = current.finishInput();
+            if (summary.sentenceCount > 0) {
+                // At least one streamed sentence: this turn's audio is owned
+                // by the streaming session until it settles. Legacy TTS is
+                // forbidden; ttsHandled keeps the app from treating the turn
+                // as a no-speak response (Hands-Free stays WAITING until the
+                // first real audio, then SPEAKING until the last audio ends).
+                return { runLegacy: false, ttsHandled: true };
+            }
+            if (current.handoffToLegacy()) {
+                // Zero-work handoff: the session produced no synthesis or
+                // playback work, so the legacy full-response path may run
+                // unchanged (it re-checks every app-level condition).
+                mode = STREAMING_TURN_MODES.LEGACY;
+                session = null;
+                return { runLegacy: true, ttsHandled: false };
+            }
+            // Unreachable in practice (a zero-sentence session always
+            // handoffs cleanly); fail closed: speak nothing, no legacy.
+            mode = STREAMING_TURN_MODES.FAILED;
+            session = null;
+            current.cancel('stream-handoff-failed');
+            settleEffects({
+                ok: false,
+                stopped: true,
+                reason: 'stream-handoff-failed',
+                firstAudioStarted: firstAudioStarted,
+            });
+            return { runLegacy: false, ttsHandled: true };
+        }
+        // Legacy/undecided: the existing shouldAutoSpeak check applies.
+        if (mode === STREAMING_TURN_MODES.FAILED || mode === STREAMING_TURN_MODES.STOPPED) {
+            // The turn's audio outcome already settled via onStreamError()
+            // or cancel(); mark it handled so the app's no-speak tail does
+            // not re-apply the settle effects. Never run legacy.
+            return { runLegacy: false, ttsHandled: true };
+        }
+        return {
+            runLegacy: mode === STREAMING_TURN_MODES.LEGACY || mode === STREAMING_TURN_MODES.UNDECIDED,
+            ttsHandled: false,
+        };
+    }
+
+    // External invalidation: conversation switch/delete, new conversation,
+    // voice toggle off. Cancels the session and settles the app-level
+    // effects only while this turn's identity is still the current one.
+    function cancel(reason) {
+        if (mode === STREAMING_TURN_MODES.STREAMING && session) {
+            mode = STREAMING_TURN_MODES.STOPPED;
+            const current = session;
+            session = null;
+            current.cancel(reason);
+            settleEffects({
+                ok: false,
+                stopped: true,
+                reason: reason,
+                firstAudioStarted: firstAudioStarted,
+            });
+            return;
+        }
+        if (mode === STREAMING_TURN_MODES.UNDECIDED || mode === STREAMING_TURN_MODES.LEGACY) {
+            mode = STREAMING_TURN_MODES.STOPPED;
+        }
+    }
+
+    return Object.assign(state, {
+        onSpeakerStart: onSpeakerStart,
+        onDelta: onDelta,
+        onSpeakerEnd: onSpeakerEnd,
+        onStreamError: onStreamError,
+        onDone: onDone,
+        cancel: cancel,
+    });
+}
+
+/**
+ * Single app-level TTS ownership teardown (VOICE-002 Step 2D).
+ *
+ * Every path that takes audio ownership (manual Play/Replay/Stop, new send,
+ * conversation switch/delete/new, toggle-off, recording start) must route
+ * through stopActiveTts() so the teardown ordering is identical everywhere:
+ *
+ *   1. cancelStreamingTurn(reason)
+ *      The streaming owner is made terminal first. Its internal teardown
+ *      stops the playback it owns and settles Hands-Free for the dead turn
+ *      (exactly once, via its own settle path).
+ *   2. groupQueue.clear()
+ *      The legacy queue is invalidated: pending items never play, and the
+ *      in-flight playAll loop exits on wake WITHOUT onAllDone (its
+ *      generation changed), so a stale queue can never end a newer
+ *      Hands-Free speaking phase.
+ *   3. playback.stop()
+ *      Deliberately AFTER clear(): stop() FIRES the currently armed
+ *      completion callback, which is what deterministically settles an
+ *      active legacy playItem promise. Without it, a replacement play()
+ *      would suppress that callback via cancelCurrent() and the playItem
+ *      promise (and its queue loop) would never settle. A second stop()
+ *      after a streaming cancel is a no-op (no armed callback left).
+ *   4. timer.cancel()
+ *      onAllDone cannot cancel the per-turn timer (step 2 invalidated the
+ *      loop), so teardown owns it; idempotent.
+ *   5. options.markSpeakingEnd
+ *      Explicit Hands-Free speaking end for owners whose normal
+ *      completion is skipped by the generation bump (legacy queue, manual
+ *      playback). No-op when Hands-Free is not in SPEAKING, so callers may
+ *      pass it unconditionally where the streaming owner has already
+ *      settled (new send). Callers that hand Hands-Free to invalidate()
+ *      (conversation switch/delete/new) omit it.
+ *   6. refreshButtons()
+ *
+ * The whole sequence is synchronous: by the time a caller starts new
+ * playback afterwards, every old owner is terminal and no old callback can
+ * touch the new owner's playback or Hands-Free state.
+ *
+ * @param {{
+ *   cancelStreamingTurn: (reason: string) => void,
+ *   groupQueue: { clear: () => void },
+ *   playback: { stop: () => void },
+ *   timer?: { cancel: () => void },
+ *   markSpeakingEnd?: () => void,
+ *   refreshButtons?: () => void,
+ * }} deps
+ * @returns {{ stopActiveTts: (reason: string, options?: { markSpeakingEnd?: boolean }) => void }}
+ */
+export function createTtsOwnershipController(deps) {
+    function stopActiveTts(reason, options = {}) {
+        deps.cancelStreamingTurn(reason);
+        deps.groupQueue.clear();
+        deps.playback.stop();
+        if (deps.timer) deps.timer.cancel();
+        if (options.markSpeakingEnd && deps.markSpeakingEnd) deps.markSpeakingEnd();
+        if (deps.refreshButtons) deps.refreshButtons();
+    }
+    return { stopActiveTts };
+}
+
+/**
+ * Estimated response-start progress state machine (DOGFOOD-007), extracted
+ * from the browser bootstrap (VOICE-002 Step 2E) so the Stop/abort
+ * cancellation contract is deterministically testable.
+ *
+ * pendingStart tracks the speaker currently awaiting its first visible
+ * token; the window is per-speaker so sequential group replies never share
+ * or morph state. Every effect is identity-guarded by the message object,
+ * so a stale stop/complete/tick from an older send cannot touch a newer
+ * send's indicator (Step 2E).
+ *
+ * All timing is injected — the clock (now) and the 200 ms tick interval
+ * (setIntervalFn/clearIntervalFn) — so tests run against a fake clock and
+ * never touch real timers.
+ *
+ * @param {{
+ *   estimator: { observe: (ms: number) => void, expectedMs: () => number },
+ *   now: () => number,
+ *   setIntervalFn: (fn: () => void, ms: number) => unknown,
+ *   clearIntervalFn: (id: unknown) => void,
+ *   onTick: (label: string) => void,
+ *   onCompleted: (name: string, bubble: unknown) => void,
+ * }} deps
+ */
+export function createResponseStartProgress(deps) {
+    let pendingStart = null;
+    let timerId = null;
+
+    function tick() {
+        if (!pendingStart) {
+            stop();
+            return;
+        }
+        deps.onTick(formatResponseStartProgress(
+            pendingStart.name,
+            estimateResponseStartProgress({
+                elapsedMs: deps.now() - pendingStart.startedAt,
+                expectedMs: deps.estimator.expectedMs(),
+            }),
+        ));
+    }
+
+    function start(msg, name) {
+        pendingStart = { msg, startedAt: deps.now(), name: name || '' };
+        if (timerId === null) {
+            timerId = deps.setIntervalFn(tick, 200);
+        }
+    }
+
+    function stop() {
+        pendingStart = null;
+        if (timerId !== null) {
+            deps.clearIntervalFn(timerId);
+            timerId = null;
+        }
+    }
+
+    // Fold the observed first-token latency into the browser-local estimate
+    // and remove the indicator; the delta path only updates the bubble, so
+    // the speaker label is fixed up by the caller (onCompleted).
+    function complete(msg, bubble) {
+        if (!pendingStart || pendingStart.msg !== msg) return;
+        const name = pendingStart.name;
+        deps.estimator.observe(deps.now() - pendingStart.startedAt);
+        stop();
+        if (name && bubble) deps.onCompleted(name, bubble);
+    }
+
+    function isPending(msg) {
+        return pendingStart !== null && pendingStart.msg === msg;
+    }
+
+    // Attach the speaker identity to an already-running window (the first
+    // speaker_start assigns the name to the message that has waited since
+    // send time).
+    function setName(name) {
+        if (pendingStart) pendingStart.name = name || '';
+    }
+
+    return {
+        start,
+        stop,
+        complete,
+        tick,
+        isPending,
+        setName,
+        get pending() { return pendingStart; },
+    };
+}
+
+/**
+ * VOICE-002 Step 2E: the user-Stop teardown sequence, extracted from the
+ * browser bootstrap so it is deterministically testable against the real
+ * streaming turn, legacy queue, playback, and Hands-Free pieces.
+ *
+ * Order matters (Step 2D ownership contract + Step 2E Stop semantics):
+ * 1. stopActiveTts('user-stop', { markSpeakingEnd: true }) — the single
+ *    ownership teardown: makes the streaming turn terminal (no synthesis
+ *    restart, no stale callback), clears the legacy queue, stops the
+ *    active playback, cancels the turn timer, and ends a legacy/manual
+ *    owner's SPEAKING phase (guarded no-op when the streaming owner
+ *    already settled it or Hands-Free is not SPEAKING).
+ * 2. Hands-Free WAITING settle: the ownership path settles SPEAKING, but
+ *    an undecided turn (no speaker_start yet) leaves Hands-Free in
+ *    WAITING — markResponseComplete moves it to LISTENING (guarded no-op
+ *    otherwise, including Hands-Free off or already settled).
+ * 3. stopProgress(): the response-start window is terminal now; its timer
+ *    must not tick into a newer turn.
+ *
+ * The caller (createActiveSendController.stopUser) runs this BEFORE the
+ * abort fires, so TTS ownership is released before the network stream is
+ * aborted and no stray callback can run after it.
+ *
+ * @param {{
+ *   stopActiveTts: (reason: string, options?: object) => void,
+ *   getHandsfree: () => ({ state: string, markResponseComplete: () => void } | null),
+ *   stopProgress: () => void,
+ * }} deps
+ * @returns {() => void}
+ */
+export function createStopTurnEffects(deps) {
+    return function stopTurnEffects() {
+        deps.stopActiveTts('user-stop', { markSpeakingEnd: true });
+        const hf = deps.getHandsfree();
+        if (hf && hf.state === HANDSFREE_STATES.WAITING) {
+            hf.markResponseComplete();
+        }
+        deps.stopProgress();
+    };
+}
+
+/**
+ * VOICE-002 Step 2E: active-send identity for the chat send pipeline.
+ *
+ * Every send captures its own identity object
+ * ({ token, abortController, stoppedByUser }). All post-completion effects
+ * (the send's catch/finally) check the CAPTURED identity against this
+ * controller instead of a module-level flag, so a send superseded by a
+ * user Stop or a conversation delete can never mutate a newer send's
+ * button state, progress, or Hands-Free state.
+ *
+ * The Send button is never disabled while a turn is in flight: it shows
+ * "Stop" and stays enabled so the user can abort (Step 2E). Only
+ * conversation availability (updateChatHeader) controls the disabled
+ * state.
+ *
+ * @param {{
+ *   button: { textContent: string, disabled: boolean, setAttribute: (k: string, v: string) => void },
+ *   onStop?: (send: object) => void,
+ * }} deps
+ */
+export function createActiveSendController(deps) {
+    let sendToken = 0;
+    let current = null;
+
+    function updateButton() {
+        const stopping = current !== null;
+        deps.button.textContent = stopping ? 'Stop' : 'Send';
+        deps.button.setAttribute('aria-label', stopping
+            ? 'Stop generating response'
+            : 'Send message');
+    }
+
+    /**
+     * Register a new send and return its captured identity. Its
+     * abortController is the only controller that may be aborted for this
+     * send. Supersedes any previous identity: the old send's catch/finally
+     * become stale from this point on.
+     */
+    function begin() {
+        sendToken += 1;
+        current = {
+            token: sendToken,
+            abortController: new AbortController(),
+            stoppedByUser: false,
+        };
+        updateButton();
+        return current;
+    }
+
+    function isSending() {
+        return current !== null;
+    }
+
+    /**
+     * User Stop (idempotent). Marks the send stopped BEFORE the teardown
+     * and abort so the send's own catch classifies the AbortError as an
+     * expected user stop (partial text preserved, no error path). Runs the
+     * app teardown (deps.onStop) before the abort fires (Step 2D order),
+     * then returns the app to the idle state. A second call — including a
+     * call when no turn is active — is a no-op returning null.
+     */
+    function stopUser() {
+        const send = current;
+        if (!send || send.stoppedByUser) return null;
+        send.stoppedByUser = true;
+        if (deps.onStop) deps.onStop(send);
+        send.abortController.abort();
+        current = null;
+        updateButton();
+        return send;
+    }
+
+    /**
+     * External abort (conversation delete): aborts the active send
+     * WITHOUT marking it as a user stop — its catch keeps the existing
+     * external-abort behavior — and clears the identity.
+     */
+    function abortExternal() {
+        const send = current;
+        if (!send) return null;
+        current = null;
+        updateButton();
+        send.abortController.abort();
+        return send;
+    }
+
+    /**
+     * Identity-safe settle for a send's finally: clears the identity only
+     * if this send is still the current one. Returns true when this send
+     * settled the state; false when it had been superseded.
+     */
+    function settle(send) {
+        if (!send || send !== current) return false;
+        current = null;
+        updateButton();
+        return true;
+    }
+
+    return {
+        begin,
+        stopUser,
+        abortExternal,
+        settle,
+        isSending,
+        get active() { return current; },
+    };
+}
+
+/**
+ * VOICE-002 Step 2E: classification of a send's stream completion error,
+ * extracted from the browser bootstrap so the stale-send isolation contract
+ * is deterministically testable.
+ *
+ * The decision is made from the CAPTURED send identity plus the error:
+ * - AbortError + send.stoppedByUser → expected user Stop. The stop path
+ *   already tore down TTS, cancelled progress, settled Hands-Free, and
+ *   released the identity; the live bubble keeps the partial assistant
+ *   text. Nothing else may run: no error state, no double-complete, and
+ *   no stream-error call on a turn that may already belong to a newer
+ *   send.
+ * - AbortError without a user stop → external abort (conversation
+ *   delete). The delete path owns the teardown and already superseded
+ *   this identity; the stale send returns quietly.
+ * - Anything else → real failure. The stream ended abnormally, so the
+ *   captured turn is settled as an error (a streaming session with open
+ *   input would otherwise hang — Step 2C), and ONLY the still-current
+ *   send may turn the failure into an error state: a superseded send
+ *   must not overwrite its preserved partial text or a newer turn's UI.
+ *
+ * The abort branches never touch the streaming turn at all: by the time
+ * an aborted send's rejection lands, a newer send may have already begun
+ * and re-assigned the turn, and a stale error call would corrupt it.
+ *
+ * @param {{
+ *   settle: (send: object) => boolean,
+ *   onStreamException: () => void,
+ *   onUserStop: (send: object) => void,
+ *   onError: (send: object) => void,
+ * }} deps
+ */
+export function createSendCompletionHandler(deps) {
+    function handleCatch(send, error) {
+        const aborted = Boolean(error && error.name === 'AbortError');
+        if (aborted) {
+            if (send.stoppedByUser) deps.onUserStop(send);
+            // External abort (conversation delete): the delete path owns
+            // the teardown and already superseded this identity.
+            return;
+        }
+        // A thrown read error ends the stream abnormally; settle the
+        // CAPTURED turn (Step 2C). Only reachable for a send that was
+        // never superseded, so the captured turn is still this send's.
+        deps.onStreamException();
+        if (deps.settle(send)) {
+            deps.onError(send);
+        }
+    }
+
+    function handleFinally(send) {
+        // Identity-safe settle: only the still-current send may clear the
+        // sending state and return the button to "Send".
+        deps.settle(send);
+    }
+
+    return { handleCatch, handleFinally };
+}
+
 import { createNdjsonParser, createStreamMessageCollector, normalizeConversation, resolveMessageCharacterId } from './conversations.js';
+import { createStreamingTtsSession } from './streaming-tts.js';
 import { buildCardExportFilename, normalizeCharacter, sanitizeCharacterInput, validateCharacterForm } from './characters.js';
 import { normalizeMemory, normalizeMemorySource, validateMemoryForm } from './memory.js';
 import { createFirstTokenEstimator, estimateResponseStartProgress, formatResponseStartProgress } from './progress.js';
@@ -173,7 +757,6 @@ if (typeof document !== 'undefined') {
     let conversations = [];
     let currentConversation = null;
     let currentMessages = [];
-    let isSending = false;
     let editingCharacterId = null;
     let ttsVoices = { voices: [], available: false };
     const playback = createPlaybackController({ getCsrfToken });
@@ -208,22 +791,106 @@ if (typeof document !== 'undefined') {
             if (handsfree) handsfree.markSpeakingEnd();
         },
     });
+    // Synthesize a single streamed sentence directly (VOICE-002 Step 2C).
+    // Unlike the group-queue path, each sentence is an independent request:
+    // the streaming session owns sequencing, so there is no shared queue
+    // state to coordinate here.
+    function synthesizeStreamingSentence({ text, voice, signal }) {
+        return getCsrfToken().then((token) => {
+            return fetch('/api/openparlor/tts/synthesize', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRF-Token': token,
+                },
+                body: JSON.stringify({ text: text, voice: voice }),
+                signal: signal,
+            });
+        }).then((response) => {
+            if (!response.ok) {
+                throw normalizeServiceError('Error synthesizing speech', response);
+            }
+            return response.blob();
+        }).then((blob) => {
+            if (!blob || blob.size === 0) {
+                throw new Error('Empty TTS response');
+            }
+            return blob;
+        });
+    }
     let selectionEpoch = 0;
     // Hands-free controller: declared before the group queue so playback
     // completion can resume listening; instantiated near the recorder
     // controls once all pipeline pieces exist.
     let handsfree = null;
     let recordingInterruptionPending = false;
-    let streamAbortController = null;
+    // Active per-turn streaming TTS state (VOICE-002 Step 2C). Re-created on
+    // every send; at most one instance exists at a time because sending is
+    // disabled while a turn is in flight.
+    let streamingTurn = null;
     const isDev = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
     const voiceTurnTimer = createVoiceTurnTimer();
 
-    // Estimated response-start progress (DOGFOOD-007). pendingStart tracks
-    // the speaker currently awaiting its first visible token; the window is
-    // per-speaker so sequential group replies never share or morph state.
+    // Single TTS ownership teardown path (VOICE-002 Step 2D). Every handler
+    // that takes audio ownership routes through stopActiveTts() so the
+    // teardown ordering is identical everywhere (see its doc comment).
+    const ttsOwnership = createTtsOwnershipController({
+        cancelStreamingTurn: (reason) => {
+            if (streamingTurn) streamingTurn.cancel(reason);
+        },
+        groupQueue: groupQueue,
+        playback: playback,
+        timer: voiceTurnTimer,
+        markSpeakingEnd: () => {
+            if (handsfree) handsfree.markSpeakingEnd();
+        },
+        refreshButtons: updatePlaybackButtons,
+    });
+
+    // Estimated response-start progress (DOGFOOD-007). responseProgress
+    // tracks the speaker currently awaiting its first visible token; the
+    // window is per-speaker so sequential group replies never share or
+    // morph state. Timing is injected so the Stop/abort cancellation
+    // contract is deterministically testable (VOICE-002 Step 2E).
     const firstTokenEstimator = createFirstTokenEstimator();
-    let pendingStart = null;
-    let progressTimerId = null;
+    const responseProgress = createResponseStartProgress({
+        estimator: firstTokenEstimator,
+        now: () => performance.now(),
+        setIntervalFn: (fn, ms) => setInterval(fn, ms),
+        clearIntervalFn: (id) => clearInterval(id),
+        onTick: (label) => {
+            const speaker = messagesEl.querySelector('.speaker-progress');
+            if (speaker) speaker.textContent = label;
+        },
+        onCompleted: (name, bubble) => {
+            const content = bubble.closest('.message-content');
+            const speaker = content ? content.querySelector('.speaker-progress') : null;
+            if (speaker) speaker.textContent = name;
+        },
+    });
+
+    // VOICE-002 Step 2E: active-send identity + the Send/Stop button. The
+    // Send button doubles as the Stop control while a turn is in flight
+    // (it stays enabled); every catch/finally effect is identity-guarded
+    // through the captured send object, so a stopped or deleted turn can
+    // never mutate a newer send's UI.
+    const activeSendController = createActiveSendController({
+        button: sendButton,
+        onStop: createStopTurnEffects({
+            stopActiveTts: (reason, options) => ttsOwnership.stopActiveTts(reason, options),
+            getHandsfree: () => handsfree,
+            stopProgress: () => responseProgress.stop(),
+        }),
+    });
+
+    // The user-visible Stop (VOICE-002 Step 2E). Idempotent and safe to
+    // call when no turn is active: it stops exactly the active send — its
+    // stream, its TTS (streaming session, legacy queue, or manual
+    // playback), its response-start progress — and settles Hands-Free
+    // back to listening, preserving any partial assistant text.
+    function stopActiveTurn() {
+        activeSendController.stopUser();
+    }
 
     // ── Auto-speak state ───────────────────────────────────────────────────
 
@@ -550,12 +1217,13 @@ if (typeof document !== 'undefined') {
             speakerEl.className = 'speaker';
             // Estimated time-to-first-token for the speaker currently
             // awaiting its first visible token (DOGFOOD-007).
-            if (!isUser && !msg.content && pendingStart && pendingStart.msg === msg) {
+            if (!isUser && !msg.content && responseProgress.isPending(msg)) {
                 speakerEl.className = 'speaker speaker-progress';
+                const startedAt = responseProgress.pending.startedAt;
                 speakerEl.textContent = formatResponseStartProgress(
                     charName,
                     estimateResponseStartProgress({
-                        elapsedMs: performance.now() - pendingStart.startedAt,
+                        elapsedMs: performance.now() - startedAt,
                         expectedMs: firstTokenEstimator.expectedMs(),
                     }),
                 );
@@ -591,7 +1259,11 @@ if (typeof document !== 'undefined') {
                         if (willSpeak && hf) hf.markSpeakingEnd();
                     };
                     try {
-                        groupQueue.clear();
+                        // Ownership teardown (Step 2D): the previous owner
+                        // (streaming session, legacy queue, or manual
+                        // playback) is fully terminal before the manual
+                        // playback arms its own completion callback.
+                        ttsOwnership.stopActiveTts('manual-playback');
                         if (willSpeak) hf.markSpeakingStart();
                         await playback.play(msg.content, voice, endSpeaking);
                         updatePlaybackButtons();
@@ -606,10 +1278,11 @@ if (typeof document !== 'undefined') {
                 stopBtn.setAttribute('aria-label', 'Stop playback');
                 stopBtn.textContent = '■';
                 stopBtn.addEventListener('click', () => {
-                    groupQueue.clear();
-                    playback.stop();
-                    if (handsfree) handsfree.markSpeakingEnd();
-                    updatePlaybackButtons();
+                    // AUDIO ownership Stop only (Step 2D): terminates
+                    // whichever TTS owner is active (streaming session,
+                    // legacy queue, or manual playback). The visible
+                    // LLM-generation Stop remains Step 2E.
+                    ttsOwnership.stopActiveTts('playback-stop', { markSpeakingEnd: true });
                 });
 
                 const replayBtn = document.createElement('button');
@@ -626,7 +1299,10 @@ if (typeof document !== 'undefined') {
                         if (willSpeak && hf) hf.markSpeakingEnd();
                     };
                     try {
-                        groupQueue.clear();
+                        // Same ownership teardown as Play (Step 2D): the
+                        // previous owner is fully terminal before the
+                        // replay arms its own completion callback.
+                        ttsOwnership.stopActiveTts('manual-playback');
                         if (willSpeak) hf.markSpeakingStart();
                         await playback.replay(msg.content, voice, endSpeaking);
                         updatePlaybackButtons();
@@ -1608,23 +2284,22 @@ if (typeof document !== 'undefined') {
         // Neutralize active response UI before awaiting the DELETE fetch so
         // server latency cannot allow an old stream to update the UI.
         if (isCurrent) {
-            if (streamAbortController) {
-                streamAbortController.abort();
-                streamAbortController = null;
-            }
-            groupQueue.clear();
-            playback.stop();
-            voiceTurnTimer.cancel();
+            // VOICE-002 Step 2E: the active send is aborted as an EXTERNAL
+            // abort (not a user stop), so its catch keeps the existing
+            // external-abort behavior and its identity is superseded — a
+            // stale completion can never re-enable the button or touch the
+            // new conversation's state.
+            activeSendController.abortExternal();
+            ttsOwnership.stopActiveTts('conversation-deleted');
             recorder.cancel();
             if (handsfree) handsfree.invalidate();
-            isSending = false;
             sendButton.disabled = true;
             messageInput.disabled = true;
             updatePlaybackButtons();
             updateRecorderUI();
             updateTranscriptionStatus();
             invalidateMemoryState();
-            stopPendingStart();
+            responseProgress.stop();
         }
 
         try {
@@ -1657,7 +2332,10 @@ if (typeof document !== 'undefined') {
             }
         } catch (e) {
             if (isCurrent && currentConversation && currentConversation.id === conv.id) {
-                isSending = false;
+                // The delete failed: the conversation still exists and its
+                // send identity is already released (VOICE-002 Step 2E), so
+                // restore the input UI — the button label is already
+                // "Send".
                 sendButton.disabled = false;
                 messageInput.disabled = false;
                 renderMessages();
@@ -1668,10 +2346,11 @@ if (typeof document !== 'undefined') {
 
     async function selectConversation(id) {
         selectionEpoch++;
-        groupQueue.clear();
-        playback.stop();
-        voiceTurnTimer.cancel();
-        stopPendingStart();
+        // Full ownership teardown (Step 2C/2D) before the epoch change
+        // makes the old turn unresolvable: streaming session, legacy queue,
+        // and current audio all terminate against the old identity.
+        ttsOwnership.stopActiveTts('conversation-switch');
+        responseProgress.stop();
         invalidateMemoryState();
         if (handsfree) handsfree.invalidate();
         try {
@@ -1699,9 +2378,15 @@ if (typeof document !== 'undefined') {
         try {
             newChatButton.disabled = true;
             invalidateMemoryState();
-            stopPendingStart();
+            responseProgress.stop();
             const conv = await createConversation(charId, title);
             conversations.unshift(conv);
+            // Full ownership teardown BEFORE the identity change so the old
+            // turn's effects still resolve against the old (current)
+            // conversation (Step 2C/2D): streaming session, legacy queue,
+            // and current audio must all be terminal before the user enters
+            // the new conversation.
+            ttsOwnership.stopActiveTts('new-conversation');
             currentConversation = conv;
             if (handsfree) handsfree.invalidate();
             currentMessages = [];
@@ -1716,70 +2401,25 @@ if (typeof document !== 'undefined') {
         }
     }
 
-    // ── Estimated response-start progress (DOGFOOD-007) ────────────────────
-    //
-    // Rough visual estimate of time-to-first-token while a speaker is being
-    // prepared. Not real model progress: the ratio caps below 100%, the
-    // label is marked with "~", and the indicator is removed on the first
-    // visible token or cancelled on stop/abort/switch/error/completion.
-
-    function startPendingStart(msg, name) {
-        pendingStart = { msg, startedAt: performance.now(), name: name || '' };
-        if (progressTimerId === null) {
-            progressTimerId = setInterval(tickPendingStart, 200);
-        }
-    }
-
-    function stopPendingStart() {
-        pendingStart = null;
-        if (progressTimerId !== null) {
-            clearInterval(progressTimerId);
-            progressTimerId = null;
-        }
-    }
-
-    // Fold the observed first-token latency into the browser-local estimate
-    // and remove the indicator; the delta path only updates the bubble, so
-    // the speaker label is fixed up here.
-    function completePendingStart(msg, bubble) {
-        if (!pendingStart || pendingStart.msg !== msg) return;
-        const name = pendingStart.name;
-        firstTokenEstimator.observe(performance.now() - pendingStart.startedAt);
-        stopPendingStart();
-        if (name && bubble) {
-            const content = bubble.closest('.message-content');
-            const speaker = content ? content.querySelector('.speaker-progress') : null;
-            if (speaker) speaker.textContent = name;
-        }
-    }
-
-    function tickPendingStart() {
-        if (!pendingStart) {
-            stopPendingStart();
-            return;
-        }
-        const speaker = messagesEl.querySelector('.speaker-progress');
-        if (!speaker) return;
-        speaker.textContent = formatResponseStartProgress(
-            pendingStart.name,
-            estimateResponseStartProgress({
-                elapsedMs: performance.now() - pendingStart.startedAt,
-                expectedMs: firstTokenEstimator.expectedMs(),
-            }),
-        );
-    }
-
     async function sendMessage() {
         const text = messageInput.value.trim();
         // Returns whether the message was actually dispatched; the
         // hands-free controller treats a skipped send as a send error.
-        if (!text || isSending || !currentConversation) return false;
+        // While a turn is in flight the Send button shows "Stop" and stays
+        // enabled (VOICE-002 Step 2E); a duplicate send is skipped, not
+        // queued.
+        if (!text || activeSendController.isSending() || !currentConversation) return false;
 
         const sendConversationId = currentConversation.id;
         const sendEpoch = selectionEpoch;
 
-        isSending = true;
-        sendButton.disabled = true;
+        // VOICE-002 Step 2E: capture this send's identity BEFORE any async
+        // work. Its AbortController is the only one that may abort this
+        // send; the catch/finally below check the captured identity against
+        // activeSendController, so a superseded (stopped/deleted) send can
+        // never mutate a newer send's state. The button now shows "Stop"
+        // and stays enabled for the whole turn.
+        const send = activeSendController.begin();
         messageInput.value = '';
         voiceTurnTimer.markSendStart();
 
@@ -1797,11 +2437,95 @@ if (typeof document !== 'undefined') {
         renderMessages();
         // The first speaker's pending window starts at send time: that is
         // when waiting for visible text begins (identity may be unknown).
-        startPendingStart(currentAssistantMsg, '');
+        responseProgress.start(currentAssistantMsg, '');
 
         let lastBubble = messagesEl.querySelector('.message:last-child .bubble');
-        const abortController = new AbortController();
-        streamAbortController = abortController;
+        const { abortController } = send;
+
+        // VOICE-002 Step 2C: per-turn streaming TTS state machine. The
+        // streaming-vs-legacy decision happens exactly once, at the first
+        // speaker_start, and identity guards (conversation id + selection
+        // epoch) keep stale turns from affecting the current one. If the
+        // previous turn's streaming session is still playing (the stream's
+        // done can arrive before its audio finishes), this send takes over
+        // audio ownership: cancel the old session so its sentences and
+        // callbacks cannot leak into this turn.
+        // Per-turn TTS-ready marker: fresh for every turn so that both the
+        // streaming first-audio path and the legacy first-item path each get
+        // exactly one markTtsReady(), even when the previous turn streamed.
+        ttsMarkedForTurn = false;
+        let hadStreamError = false;
+        // Ownership takeover (Step 2D): the previous turn's audio — streamed,
+        // legacy-queued, or manual — is fully terminal before this turn
+        // initializes, so no old sentence, queue item, or callback can leak
+        // into the new turn. markSpeakingEnd ends an old non-streaming
+        // owner's speaking phase (no-op when the streaming owner already
+        // settled it or Hands-Free is not SPEAKING).
+        ttsOwnership.stopActiveTts('superseded-send', { markSpeakingEnd: true });
+        streamingTurn = createStreamingTurnState({
+            isCurrent: () => currentConversation
+                && currentConversation.id === sendConversationId
+                && selectionEpoch === sendEpoch,
+            isEligible: () => (getAutoSpeakState(sendConversationId) || getVoiceModeState(sendConversationId))
+                && recorder.state !== 'recording'
+                && !recordingInterruptionPending
+                && !hadStreamError,
+            resolveVoice: (characterId) => {
+                const char = findCharacter(characterId);
+                return char ? char.ttsVoice : '';
+            },
+            createSession: (hooks) => createStreamingTtsSession({
+                playback: playback,
+                synthesize: synthesizeStreamingSentence,
+                onFirstAudioStart: hooks.onFirstAudioStart,
+                onTurnEnd: hooks.onTurnEnd,
+            }),
+            onFirstAudio: () => {
+                if (!ttsMarkedForTurn) {
+                    ttsMarkedForTurn = true;
+                    voiceTurnTimer.markTtsReady();
+                }
+                // Hands-Free: the speaking phase starts on the first real
+                // audio, never on the NDJSON done record.
+                if (handsfree) handsfree.markSpeakingStart();
+            },
+            onTurnSettled: (state) => {
+                if (isDev) voiceTurnTimer.log();
+                voiceTurnTimer.cancel();
+                if (handsfree) {
+                    if (state.firstAudioStarted) handsfree.markSpeakingEnd();
+                    else handsfree.markResponseComplete();
+                }
+            },
+        });
+
+        // VOICE-002 Step 2E: this send's completion handler. It captures
+        // this send's turn identity so a stale completion (superseded by
+        // Stop or delete) is classified from the captured state and can
+        // never touch a newer send's turn or UI.
+        const sendTurn = streamingTurn;
+        const sendCompletion = createSendCompletionHandler({
+            settle: (s) => activeSendController.settle(s),
+            onStreamException: () => {
+                if (sendTurn) sendTurn.onStreamError('stream-exception');
+            },
+            onUserStop: () => {
+                // The stop path already did everything (VOICE-002 Step 2E):
+                // TTS teardown, progress cancellation, Hands-Free settle,
+                // identity release. The live bubble already shows the
+                // partial assistant text — preserve it.
+            },
+            onError: () => {
+                currentAssistantMsg.content = 'Connection error';
+                if (lastBubble) lastBubble.textContent = currentAssistantMsg.content;
+                renderMessages();
+                scrollMessages();
+                responseProgress.stop();
+                if (isDev) voiceTurnTimer.log();
+                voiceTurnTimer.cancel();
+                if (handsfree) handsfree.markResponseComplete();
+            },
+        });
 
         try {
             const token = await getCsrfToken();
@@ -1823,14 +2547,21 @@ if (typeof document !== 'undefined') {
 
             if (!response.ok) {
                 const err = await response.json().catch(() => ({}));
-                currentAssistantMsg.content = normalizeServiceError(err, 'Request failed');
-                if (lastBubble) lastBubble.textContent = currentAssistantMsg.content;
-                renderMessages();
-                scrollMessages();
-                stopPendingStart();
-                if (isDev) voiceTurnTimer.log();
-                voiceTurnTimer.cancel();
-                if (handsfree) handsfree.markResponseComplete();
+                // VOICE-002 Step 2E: only the CURRENT send may turn a
+                // non-OK response into an error state — a send superseded
+                // by Stop or delete must not overwrite its preserved
+                // partial text (or a newer conversation's UI) with an
+                // error.
+                if (activeSendController.settle(send)) {
+                    currentAssistantMsg.content = normalizeServiceError(err, 'Request failed');
+                    if (lastBubble) lastBubble.textContent = currentAssistantMsg.content;
+                    renderMessages();
+                    scrollMessages();
+                    responseProgress.stop();
+                    if (isDev) voiceTurnTimer.log();
+                    voiceTurnTimer.cancel();
+                    if (handsfree) handsfree.markResponseComplete();
+                }
                 return true;
             }
 
@@ -1838,7 +2569,6 @@ if (typeof document !== 'undefined') {
             const reader = response.body.getReader();
             let processedCount = 0;
             let streamDone = false;
-            let hadStreamError = false;
 
             function processNewRecords() {
                 for (let i = processedCount; i < parser.records.length; i++) {
@@ -1851,19 +2581,23 @@ if (typeof document !== 'undefined') {
                     if (outcome === null) continue;
                     if (outcome.type === 'speaker_start') {
                         currentAssistantMsg = outcome.message;
+                        // VOICE-002 Step 2C: exactly one decision per turn,
+                        // made on the first speaker_start; later speakers
+                        // only route their voice to the same session.
+                        if (streamingTurn) streamingTurn.onSpeakerStart(outcome.message.character_id || currentConversation.characterId);
                         if (outcome.isNewMessage) {
                             currentMessages.push(currentAssistantMsg);
                             // Each speaker in a sequential reply waits for
                             // its own first token: fresh pending state so
                             // progress never carries across speakers.
                             const speakerChar = findCharacter(resolveMessageCharacterId(currentAssistantMsg, currentConversation));
-                            startPendingStart(currentAssistantMsg, speakerChar ? speakerChar.name : '');
-                        } else if (pendingStart && pendingStart.msg === currentAssistantMsg) {
+                            responseProgress.start(currentAssistantMsg, speakerChar ? speakerChar.name : '');
+                        } else if (responseProgress.isPending(currentAssistantMsg)) {
                             // First speaker: identity was assigned to the
                             // existing pending message. Keep the window
                             // running from send time; only attach the name.
                             const speakerChar = findCharacter(resolveMessageCharacterId(currentAssistantMsg, currentConversation));
-                            pendingStart.name = speakerChar ? speakerChar.name : '';
+                            responseProgress.setName(speakerChar ? speakerChar.name : '');
                         }
                         // Re-render on every speaker_start so the
                         // server-identified speaker is displayed before the
@@ -1871,15 +2605,25 @@ if (typeof document !== 'undefined') {
                         renderMessages();
                         lastBubble = messagesEl.querySelector('.message:last-child .bubble');
                     } else if (outcome.type === 'delta') {
-                        if (pendingStart && pendingStart.msg === currentAssistantMsg) {
-                            completePendingStart(currentAssistantMsg, lastBubble);
+                        // Raw incremental delta only — never the accumulated
+                        // message content, which would re-split everything.
+                        if (streamingTurn) streamingTurn.onDelta(record.text);
+                        if (responseProgress.isPending(currentAssistantMsg)) {
+                            responseProgress.complete(currentAssistantMsg, lastBubble);
                         }
                         voiceTurnTimer.markFirstToken();
                         if (lastBubble) lastBubble.textContent = currentAssistantMsg.content;
                         scrollMessages();
+                    } else if (outcome.type === 'speaker_end') {
+                        // Flush this speaker's unterminated tail now, with
+                        // this speaker's voice (raw protocol event).
+                        if (streamingTurn) streamingTurn.onSpeakerEnd();
                     } else if (outcome.type === 'error') {
                         hadStreamError = true;
-                        stopPendingStart();
+                        // A streamed turn has no legacy fallback: cancel the
+                        // session and settle the turn's audio effects.
+                        if (streamingTurn) streamingTurn.onStreamError('stream-error');
+                        responseProgress.stop();
                         if (lastBubble) lastBubble.textContent = currentAssistantMsg.content;
                         scrollMessages();
                     }
@@ -1896,17 +2640,32 @@ if (typeof document !== 'undefined') {
 
             parser.flush();
             processNewRecords();
-            if (streamDone) voiceTurnTimer.markStreamComplete();
+            // A stream that ended without a done record is an abnormal
+            // termination: a streaming session with open input would
+            // otherwise never settle (VOICE-002 Step 2C).
+            if (!streamDone && streamingTurn) streamingTurn.onStreamError('stream-ended');
+            // Stale-turn guard: a stream that outlives its conversation
+            // (switch/new conversation do not abort it) must not settle the
+            // current conversation's voice state (VOICE-002 Step 2C).
+            const turnIdentityCurrent = sendConversationId !== ''
+                && sendConversationId === (currentConversation ? currentConversation.id : '')
+                && sendEpoch === selectionEpoch;
+            if (streamDone && turnIdentityCurrent) voiceTurnTimer.markStreamComplete();
             // Final full render: the delta path only updates the live bubble
             // text, so completed messages need a re-render to gain their TTS
             // controls and server-identified speaker.
             renderMessages();
 
-            // Auto-speak: queue completed group replies for sequential playback
-            let ttsHandled = false;
-            ttsMarkedForTurn = false;
+            // Auto-speak: the streaming session (decided once at the first
+            // speaker_start) owns the turn's audio once any sentence was
+            // streamed; otherwise the legacy full-response queue runs
+            // unchanged. onDone() makes that handoff decision exactly once
+            // per turn (VOICE-002 Step 2C).
+            const turnDecision = streamingTurn ? streamingTurn.onDone() : { runLegacy: true, ttsHandled: false };
+            let ttsHandled = turnDecision.ttsHandled;
             if (
-                shouldAutoSpeak({
+                turnDecision.runLegacy
+                && shouldAutoSpeak({
                     sendConversationId,
                     currentConversationId: currentConversation ? currentConversation.id : '',
                     sendEpoch,
@@ -1918,6 +2677,7 @@ if (typeof document !== 'undefined') {
                     recordingActive: recorder.state === 'recording' || recordingInterruptionPending,
                 })
             ) {
+                ttsMarkedForTurn = false;
                 const turnMessages = currentMessages.slice(assistantMsgStartIndex);
                 for (const msg of turnMessages) {
                     if (!msg.content) continue;
@@ -1941,36 +2701,26 @@ if (typeof document !== 'undefined') {
                     updatePlaybackButtons();
                 }
             }
-            if (!ttsHandled) {
+            if (!ttsHandled && turnIdentityCurrent) {
                 if (isDev) voiceTurnTimer.log();
                 voiceTurnTimer.cancel();
                 if (handsfree) handsfree.markResponseComplete();
             }
         } catch (e) {
-            if (e && e.name === 'AbortError') {
-                stopPendingStart();
-                if (handsfree) handsfree.markResponseComplete();
-                return true;
-            }
-            currentAssistantMsg.content = 'Connection error';
-            if (lastBubble) lastBubble.textContent = currentAssistantMsg.content;
-            renderMessages();
-            scrollMessages();
-            stopPendingStart();
-            if (isDev) voiceTurnTimer.log();
-            voiceTurnTimer.cancel();
-            if (handsfree) handsfree.markResponseComplete();
+            // VOICE-002 Step 2E: the CAPTURED send identity decides how
+            // this completion is classified — user Stop, external abort,
+            // or real failure — and a superseded send must never mutate a
+            // newer turn's state (see createSendCompletionHandler).
+            sendCompletion.handleCatch(send, e);
         } finally {
-            // Clear this stream's pending state on completion; the guard
-            // keeps a newer conversation's state (if any) untouched.
-            if (pendingStart && pendingStart.msg === currentAssistantMsg) {
-                stopPendingStart();
+            // Identity-safe settle (VOICE-002 Step 2E): only the still-
+            // current send may clear the sending state and return the
+            // button to "Send"; a send superseded by Stop or delete is a
+            // no-op here so it cannot disturb a newer send's button.
+            if (responseProgress.isPending(currentAssistantMsg)) {
+                responseProgress.stop();
             }
-            if (streamAbortController === abortController) {
-                streamAbortController = null;
-                isSending = false;
-                sendButton.disabled = false;
-            }
+            sendCompletion.handleFinally(send);
         }
         return true;
     }
@@ -1979,12 +2729,27 @@ if (typeof document !== 'undefined') {
 
     newChatButton.addEventListener('click', handleNewConversation);
 
-    sendButton.addEventListener('click', sendMessage);
+    // VOICE-002 Step 2E: the Send button doubles as the Stop control while
+    // a turn is in flight — it stays enabled for the whole generation.
+    sendButton.addEventListener('click', () => {
+        if (activeSendController.isSending()) {
+            stopActiveTurn();
+        } else {
+            sendMessage();
+        }
+    });
 
+    // Enter mirrors the Send/Stop button: a second Enter while a turn is
+    // active stops that turn (idempotently) and never starts a duplicate
+    // send.
     messageInput.addEventListener('keydown', event => {
         if (event.key === 'Enter' && !event.shiftKey) {
             event.preventDefault();
-            sendMessage();
+            if (activeSendController.isSending()) {
+                stopActiveTurn();
+            } else {
+                sendMessage();
+            }
         }
     });
 
@@ -2019,10 +2784,7 @@ if (typeof document !== 'undefined') {
             const newState = !getAutoSpeakState(currentConversation.id);
             setAutoSpeakState(currentConversation.id, newState);
             if (!newState) {
-                groupQueue.clear();
-                playback.stop();
-                if (handsfree) handsfree.markSpeakingEnd();
-                updatePlaybackButtons();
+                ttsOwnership.stopActiveTts('auto-speak-disabled', { markSpeakingEnd: true });
             }
             updateAutoSpeakButton();
         });
@@ -2034,10 +2796,7 @@ if (typeof document !== 'undefined') {
             const newState = !getVoiceModeState(currentConversation.id);
             setVoiceModeState(currentConversation.id, newState);
             if (!newState) {
-                groupQueue.clear();
-                playback.stop();
-                if (handsfree) handsfree.markSpeakingEnd();
-                updatePlaybackButtons();
+                ttsOwnership.stopActiveTts('voice-mode-disabled', { markSpeakingEnd: true });
             }
             updateVoiceModeButton();
         });
@@ -2130,8 +2889,11 @@ if (typeof document !== 'undefined') {
             // Hands-free owns the microphone while active.
             if (handsfree && handsfree.state !== HANDSFREE_STATES.OFF) return;
             recordingInterruptionPending = true;
-            playback.stop();
-            updatePlaybackButtons();
+            // All speech output (streaming session, legacy queue, manual
+            // playback) must be fully stopped before the microphone starts
+            // (Step 2D); a stale TTS callback cannot touch Hands-Free
+            // during recording because Hands-Free is OFF here.
+            ttsOwnership.stopActiveTts('recording-start');
             try {
                 await recorder.start();
             } finally {
