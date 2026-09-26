@@ -1,7 +1,14 @@
 // ─── OpenParlor Hands-Free conversation mode (TASK-VOICE-HANDSFREE-001) ──────
-// Browser-local, half-duplex voice loop:
+// Browser-local voice loop:
 //   listen → VAD speech start → record utterance → VAD end → STT → auto-send
 //   → AI reply → TTS playback → resume listening
+//
+// VOICE-003 made the loop interruptible. While TTS plays, the microphone also
+// hears the AI, so microphone energy is NOT evidence of user speech. During
+// SPEAKING the frames are routed to a barge-in detector (see
+// createBargeInDetector) instead of the ordinary VAD, and a confirmed
+// interrupt reuses the EXISTING active-response Stop path. See the
+// "VOICE-003: barge-in detection" section below.
 //
 // Architecture rules honored here:
 // - The microphone never streams continuously to STT. A lightweight energy
@@ -137,6 +144,7 @@ const DEFAULT_VAD_OPTIONS = {
  *   hold: () => void,
  *   release: () => void,
  *   reset: () => void,
+ *   adopt: (lookbackMs?: number) => void,
  *   isActive: boolean,
  *   isHeld: boolean,
  *   preRollMs: number,
@@ -223,14 +231,213 @@ export function createEnergyVad(opts = {}) {
         reset();
     }
 
+    /**
+     * VOICE-003: adopts an utterance that is ALREADY in progress.
+     *
+     * A confirmed barge-in has already proven that the user is speaking, and
+     * the capture has already been seeded with the preserved pre-roll. The
+     * VAD therefore skips its start-sustain phase and goes straight to
+     * endpoint detection, crediting `lookbackMs` of already-elapsed speech so
+     * the max-duration cap is measured from the real onset.
+     *
+     * Without this, a short interrupt ("wait", one word) would have to satisfy
+     * the full start-sustain window again and the utterance could never end,
+     * leaving Hands-Free stuck in HEARING.
+     *
+     * @param {number} [lookbackMs] already-elapsed speech before this moment
+     * @returns {void}
+     */
+    function adopt(lookbackMs) {
+        holding = false;
+        active = true;
+        speechStreakMs = 0;
+        silenceMs = 0;
+        // Deliberately allowed to be negative: a confirmed interrupt proves
+        // speech began BEFORE this VAD's clock reached the lookback, so
+        // clamping to zero would push the max-duration cap into the future.
+        const back = Number.isFinite(lookbackMs) && lookbackMs > 0 ? lookbackMs : 0;
+        utteranceStartMs = clockMs - back;
+    }
+
     return {
         processFrame,
         hold,
         release,
         reset,
+        adopt,
         get isActive() { return active; },
         get isHeld() { return holding; },
         get preRollMs() { return preRollMs; },
+    };
+}
+
+// ─── VOICE-003: barge-in detection while the AI is speaking ──────────────────
+// While TTS plays, the microphone also hears the AI. Microphone energy is
+// therefore NOT evidence of user speech, and any single loud frame is
+// irrelevant. A barge-in is only reported after SUSTAINED energy above a
+// threshold that is deliberately stronger than the LISTENING VAD's.
+//
+// The detector is frame-driven (no wall clock) exactly like createEnergyVad, so
+// it is fully deterministic under test. It is ARMED with the identity of the
+// speaking turn that currently owns the microphone, and every confirmation
+// carries that identity: a candidate raised by a turn that has already ended
+// (TTS finished, conversation switched, hands-free toggled off) is inert
+// instead of interrupting something newer.
+//
+// The detector decides WHEN. Deciding WHAT to do is the caller's job: it owns
+// the cancellation path, the pre-roll capture, and the Hands-Free state
+// machine.
+
+/**
+ * Default barge-in tuning. These are starting points, named and testable so a
+ * later adaptive detector can tune them without code changes upstream.
+ *
+ * speechThreshold is intentionally well above the LISTENING VAD's 0.01: the
+ * AI's own voice leaking into the mic must not clear it, while a deliberate
+ * human interjection comfortably does.
+ * @type {{ speechThreshold: number, sustainMs: number, releaseSilenceMs: number }}
+ */
+export const DEFAULT_BARGE_IN_OPTIONS = Object.freeze({
+    speechThreshold: 0.03,
+    sustainMs: 300,
+    releaseSilenceMs: 200,
+});
+
+/**
+ * Sustained-speech barge-in detector used while Hands-Free is SPEAKING.
+ *
+ * - A sustained-speech run STARTS on the first frame at or above
+ *   `speechThreshold` and again after any quiet frame breaks the streak;
+ *   each start reports through onSustainStart(), so the caller can drop any
+ *   audio captured before it (i.e. AI echo). Re-anchoring on every restart is
+ *   what guarantees the confirmed pre-roll is exactly the user's speech and
+ *   never a long tail of the AI's voice.
+ * - The candidate CONFIRMS once energy has been sustained for `sustainMs`.
+ *   Confirmation is a one-shot transition: the detector disarms itself before
+ *   invoking onConfirm, so a re-entrant frame can never confirm twice.
+ * - A quiet gap shorter than `releaseSilenceMs` keeps the candidate alive but
+ *   breaks the sustained streak, so a hesitation inside an interrupting
+ *   sentence does not restart the countdown and does not split the utterance.
+ * - `lookbackMs` is the length of the CONFIRMED sustained stretch, i.e. how
+ *   far back the user's speech provably reaches. The caller uses it to rewind
+ *   the capture pre-roll so the first word is not lost.
+ *
+ * @param {{
+ *   speechThreshold?: number,
+ *   sustainMs?: number,
+ *   releaseSilenceMs?: number,
+ *   onSustainStart?: () => void,
+ *   onCandidateEnd?: () => void,
+ *   onConfirm?: (info: { token: number, lookbackMs: number }) => void,
+ * }} [opts]
+ * @returns {{
+ *   arm: () => number,
+ *   disarm: () => void,
+ *   reset: () => void,
+ *   processFrame: (frame: { samples: ArrayLike<number>, sampleRate?: number }) => void,
+ *   isArmed: boolean,
+ *   isCandidate: boolean,
+ *   token: number | null,
+ * }}
+ */
+export function createBargeInDetector(opts = {}) {
+    const {
+        speechThreshold = DEFAULT_BARGE_IN_OPTIONS.speechThreshold,
+        sustainMs = DEFAULT_BARGE_IN_OPTIONS.sustainMs,
+        releaseSilenceMs = DEFAULT_BARGE_IN_OPTIONS.releaseSilenceMs,
+        onSustainStart = null,
+        onCandidateEnd = null,
+        onConfirm = null,
+    } = opts;
+
+    let tokenSeq = 0;
+    let armed = false;
+    let token = null;
+    let candidate = false;
+    let streakMs = 0;
+    let quietMs = 0;
+
+    function dropCandidate() {
+        if (!candidate) return;
+        candidate = false;
+        streakMs = 0;
+        quietMs = 0;
+        if (onCandidateEnd) onCandidateEnd();
+    }
+
+    // Starts monitoring for a new speaking turn and returns its identity.
+    // Every state is rebuilt: a candidate can never straddle two turns.
+    // @returns {number} the token identifying this armed turn
+    function arm() {
+        tokenSeq += 1;
+        token = tokenSeq;
+        armed = true;
+        candidate = false;
+        streakMs = 0;
+        quietMs = 0;
+        return token;
+    }
+
+    // Stops monitoring. Any confirmation still in flight carries a token that
+    // no longer matches, so the caller discards it.
+    function disarm() {
+        armed = false;
+        token = null;
+        candidate = false;
+        streakMs = 0;
+        quietMs = 0;
+    }
+
+    function confirm() {
+        // Disarm BEFORE the callback so a re-entrant frame — or a confirmation
+        // that re-enters this controller — cannot confirm the same speech
+        // twice.
+        const confirmedToken = token;
+        const lookbackMs = streakMs;
+        armed = false;
+        token = null;
+        candidate = false;
+        streakMs = 0;
+        quietMs = 0;
+        if (onConfirm) onConfirm({ token: confirmedToken, lookbackMs: lookbackMs });
+    }
+
+    function processFrame(frame) {
+        if (!frame || !frame.samples || frame.samples.length === 0) return;
+        if (!armed) return;
+        const sampleRate = frame.sampleRate > 0 ? frame.sampleRate : 48000;
+        const frameMs = (frame.samples.length / sampleRate) * 1000;
+        const rms = computeFrameRms(frame.samples);
+        if (rms >= speechThreshold) {
+            quietMs = 0;
+            // Every restart of the sustained run re-anchors the audio: the
+            // caller drops what came before, so the confirmed pre-roll can
+            // never contain a long tail of the AI's voice.
+            if (streakMs === 0) {
+                candidate = true;
+                if (onSustainStart) onSustainStart();
+            }
+            streakMs += frameMs;
+            if (streakMs >= sustainMs) confirm();
+            return;
+        }
+        if (!candidate) return;
+        // A quiet frame breaks the sustained streak. The candidate itself
+        // survives, so a hesitation inside an interrupting sentence does not
+        // throw away the pre-roll the caller is still filling.
+        quietMs += frameMs;
+        streakMs = 0;
+        if (quietMs >= releaseSilenceMs) dropCandidate();
+    }
+
+    return {
+        arm,
+        disarm,
+        reset: disarm,
+        processFrame,
+        get isArmed() { return armed; },
+        get isCandidate() { return candidate; },
+        get token() { return token; },
     };
 }
 
@@ -448,11 +655,26 @@ export function createPcmUtteranceCapture(opts = {}) {
  *   aligned with the VAD options);
  * - onSendText(text): the EXISTING chat send pipeline.
  *
- * TTS cooperation (half-duplex): the app calls markSpeakingStart() when AI
- * playback begins (any user speech is discarded and detection is suppressed)
- * and markSpeakingEnd() only when the whole queued playback (including
- * sequential group-character items) has actually finished. Stale callbacks
- * are dropped via a session generation check.
+ * TTS cooperation (interruptible): the app calls markSpeakingStart() when AI
+ * playback begins and markSpeakingEnd() only when the whole queued playback
+ * (including sequential group-character items) has actually finished. Stale
+ * callbacks are dropped via a session generation check.
+ *
+ * Barge-in (VOICE-003): markSpeakingStart() also ARMS a barge-in detector
+ * (createBargeInDetector) with the identity of this speaking turn. While
+ * SPEAKING the mic frames go to that detector instead of the ordinary VAD, and
+ * the capture is fed only once a candidate exists — so the AI's own audio can
+ * never reach a user utterance. A confirmed candidate:
+ *   1. rewinds the capture into the preserved pre-roll (the user's first word
+ *      is not lost) and hands the in-progress utterance to the VAD via
+ *      adopt(), so endpointing starts immediately;
+ *   2. moves to HEARING FIRST, and only then notifies onBargeInConfirm();
+ *   3. calls onBargeInConfirm(), which must route through the EXISTING
+ *      active-response Stop path. Because the state already left SPEAKING, the
+ *      markSpeakingEnd() calls inside that teardown are guarded no-ops and
+ *      cannot reopen listening on top of the utterance being captured.
+ * A confirmation carrying a stale token (TTS finished, conversation switched,
+ * hands-free disabled) is inert.
  *
  * @param {{
  *   getConversationId?: () => string,
@@ -468,6 +690,9 @@ export function createPcmUtteranceCapture(opts = {}) {
  *   vadOptions?: object,
  *   captureFactory?: (opts: object) => object,
  *   captureOptions?: object,
+ *   bargeInFactory?: (opts: object) => object,
+ *   bargeInOptions?: object,
+ *   onBargeInConfirm?: (info: { lookbackMs: number }) => void,
  *   onStateChange?: (state: string, info: { error?: string }) => void,
  * }} [deps]
  * @returns {{
@@ -484,6 +709,7 @@ export function createPcmUtteranceCapture(opts = {}) {
  *   isActive: boolean,
  *   vad: object,
  *   capture: object,
+ *   bargeIn: object,
  * }}
  */
 export function createHandsFreeController(deps = {}) {
@@ -501,6 +727,9 @@ export function createHandsFreeController(deps = {}) {
         vadOptions = {},
         captureFactory = createPcmUtteranceCapture,
         captureOptions = {},
+        bargeInFactory = createBargeInDetector,
+        bargeInOptions = {},
+        onBargeInConfirm = null,
         onStateChange = null,
     } = deps;
 
@@ -510,6 +739,11 @@ export function createHandsFreeController(deps = {}) {
     let inFlight = null;
     let errorTimer = null;
     let speakSessionGen = null;
+    // VOICE-003: the identity of the speaking turn that currently owns the
+    // microphone, and whether a barge candidate has opened the capture for
+    // this turn. A confirmation is honored only when both still match.
+    let bargeArmedToken = null;
+    let bargeCaptureArmed = false;
 
     const vad = vadFactory({
         ...vadOptions,
@@ -525,6 +759,16 @@ export function createHandsFreeController(deps = {}) {
         preRollMs: vadOptions.preRollMs,
         maxUtteranceMs: vadOptions.maxUtteranceMs,
         ...captureOptions,
+    });
+
+    // VOICE-003: decides WHEN a user interjection is real. The controller below
+    // owns WHAT happens (cancellation, pre-roll, state) and injects the
+    // token-carrying confirmation.
+    const bargeIn = bargeInFactory({
+        ...bargeInOptions,
+        onSustainStart: handleBargeSustainStart,
+        onCandidateEnd: handleBargeCandidateEnd,
+        onConfirm: handleBargeConfirm,
     });
 
     function setState(next, info = {}) {
@@ -551,6 +795,72 @@ export function createHandsFreeController(deps = {}) {
         if (hadUtterance) capture.discard();
     }
 
+    // ── VOICE-003: barge-in ────────────────────────────────────────────────
+    // The capture is starved while the AI speaks, so the pre-roll ring holds
+    // whatever was there when playback began. The moment a sustained-speech
+    // run starts we drop it: everything captured before an interjection began
+    // is, by definition, the AI's voice bleeding into the mic. From here on
+    // the capture is fed again, so the confirmed pre-roll can contain nothing
+    // but the user's own speech.
+    function handleBargeSustainStart() {
+        if (state !== HANDSFREE_STATES.SPEAKING) return;
+        capture.discard();
+        bargeCaptureArmed = true;
+    }
+
+    function handleBargeCandidateEnd() {
+        if (bargeCaptureArmed) {
+            // The candidate died before confirming: drop the speculative audio
+            // too, so it can never seed an unrelated later utterance.
+            capture.discard();
+        }
+        bargeCaptureArmed = false;
+    }
+
+    // A confirmed interrupt. The token check is the identity guard: a
+    // confirmation raised by a turn that has already ended (TTS finished,
+    // conversation switched, hands-free disabled) must not cancel anything.
+    function handleBargeConfirm(info) {
+        if (state !== HANDSFREE_STATES.SPEAKING) return;
+        if (!info || info.token !== bargeArmedToken) return;
+        if (!canUseConversation()) return;
+        // Defensive: markSpeakingStart() clears any in-flight utterance, so
+        // this cannot normally happen here. If it somehow does, keep the
+        // interrupt monitor alive for the rest of the turn rather than
+        // silently leaving the turn uninterruptable.
+        if (inFlight !== null) {
+            bargeArmedToken = bargeIn.arm();
+            return;
+        }
+        bargeIn.disarm();
+        bargeArmedToken = null;
+        bargeCaptureArmed = false;
+        // Preserve the user's first word: rewind the capture into the pre-roll
+        // that was preserved while the AI spoke, using the confirmed sustained
+        // length as the lookback.
+        capture.begin(info.lookbackMs);
+        // Endpoint the interrupting utterance immediately. Without adopt() a
+        // one-word interrupt would have to satisfy the start-sustain window
+        // again and could never end.
+        vad.adopt(info.lookbackMs);
+        speakSessionGen = null;
+        // Leave SPEAKING BEFORE notifying the app: the existing Stop teardown
+        // calls markSpeakingEnd(), which is a guarded no-op in any state but
+        // SPEAKING. Doing it in this order means that teardown can never
+        // reopen listening on top of the utterance we are capturing.
+        setState(HANDSFREE_STATES.HEARING);
+        if (onBargeInConfirm) onBargeInConfirm({ lookbackMs: info.lookbackMs });
+    }
+
+    // Tears down any live barge candidate. Called by every path that ends the
+    // speaking phase, so no candidate can outlive the turn that raised it.
+    function resetBargeIn() {
+        bargeIn.disarm();
+        bargeArmedToken = null;
+        if (bargeCaptureArmed) capture.discard();
+        bargeCaptureArmed = false;
+    }
+
 
     async function enable() {
         if (state !== HANDSFREE_STATES.OFF && state !== HANDSFREE_STATES.ERROR) return;
@@ -573,8 +883,10 @@ export function createHandsFreeController(deps = {}) {
             stopListening();
             return;
         }
-        // A (re-)opened mic session starts with a clean pre-roll so audio
+        // A (re-)opened mic session starts with a clean pre-roll and a clean
+        // interrupt monitor so audio — and any half-open barge candidate —
         // from a previous session can never seed the first utterance.
+        resetBargeIn();
         capture.discard();
         setState(HANDSFREE_STATES.LISTENING);
     }
@@ -583,6 +895,7 @@ export function createHandsFreeController(deps = {}) {
         sessionGen++;
         clearErrorTimer();
         discardUtterance();
+        resetBargeIn();
         stopListening();
         setState(HANDSFREE_STATES.OFF);
     }
@@ -596,6 +909,7 @@ export function createHandsFreeController(deps = {}) {
         sessionGen++;
         clearErrorTimer();
         discardUtterance();
+        resetBargeIn();
         speakSessionGen = null;
         if (state === HANDSFREE_STATES.OFF) return;
         if (!canUseConversation()) {
@@ -611,6 +925,7 @@ export function createHandsFreeController(deps = {}) {
         sessionGen++;
         clearErrorTimer();
         discardUtterance();
+        resetBargeIn();
         stopListening();
         // No auto-retry: re-enabling requires a fresh user gesture.
         setState(HANDSFREE_STATES.ERROR, { error: 'device-lost' });
@@ -714,13 +1029,21 @@ export function createHandsFreeController(deps = {}) {
             // mic was listening before TTS is not carried over.
             capture.discard();
         }
+        resetBargeIn();
         vad.hold();
         speakSessionGen = sessionGen;
+        // VOICE-003: arm the interrupt monitor for THIS turn and remember the
+        // identity a confirmation must match to be honored.
+        bargeArmedToken = bargeIn.arm();
         setState(HANDSFREE_STATES.SPEAKING);
     }
 
     function markSpeakingEnd() {
         if (state !== HANDSFREE_STATES.SPEAKING) return;
+        // The turn is over: any candidate it raised is dropped here, so a
+        // confirmation that arrives late can never interrupt something newer.
+        resetBargeIn();
+        capture.discard();
         vad.release();
         if (speakSessionGen !== sessionGen || !canUseConversation()) {
             // Stale playback callback or no conversation left: do not
@@ -739,13 +1062,25 @@ export function createHandsFreeController(deps = {}) {
 
     function onAudioFrame(frame) {
         if (state === HANDSFREE_STATES.OFF) return;
-        // The capture layer sees every frame BEFORE the VAD: the very frame
+        // The capture layer sees every frame BEFORE detection: the very frame
         // that confirms speech must already be in the pre-roll ring when
-        // begin() rewinds into it. While the AI is speaking (SPEAKING) the
-        // capture is starved entirely, so TTS audio can never enter an
-        // utterance or its pre-roll.
-        if (state !== HANDSFREE_STATES.SPEAKING) capture.processFrame(frame);
-        vad.processFrame(frame);
+        // begin() rewinds into it. Outside SPEAKING that is the ordinary VAD.
+        if (state === HANDSFREE_STATES.SPEAKING) {
+            // VOICE-003: the AI is audible, so the ordinary VAD is
+            // unsupervised. Frames go to the barge-in detector, and the
+            // capture is fed ONLY once a candidate exists — before that the
+            // ring holds pre-TTS audio, which must never reach a user
+            // utterance. The detector may flip the state to HEARING
+            // synchronously, so the decision is re-read below and this very
+            // frame lands in the newly-started utterance.
+            bargeIn.processFrame(frame);
+        }
+        if (state !== HANDSFREE_STATES.SPEAKING || bargeCaptureArmed) {
+            capture.processFrame(frame);
+        }
+        if (state !== HANDSFREE_STATES.SPEAKING) {
+            vad.processFrame(frame);
+        }
     }
 
     return {
@@ -762,6 +1097,7 @@ export function createHandsFreeController(deps = {}) {
         get isActive() { return state !== HANDSFREE_STATES.OFF; },
         get vad() { return vad; },
         get capture() { return capture; },
+        get bargeIn() { return bargeIn; },
     };
 }
 

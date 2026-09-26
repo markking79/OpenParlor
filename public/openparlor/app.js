@@ -892,6 +892,28 @@ if (typeof document !== 'undefined') {
         activeSendController.stopUser();
     }
 
+    // VOICE-003: a confirmed Hands-Free barge-in reuses that EXACT Stop path.
+    // There is deliberately no second cancellation system: the interrupt is a
+    // user pressing Stop while the AI talks, so it must abort the model
+    // stream, make the streaming turn terminal, stop the active audio, cancel
+    // the response-start window, and preserve the partial assistant text —
+    // all the things a second implementation could get subtly wrong.
+    function onHandsFreeBargeIn() {
+        if (!activeSendController.stopUser()) {
+            // No model turn is in flight (e.g. manual Play/Replay speech, or
+            // TTS that outlived its stream). Release the audio owner and the
+            // response-start window through the same helpers Stop uses.
+            ttsOwnership.stopActiveTts('barge-in', { markSpeakingEnd: true });
+            responseProgress.stop();
+        }
+        // The controller has already moved to HEARING, which started the voice
+        // turn timer for the interrupting utterance — but the Stop teardown
+        // above just cancelled it with the interrupted turn. The interrupt is
+        // a turn in its own right, so reopen its window after the teardown
+        // instead of leaving the diagnostics silently dead.
+        voiceTurnTimer.start();
+    }
+
     // ── Auto-speak state ───────────────────────────────────────────────────
 
     function getAutoSpeakState(conversationId) {
@@ -2980,7 +3002,17 @@ if (typeof document !== 'undefined') {
         let stream;
         try {
             stream = await navigator.mediaDevices.getUserMedia({
-                audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
+                // VOICE-003: echoCancellation is the first line of defence
+                // against the AI's own voice triggering a barge-in, but the
+                // detector's stronger threshold and sustained confirmation are
+                // what actually make interruption reliable. autoGainControl
+                // keeps a quiet interjection above the threshold.
+                audio: {
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                    autoGainControl: true,
+                    channelCount: 1,
+                },
             });
         } catch {
             stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -3112,6 +3144,13 @@ if (typeof document !== 'undefined') {
             messageInput.value = text;
             const sent = await sendMessage();
             if (sent !== true) throw new Error('send skipped');
+        },
+        // VOICE-003: a confirmed interrupt cancels the active response through
+        // the existing Stop path. The controller has already moved to HEARING
+        // with the preserved pre-roll, so the markSpeakingEnd() calls inside
+        // that teardown are guarded no-ops.
+        onBargeInConfirm: () => {
+            onHandsFreeBargeIn();
         },
         onStateChange: (state) => {
             updateHandsFreeUI();
