@@ -21,6 +21,74 @@ function escapeRegex(str) {
 }
 
 /**
+ * Detects a question a character asked the USER, in the trailing part of that
+ * character's message.
+ *
+ * Only the final sentence is considered: "I'm Doug, by the way. What's your
+ * name?" is a question to the user, while "Doug, what did Monica say? She's
+ * always asking me things" is not. Restricting the check to the last sentence
+ * means a rhetorical question earlier in a line does not create a pending
+ * question that the user is not answering.
+ *
+ * A direct address to another character in that final sentence disqualifies
+ * the turn, because the user is not the addressee: "Monica, did you get the
+ * delivery?" is a question for Monica, and the user's next message is far more
+ * likely a reply to it than an answer to the asker.
+ *
+ * @param {string} content A character message
+ * @returns {boolean} True when the final sentence is a question to the user
+ */
+function endsWithQuestionToUser(content) {
+    if (typeof content !== 'string') return false;
+    const trimmed = content.trim();
+    if (trimmed === '' || !trimmed.endsWith('?')) return false;
+    // Only the final sentence decides.
+    const lastSentence = trimmed.split(/(?<=[.!?])\s+/).pop().trim();
+    if (!lastSentence.endsWith('?')) return false;
+    // A leading vocative means the question is aimed at another character.
+    const vocative = /^[^A-Za-z0-9]*[A-Z][\w'-]*(?:\s+(?:and|&)\s+[A-Z][\w'-]*)*\s*,/;
+    return !vocative.test(lastSentence);
+}
+
+/**
+ * Finds the character participant whose most recent turn left a question
+ * outstanding for the user.
+ *
+ * This is the "pending question" rule: in a group, when a character asks the
+ * user something and the user then replies, the reply is an answer to THAT
+ * character. Reported case: Doug asked "What's your name?", the user answered
+ * "Oh, my name is Mark.", and a different character responded.
+ *
+ * The scan walks backwards and stops at the first user message: only a
+ * question asked after the user's last turn can be the one being answered. A
+ * question from an earlier turn is already answered and must not re-capture
+ * the speaker, or a character could monopolize the room.
+ *
+ * @param {CharacterParticipant[]} participants All conversation participants
+ * @param {Array<{role: string, participant_id?: string, content?: string}>} [recentMessages] Stored messages, oldest first
+ * @returns {CharacterParticipant|null} The participant awaiting an answer, or null
+ */
+export function findPendingQuestionAsker(participants, recentMessages = []) {
+    const charParticipants = (Array.isArray(participants) ? participants : [])
+        .filter(p => p && p.role === 'character');
+    if (charParticipants.length === 0) return null;
+    const byParticipantId = new Map(charParticipants.map(p => [p.id, p]));
+    const history = Array.isArray(recentMessages) ? recentMessages : [];
+    for (let i = history.length - 1; i >= 0; i -= 1) {
+        const message = history[i];
+        if (!message || typeof message !== 'object') continue;
+        if (message.role === 'user') return null; // older questions are already answered
+        if (message.role !== 'character') continue;
+        const participant = typeof message.participant_id === 'string'
+            ? byParticipantId.get(message.participant_id)
+            : undefined;
+        if (!participant) continue;
+        if (endsWithQuestionToUser(message.content)) return participant;
+    }
+    return null;
+}
+
+/**
  * Bounded whole-group cues, matched against the lowercased message.
  */
 const GROUP_WIDE_CUES = [
@@ -94,16 +162,23 @@ function isDirectAddress(messageLower, nameLower) {
  *    message, so "Doug, what did Monica say?" selects Doug only.
  * 5. If the user message mentions one or more character names
  *    (case-insensitive, word-boundary match), return those participants.
- * 6. Otherwise, return the first character participant (deterministic by order).
+ * 6. If the most recent character turn left a question outstanding for the
+ *    user (see findPendingQuestionAsker), return that asker: the user's
+ *    message is the answer to their question. This is checked last on
+ *    purpose — an explicit group cue or a name always expresses intent more
+ *    directly than conversational continuity.
+ * 7. Otherwise, return null so the caller can consult the model director.
  *
  * @param {CharacterParticipant[]} participants All participants in the conversation
  * @param {Character[]} characters Character records corresponding to the participants
  * @param {string} userMessage The user's message content
+ * @param {Array<{role: string, participant_id?: string, content?: string}>} [recentMessages]
+ *   Stored messages (oldest first), used only by the pending-question rule
  * @returns {CharacterParticipant[]|null} The selected participants, or null when no
  *   deterministic rule fires (ambiguous turn). Returns [] when no character
  *   participants exist.
  */
-export function selectSpeakerByRules(participants, characters, userMessage) {
+export function selectSpeakerByRules(participants, characters, userMessage, recentMessages = []) {
     const charParticipants = (Array.isArray(participants) ? participants : []).filter(p => p && p.role === 'character');
     if (charParticipants.length === 0 || typeof userMessage !== 'string' || userMessage.trim() === '') {
         return [];
@@ -146,6 +221,14 @@ export function selectSpeakerByRules(participants, characters, userMessage) {
         return mentioned;
     }
 
+    // 6. Pending question: the most recent character turn asked the user
+    // something, so this message is that character's answer. Deterministic and
+    // correct by construction — no model call, no tie-break guess.
+    const asker = findPendingQuestionAsker(participants, recentMessages);
+    if (asker) {
+        return [asker];
+    }
+
     return null;
 }
 
@@ -161,8 +244,8 @@ export function selectSpeakerByRules(participants, characters, userMessage) {
  * @param {string} userMessage The user's message content
  * @returns {CharacterParticipant[]} The selected character participants (non-empty when character participants exist)
  */
-export function selectSpeaker(participants, characters, userMessage) {
-    const byRules = selectSpeakerByRules(participants, characters, userMessage);
+export function selectSpeaker(participants, characters, userMessage, recentMessages = []) {
+    const byRules = selectSpeakerByRules(participants, characters, userMessage, recentMessages);
     if (byRules !== null) {
         return byRules;
     }
@@ -266,6 +349,8 @@ export function buildDirectorPrompt({ participants = [], characters = [], userMe
         'Rules:',
         '- You may only use the character IDs listed in the Characters section. Never invent or guess other IDs.',
         '- Usually choose exactly one character; choose more than one only when the message clearly invites several.',
+        '- The recent conversation is labelled with character NAMES, and the Characters section maps each name to its ID. Read that mapping carefully.',
+        '- If a character asked the user a question immediately before the newest message, that character is answering: the user\'s message is their reply. Choose that character, not a bystander.',
         '- Vary turn-taking: when the message does not imply otherwise, prefer a character who has not spoken recently.',
         '- Reply with a single JSON object only, no markdown and no commentary: {"speakers": ["character-id"], "reason": "brief internal reason"}',
     ].join('\n');
@@ -286,12 +371,27 @@ export function buildDirectorPrompt({ participants = [], characters = [], userMe
     const recent = (Array.isArray(recentMessages) ? recentMessages : []).slice(-6);
     if (recent.length > 0) {
         lines.push('Recent conversation:');
+        // Names, not participant IDs. This prompt previously labelled the
+        // transcript with participant IDs (`pm`/`pd`) while the Characters
+        // list above used character IDs (`cm`/`cd`) and no names at all, so
+        // the director was asked to answer with one ID namespace while being
+        // shown another. It could not tell which character had asked a
+        // question, and effectively guessed. Reported case: Doug asked
+        // "What's your name?", the user answered, and a different character
+        // was selected because Doug was not identifiable in the transcript.
+        const nameByParticipantId = new Map(charParticipants.map(p => [p.id, nameById.get(p.character_id)]));
         for (const message of recent) {
             if (message === null || typeof message !== 'object') continue;
             const content = typeof message.content === 'string' ? message.content : '';
             if (content === '') continue;
-            const speaker = message.role === 'character' ? `Character ${typeof message.participant_id === 'string' ? message.participant_id : ''}` : 'User';
-            lines.push(`${speaker}: ${content}`);
+            if (message.role !== 'character') {
+                lines.push(`User: ${content}`);
+                continue;
+            }
+            const name = typeof message.participant_id === 'string'
+                ? nameByParticipantId.get(message.participant_id)
+                : undefined;
+            lines.push(`${typeof name === 'string' && name !== '' ? name : 'Unknown character'}: ${content}`);
         }
     }
     lines.push(`User's newest message: ${typeof userMessage === 'string' ? userMessage : ''}`);
@@ -323,7 +423,7 @@ const DIRECTOR_MAX_MODEL_TOKENS = 200;
  * @returns {Promise<CharacterParticipant[]>} Selected participants in participant order (empty when no character participants exist)
  */
 export async function selectSpeakers({ participants = [], characters = [], userMessage = '', recentMessages = [], provider = null } = {}) {
-    const byRules = selectSpeakerByRules(participants, characters, userMessage);
+    const byRules = selectSpeakerByRules(participants, characters, userMessage, recentMessages);
     if (byRules !== null) {
         return byRules;
     }

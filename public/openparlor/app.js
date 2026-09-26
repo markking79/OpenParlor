@@ -661,6 +661,7 @@ import { normalizeMemory, normalizeMemorySource, validateMemoryForm } from './me
 import { createFirstTokenEstimator, estimateResponseStartProgress, formatResponseStartProgress } from './progress.js';
 import { fetchDeferredPrerequisite, normalizeHealthStatus, normalizeModelStatus } from './settings.js';
 import {
+    autoSpeakToggleDescription,
     createGroupPlaybackQueue,
     createPlaybackController,
     createRecorderController,
@@ -671,6 +672,8 @@ import {
     normalizeVoiceModeState,
     shouldAutoSendTranscription,
     shouldAutoSpeak,
+    shouldStopSpeechOnToggleOff,
+    voiceModeToggleDescription,
 } from './audio.js';
 import {
     HANDSFREE_STATES,
@@ -934,6 +937,16 @@ if (typeof document !== 'undefined') {
         }
     }
 
+    // ── Toggle explanations ─────────────────────────────────────────────────
+    // "Auto-speak" and "Voice" read as two speech switches, but they control
+    // different things, and users reasonably read "Voice: Off" as "stop
+    // talking". The wording lives in audio.js so it is unit-testable; this
+    // only applies it. No behavior change — the wiring is unchanged.
+    function applyToggleDescription(button, description) {
+        button.title = description;
+        button.setAttribute('aria-label', description);
+    }
+
     function updateAutoSpeakButton() {
         if (!autoSpeakButton) return;
         if (!currentConversation) {
@@ -944,6 +957,7 @@ if (typeof document !== 'undefined') {
         const enabled = getAutoSpeakState(currentConversation.id);
         autoSpeakButton.setAttribute('aria-pressed', String(enabled));
         autoSpeakButton.textContent = enabled ? 'Auto-speak: On' : 'Auto-speak: Off';
+        applyToggleDescription(autoSpeakButton, autoSpeakToggleDescription(enabled));
     }
 
     // ── Voice mode state ───────────────────────────────────────────────────
@@ -976,6 +990,7 @@ if (typeof document !== 'undefined') {
         const enabled = getVoiceModeState(currentConversation.id);
         voiceModeButton.setAttribute('aria-pressed', String(enabled));
         voiceModeButton.textContent = enabled ? 'Voice: On' : 'Voice: Off';
+        applyToggleDescription(voiceModeButton, voiceModeToggleDescription(enabled));
     }
 
     // ── Rendering helpers ──────────────────────────────────────────────────
@@ -2800,12 +2815,19 @@ if (typeof document !== 'undefined') {
         }
     });
 
+    // Both speech toggles are OR-ed into the speak decision, so either can be
+    // why the characters are audible. Turning one off must therefore stop
+    // playback only when the OTHER is also off -- "the last owner leaving
+    // turns the speakers off". Previously both handlers stopped all TTS
+    // unconditionally, so Voice: Off could cut off audio that Auto-speak
+    // owned, contradicting the tooltip that says replies stay audible.
     if (autoSpeakButton) {
         autoSpeakButton.addEventListener('click', () => {
             if (!currentConversation) return;
-            const newState = !getAutoSpeakState(currentConversation.id);
-            setAutoSpeakState(currentConversation.id, newState);
-            if (!newState) {
+            const conversationId = currentConversation.id;
+            const newState = !getAutoSpeakState(conversationId);
+            setAutoSpeakState(conversationId, newState);
+            if (!newState && shouldStopSpeechOnToggleOff(getVoiceModeState(conversationId))) {
                 ttsOwnership.stopActiveTts('auto-speak-disabled', { markSpeakingEnd: true });
             }
             updateAutoSpeakButton();
@@ -2815,9 +2837,13 @@ if (typeof document !== 'undefined') {
     if (voiceModeButton) {
         voiceModeButton.addEventListener('click', () => {
             if (!currentConversation) return;
-            const newState = !getVoiceModeState(currentConversation.id);
-            setVoiceModeState(currentConversation.id, newState);
-            if (!newState) {
+            const conversationId = currentConversation.id;
+            const newState = !getVoiceModeState(conversationId);
+            setVoiceModeState(conversationId, newState);
+            // Voice only owns the audio when Auto-speak is off. With
+            // Auto-speak on, Voice: Off concerns the user's input only and
+            // must leave the characters' playback running.
+            if (!newState && shouldStopSpeechOnToggleOff(getAutoSpeakState(conversationId))) {
                 ttsOwnership.stopActiveTts('voice-mode-disabled', { markSpeakingEnd: true });
             }
             updateVoiceModeButton();

@@ -21,6 +21,61 @@ export function normalizeVoiceModeState(raw) {
 }
 
 /**
+ * Decides whether turning one speech toggle off should stop the audio that is
+ * currently playing.
+ *
+ * Auto-speak and Voice are both OR-ed into the speak decision, so either one
+ * can be the reason the characters are audible. The two toggle handlers used to
+ * stop ALL active TTS unconditionally, which made Voice: Off silence audio
+ * that Auto-speak owned -- the same Voice: Off that the tooltip says leaves
+ * replies audible. That inconsistency is what made the control read as broken.
+ *
+ * The rule is "the last owner leaving turns the speakers off": stop only when
+ * no other enabled toggle still wants audio.
+ *
+ * @param {boolean} otherToggleEnabled State of the OTHER speech toggle
+ * @returns {boolean} true when nothing still wants audio and playback must stop
+ */
+export function shouldStopSpeechOnToggleOff(otherToggleEnabled) {
+    return otherToggleEnabled !== true;
+}
+
+/**
+ * Describes the Auto-speak toggle for the tooltip and the accessible label.
+ *
+ * Auto-speak is the CHARACTERS' TTS switch, not a setting for the user's own
+ * voice. That distinction is not guessable from the label, and users have
+ * reasonably read "Voice: Off" as "stop talking", so the wording states what
+ * the control is for in both directions.
+ *
+ * @param {boolean} enabled Current Auto-speak state
+ * @returns {string}
+ */
+export function autoSpeakToggleDescription(enabled) {
+    return enabled
+        ? 'Auto-speak is On: the characters speak their replies aloud. This controls their voice, not yours.'
+        : 'Auto-speak is Off: the characters reply as text only. This controls their voice, not yours.';
+}
+
+/**
+ * Describes the Voice toggle for the tooltip and the accessible label.
+ *
+ * Voice governs the USER's recorded speech: whether a transcription is sent
+ * automatically or dropped into the composer for review. It is OR-ed into the
+ * speak decision, so Voice: On also implies spoken replies — and, importantly
+ * for the "why is it still talking" question, Voice: Off does NOT silence the
+ * characters when Auto-speak is on.
+ *
+ * @param {boolean} enabled Current Voice state
+ * @returns {string}
+ */
+export function voiceModeToggleDescription(enabled) {
+    return enabled
+        ? 'Voice is On: your recorded speech is transcribed and sent automatically, and replies are spoken aloud.'
+        : 'Voice is Off: your recorded speech is transcribed into the message box for you to review and send. Replies are still spoken if Auto-speak is On.';
+}
+
+/**
  * Pure decision helper: determines whether a successful transcription
  * should be auto-sent through the chat flow.
  * @param {{

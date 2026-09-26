@@ -1,6 +1,14 @@
 import assert from 'node:assert/strict';
-import test from 'node:test';
-import { selectSpeaker } from '../../src/openparlor/speaker-director.js';
+import { describe, test } from 'node:test';
+import {
+    buildDirectorPrompt,
+    findPendingQuestionAsker,
+    leastRecentlySpoken,
+    parseDirectorDecision,
+    selectSpeaker,
+    selectSpeakerByRules,
+    selectSpeakers,
+} from '../../src/openparlor/speaker-director.js';
 
 function makeParticipants(names) {
     return names.map((name, i) => ({
@@ -278,14 +286,6 @@ test('whole-group cue still takes precedence over direct address', () => {
 });
 
 // ─── STAB-006: rule selection, anti-starvation rotation, model director ──────
-
-import {
-    selectSpeakerByRules,
-    leastRecentlySpoken,
-    parseDirectorDecision,
-    buildDirectorPrompt,
-    selectSpeakers,
-} from '../../src/openparlor/speaker-director.js';
 
 test('selectSpeakerByRules matches selectSpeaker when a deterministic rule fires', () => {
     const participants = makeParticipants(['Alice', 'Bob', 'Charlie']);
@@ -581,4 +581,172 @@ test('"guys" alone without a second-person or vocative marker does NOT select th
     const result = selectSpeaker(participants, characters, 'my guys are coming over');
     assert.equal(result.length, 1);
     assert.equal(result[0].id, 'part-0');
+});
+
+// ─── Regression: the character who asked the question answers the reply ──────
+//
+// Reported case: Monica introduced herself, Doug said "I'm Doug, by the way.
+// What's your name?", the user replied "Oh, my name is Mark.", and Monica —
+// not Doug — answered. Two independent defects combined:
+//
+//   1. "Oh, my name is Mark." names nobody and carries no group cue, so every
+//      deterministic rule missed and the turn went to the model director (or
+//      its fallback). Nothing looked at the outstanding question.
+//   2. The director prompt labelled the transcript with participant IDs while
+//      asking for character IDs, so it could not tell that Doug had asked.
+//
+// The pending-question rule fixes (1) deterministically; the name mapping
+// fixes (2) for the genuinely ambiguous turns that still reach the model.
+const PQ_PARTICIPANTS = [
+    { id: 'part-monica', character_id: 'char-monica', role: 'character' },
+    { id: 'part-doug', character_id: 'char-doug', role: 'character' },
+];
+const PQ_CHARACTERS = [
+    { id: 'char-monica', name: 'Monica' },
+    { id: 'char-doug', name: 'Doug' },
+];
+const PQ_HISTORY = [
+    { role: 'character', participant_id: 'part-monica', content: 'I\'m Monica! I\'m just taking it easy right now.' },
+    { role: 'character', participant_id: 'part-doug', content: 'I\'m Doug, by the way. What\'s your name?' },
+];
+const pqNameOf = (participants) => participants
+    .map(p => PQ_CHARACTERS.find(c => c.id === p.character_id).name);
+
+describe('pending question: the asker answers the user', () => {
+    test('routes the reported message to Doug, not Monica', () => {
+        const result = selectSpeakerByRules(
+            PQ_PARTICIPANTS, PQ_CHARACTERS, 'Oh, my name is Mark.', PQ_HISTORY,
+        );
+        assert.ok(result, 'the turn must be decided deterministically, not sent to the model');
+        assert.deepEqual(pqNameOf(result), ['Doug']);
+    });
+
+    test('never consults the model for an outstanding question', async () => {
+        let called = 0;
+        const provider = {
+            chatCompletion: async () => {
+                called += 1;
+                // A provider that would have chosen wrongly must never run.
+                return { choices: [{ message: { content: '{"speakers":["char-monica"]}' } }] };
+            },
+        };
+        const result = await selectSpeakers({
+            participants: PQ_PARTICIPANTS,
+            characters: PQ_CHARACTERS,
+            userMessage: 'Oh, my name is Mark.',
+            recentMessages: PQ_HISTORY,
+            provider,
+        });
+        assert.equal(called, 0, 'the model must not be consulted when a question is outstanding');
+        assert.deepEqual(pqNameOf(result), ['Doug']);
+    });
+
+    test('a later user turn does not re-capture a long-answered question', () => {
+        const history = [
+            ...PQ_HISTORY,
+            { role: 'user', content: 'Oh, my name is Mark.' },
+            { role: 'character', participant_id: 'part-doug', content: 'Nice to meet you, Mark.' },
+        ];
+        assert.equal(findPendingQuestionAsker(PQ_PARTICIPANTS, history), null,
+            'a question asked before the last user turn is already answered');
+    });
+
+    test('an explicit name still wins over conversational continuity', () => {
+        const result = selectSpeakerByRules(
+            PQ_PARTICIPANTS, PQ_CHARACTERS, 'Monica, what do you think?', PQ_HISTORY,
+        );
+        assert.deepEqual(pqNameOf(result), ['Monica']);
+    });
+
+    test('a whole-group cue still wins over conversational continuity', () => {
+        const result = selectSpeakerByRules(
+            PQ_PARTICIPANTS, PQ_CHARACTERS, 'what do you all think?', PQ_HISTORY,
+        );
+        assert.equal(result.length, 2, 'both characters answer an open question to the group');
+    });
+
+    test('a question addressed to another character is not a pending question', () => {
+        // Doug asks MONICA, not the user, so the user's reply is not an
+        // answer to Doug.
+        const history = [
+            { role: 'character', participant_id: 'part-doug', content: 'Monica, did you get the delivery?' },
+        ];
+        assert.equal(findPendingQuestionAsker(PQ_PARTICIPANTS, history), null);
+    });
+
+    test('a rhetorical question earlier in the message does not capture the turn', () => {
+        const history = [
+            { role: 'character', participant_id: 'part-doug', content: 'Wasn\'t that something? Anyway, nice weather.' },
+        ];
+        assert.equal(findPendingQuestionAsker(PQ_PARTICIPANTS, history), null);
+    });
+
+    test('only the most recent question matters', () => {
+        const history = [
+            { role: 'character', participant_id: 'part-doug', content: 'What\'s your name?' },
+            { role: 'character', participant_id: 'part-monica', content: 'How are you?' },
+        ];
+        const asker = findPendingQuestionAsker(PQ_PARTICIPANTS, history);
+        assert.equal(asker.character_id, 'char-monica', 'the newest question wins');
+    });
+
+    test('a statement is not a pending question', () => {
+        const history = [
+            { role: 'character', participant_id: 'part-doug', content: 'I\'m Doug, by the way. It\'s been a long day.' },
+        ];
+        assert.equal(findPendingQuestionAsker(PQ_PARTICIPANTS, history), null);
+    });
+
+    test('an unresolvable participant_id does not crash the scan', () => {
+        const history = [
+            { role: 'character', participant_id: 'part-gone', content: 'What\'s your name?' },
+        ];
+        assert.equal(findPendingQuestionAsker(PQ_PARTICIPANTS, history), null);
+    });
+});
+
+// ─── Regression: the director prompt must not mix ID namespaces ──────────────
+describe('director prompt names its speakers', () => {
+    test('labels the transcript with character names, not participant IDs', () => {
+        const [system, user] = buildDirectorPrompt({
+            participants: PQ_PARTICIPANTS,
+            characters: PQ_CHARACTERS,
+            userMessage: 'Oh, my name is Mark.',
+            recentMessages: [
+                { role: 'character', participant_id: 'part-doug', content: 'What\'s your name?' },
+                { role: 'user', content: 'Oh, my name is Mark.' },
+            ],
+        });
+        assert.ok(user.content.includes('Doug: What\'s your name?'),
+            'the asker must be identifiable by name');
+        assert.ok(user.content.includes('User: Oh, my name is Mark.'));
+        assert.ok(!/Character part-/.test(user.content),
+            'participant IDs must not label the transcript');
+        assert.ok(!user.content.includes('part-doug'), 'no raw participant ID may appear');
+        assert.ok(system.content.includes('NAMES'), 'the director is told the transcript uses names');
+        assert.ok(system.content.includes('asked the user a question'),
+            'the answer-the-asker rule is stated for genuinely ambiguous turns');
+    });
+
+    test('an unknown participant degrades to a readable placeholder', () => {
+        const [, user] = buildDirectorPrompt({
+            participants: PQ_PARTICIPANTS,
+            characters: PQ_CHARACTERS,
+            userMessage: 'hello',
+            recentMessages: [{ role: 'character', participant_id: 'part-vanished', content: 'hi' }],
+        });
+        assert.ok(user.content.includes('Unknown character: hi'));
+        assert.ok(!user.content.includes('undefined'));
+    });
+
+    test('the Characters list still offers exactly the answerable IDs', () => {
+        const [, user] = buildDirectorPrompt({
+            participants: PQ_PARTICIPANTS,
+            characters: PQ_CHARACTERS,
+            userMessage: 'hello',
+            recentMessages: [],
+        });
+        assert.ok(user.content.includes('- id: char-doug (name: Doug)'));
+        assert.ok(user.content.includes('- id: char-monica (name: Monica)'));
+    });
 });

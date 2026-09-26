@@ -232,7 +232,7 @@ test('includes present participant names for group conversations', () => {
     const conversation = { participants: ['Alice', 'Bob', 'Charlie'] };
     const result = buildPrompt({ character, conversation, history: [], newMessages: [] });
     const sys = result[0].content;
-    assert.ok(sys.includes('Present participants'));
+    assert.ok(sys.includes('Characters in this conversation'));
     assert.ok(sys.includes('Alice'));
     assert.ok(sys.includes('Bob'));
     assert.ok(sys.includes('Charlie'));
@@ -243,7 +243,8 @@ test('omits participant section for single-character conversations', () => {
     const conversation = {};
     const result = buildPrompt({ character, conversation, history: [], newMessages: [] });
     const sys = result[0].content;
-    assert.ok(!sys.includes('Present participants'));
+    assert.ok(!sys.includes('Characters in this conversation'));
+    assert.ok(!sys.includes('The person typing in the chat is the human user'));
 });
 
 test('browser content cannot override identity or first-person rules', () => {
@@ -276,7 +277,7 @@ test('group prompt construction with multiple participants and history', () => {
     assert.ok(sys.includes('Your name is Alice'));
     assert.ok(sys.includes('You are Alice, a wizard.'));
     assert.ok(sys.includes('Scenario: A tavern'));
-    assert.ok(sys.includes('Present participants'));
+    assert.ok(sys.includes('Characters in this conversation'));
     assert.ok(sys.includes('Bob'));
     assert.ok(sys.includes('Charlie'));
 
@@ -402,7 +403,7 @@ test('group prompt for Monica keeps her own line as assistant and labels Doug\'s
     const result = buildPrompt({ character, conversation, history: GROUP_HISTORY, newMessages, participantContext: GROUP_CONTEXT });
 
     const sys = result[0].content;
-    assert.ok(sys.includes('Present participants in this conversation: Doug, Monica'));
+    assert.ok(sys.includes('Characters in this conversation: Doug, Monica'));
     assert.ok(!sys.includes('[object Object]'));
 
     const monicaLine = result.find(m => m.content === 'Hi, I\'m Monica');
@@ -411,10 +412,13 @@ test('group prompt for Monica keeps her own line as assistant and labels Doug\'s
 
     const dougLine = result.find(m => m.content.includes('I\'m Doug'));
     assert.ok(dougLine, 'Doug line must be present');
-    assert.equal(dougLine.role, 'user');
-    assert.ok(dougLine.content.includes('Doug'), 'Doug line must be attributed to Doug');
-    assert.ok(!result.some(m => m.role === 'assistant' && m.content.includes('I\'m Doug')),
-        'Doug line must not be an anonymous assistant message');
+    // Another character's speech must NEVER occupy the `user` role. A model
+    // reads every `user` turn as the human, so a user-role Doug line makes the
+    // model believe the human is Doug.
+    assert.equal(dougLine.role, 'assistant', 'another character must not be a user turn');
+    assert.ok(dougLine.content.includes('[Doug said to the group]'), 'Doug line must be attributed to Doug');
+    assert.ok(!result.some(m => m.role === 'assistant' && m.content === 'I\'m Doug'),
+        'the labeled Doug line must not appear as unlabeled own speech');
 
     assert.equal(result.filter(m => m.content === 'Hello everyone').length, 1);
     const userTurn = result.filter(m => m.content === 'What are you working on today?');
@@ -429,7 +433,7 @@ test('group prompt for Doug keeps his own line as assistant and labels Monica\'s
     const result = buildPrompt({ character, conversation, history: GROUP_HISTORY, newMessages, participantContext: GROUP_CONTEXT });
 
     const sys = result[0].content;
-    assert.ok(sys.includes('Present participants in this conversation: Doug, Monica'));
+    assert.ok(sys.includes('Characters in this conversation: Doug, Monica'));
 
     const dougLine = result.find(m => m.content === 'Hi, I\'m Doug');
     assert.ok(dougLine, 'Doug line must be present');
@@ -437,10 +441,94 @@ test('group prompt for Doug keeps his own line as assistant and labels Monica\'s
 
     const monicaLine = result.find(m => m.content.includes('I\'m Monica'));
     assert.ok(monicaLine, 'Monica line must be present');
-    assert.equal(monicaLine.role, 'user');
-    assert.ok(monicaLine.content.includes('Monica'), 'Monica line must be attributed to Monica');
-    assert.ok(!result.some(m => m.role === 'assistant' && m.content.includes('I\'m Monica')),
-        'Monica line must not be an anonymous assistant message');
+    assert.equal(monicaLine.role, 'assistant', 'another character must not be a user turn');
+    assert.ok(monicaLine.content.includes('[Monica said to the group]'), 'Monica line must be attributed to Monica');
+    assert.ok(!result.some(m => m.role === 'assistant' && m.content === 'I\'m Monica'),
+        'the labeled Monica line must not appear as unlabeled own speech');
+});
+
+// ─── Regression: characters must not mistake the human for a participant ────
+//
+// Reported bug: with Doug and Monica in a room, each addressed the user by the
+// OTHER character's name ("Monica, what's with the counting?" / "That's a nice
+// way to put it, Doug."). The prompt had been rendering the other character's
+// speech as a `user` turn, so the model read "the human just said 'Monica,
+// what's with the counting?'" and replied as if the human were Doug.
+//
+// The load-bearing invariant: ONLY the human's messages may be `user` turns.
+describe('group prompt: the human user is never mistaken for a participant', () => {
+    const REPORTED_HISTORY = [
+        { role: 'user', content: '1, 2, 3, 4, 5, 6, 7' },
+        { role: 'character', content: 'Monica, what\'s with the counting?', participant_id: 'part-doug' },
+        { role: 'user', content: 'The rain in Spain falls gently on the plain.' },
+        { role: 'character', content: 'That\'s a nice way to put it, Doug.', participant_id: 'part-monica' },
+    ];
+    const NEWEST = 'The rain in Spain falls gently on the plain.';
+
+    const promptFor = (id, name) => buildPrompt({
+        character: { id, name, system_prompt: `You are ${name}.` },
+        conversation: {},
+        history: REPORTED_HISTORY,
+        newMessages: [{ role: 'user', content: NEWEST }],
+        participantContext: GROUP_CONTEXT,
+    });
+
+    for (const [id, name] of [['char-monica', 'Monica'], ['char-doug', 'Doug']]) {
+        test(`every user turn in ${name}'s prompt is the human's own message`, () => {
+            const result = promptFor(id, name);
+            const userContents = result.filter(m => m.role === 'user').map(m => m.content);
+            const humanMessages = ['1, 2, 3, 4, 5, 6, 7', NEWEST];
+            for (const content of userContents) {
+                assert.ok(
+                    humanMessages.includes(content),
+                    `user turn must be a human message, got a character line: ${content}`,
+                );
+            }
+            assert.ok(!userContents.some(c => c.includes('said to the group')),
+                'no labeled character line may occupy the user role');
+            assert.ok(!userContents.some(c => c.includes('what\'s with the counting')),
+                'Doug must never appear to be the human');
+            assert.ok(!userContents.some(c => c.includes('nice way to put it')),
+                'Monica must never appear to be the human');
+        });
+
+        test(`${name}'s system prompt states the human is not a participant`, () => {
+            const sys = promptFor(id, name)[0].content;
+            assert.ok(sys.includes('The person typing in the chat is the human user'),
+                'the human/user distinction must be stated');
+            assert.ok(sys.includes('never call them by a character\'s name'),
+                'calling the human by a character name must be forbidden explicitly');
+            assert.ok(!sys.includes('Address them by name when appropriate'),
+                'the old instruction that invited addressing the human by a participant name must be gone');
+        });
+    }
+
+    test('the target character sees its own speech unlabeled and others labeled', () => {
+        const result = promptFor('char-monica', 'Monica');
+        // Monica's own earlier line stays a plain assistant turn...
+        const own = result.find(m => m.content === 'That\'s a nice way to put it, Doug.');
+        assert.ok(own, 'Monica own line must be present');
+        assert.equal(own.role, 'assistant');
+        assert.ok(!own.content.startsWith('['), 'own speech carries no label');
+        // ...and Doug's is an assistant turn that is explicitly his.
+        const other = result.find(m => m.content.includes('what\'s with the counting'));
+        assert.equal(other.role, 'assistant');
+        assert.ok(other.content.startsWith('[Doug said to the group]:'),
+            'another character\'s speech must be labeled so it is not claimed as own memory');
+    });
+
+    test('a single-character room is unaffected and gains no group rules', () => {
+        const result = buildPrompt({
+            character: { id: 'char-mon', name: 'Monica', system_prompt: '' },
+            conversation: { participants: [{ name: 'Monica' }] },
+            history: [{ role: 'user', content: 'hi' }, { role: 'character', content: 'hello' }],
+            newMessages: [],
+        });
+        const sys = result[0].content;
+        assert.ok(!sys.includes('The person typing in the chat is the human user'),
+            'the group rule is only for multi-character rooms');
+        assert.ok(!sys.includes('said to the group'));
+    });
 });
 
 test('participantContext names take precedence over raw participant records', () => {
@@ -448,7 +536,7 @@ test('participantContext names take precedence over raw participant records', ()
     const conversation = { participants: [{ participant_id: 'part-doug', character_id: 'char-doug', role: 'character' }] };
     const result = buildPrompt({ character, conversation, history: [], newMessages: [], participantContext: GROUP_CONTEXT });
     const sys = result[0].content;
-    assert.ok(sys.includes('Present participants in this conversation: Doug, Monica'));
+    assert.ok(sys.includes('Characters in this conversation: Doug, Monica'));
     assert.ok(!sys.includes('[object Object]'));
 });
 
@@ -457,7 +545,7 @@ test('participant records with name fields render readable names', () => {
     const conversation = { participants: [{ name: 'Doug' }, { name: 'Monica' }] };
     const result = buildPrompt({ character, conversation, history: [], newMessages: [] });
     const sys = result[0].content;
-    assert.ok(sys.includes('Present participants in this conversation: Doug, Monica'));
+    assert.ok(sys.includes('Characters in this conversation: Doug, Monica'));
     assert.ok(!sys.includes('[object Object]'));
 });
 

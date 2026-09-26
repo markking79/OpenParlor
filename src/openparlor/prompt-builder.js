@@ -8,12 +8,44 @@ function identityRule(name) {
     return `Your name is ${name}. You are ${name}. Always speak in first person as ${name}. Never refer to yourself in third person or break character.`;
 }
 
+/**
+ * Lists the character participants. These are the characters only — the human
+ * typing in the chat is not on this list (see groupContextRule).
+ *
+ * The closing instruction is deliberately phrased as "the other characters"
+ * rather than "them": in a group prompt the nearest antecedent of a bare
+ * pronoun is the human user, and an earlier revision said "Address them by
+ * name", which models applied to the human and produced replies that called
+ * the user by a character's name.
+ */
 function participantsRule(names) {
-    return `Present participants in this conversation: ${names.join(', ')}. Address them by name when appropriate.`;
+    return `Characters in this conversation: ${names.join(', ')}. These are the characters in the scene, not the human user. You may refer to the other characters by name.`;
 }
 
+/**
+ * Group-context rule for conversations with more than one character.
+ *
+ * Three things must be stated, because the message roles alone do not carry
+ * them:
+ *
+ * 1. The human who types into the chat is the `user` and is NOT one of the
+ *    named participants. Without this, a model that sees the other characters'
+ *    speech in the transcript will attribute the newest unlabeled `user` turn
+ *    to whichever participant name is salient, and will address the human by a
+ *    character's name. This was the reported bug.
+ * 2. Other characters' speech is labeled and is theirs, never the human's.
+ * 3. The target character must not claim labeled lines as its own memory.
+ *
+ * The rules are ordered so the human/user distinction is stated first, before
+ * the more detailed (and more easily ignored) labeling contract.
+ */
 function groupContextRule() {
-    return 'Earlier speech from other participants is shown as labeled context lines such as "[Doug said to the group]: ...". Those labeled lines are not your own words; only assistant messages without such a label are your previous speech.';
+    return [
+        'This is a group conversation with more than one character.',
+        'The person typing in the chat is the human user. They are NOT one of the named participants, they are not any character listed above, and you must never call them by a character\'s name, never treat their messages as another character\'s words, and never answer them as if they were a participant. Address them as "you", or without a name.',
+        'Messages that begin with a label such as "[Doug said to the group]:" are another character\'s speech, not the human user\'s and not yours. They are included only so you know what the other characters have said.',
+        'Your own previous speech is the assistant message that carries no such label.',
+    ].join(' ');
 }
 
 /**
@@ -118,9 +150,11 @@ export function buildPrompt({ character, conversation, history, newMessages, mem
 
     // Speaker-relative history. When a participant context is provided, each
     // stored character message is mapped by participant_id: the target
-    // character's own speech stays an assistant message while every other
-    // character's speech becomes a labeled user context line, so the model
-    // can distinguish its own previous words from other characters' words.
+    // character's own speech stays an unlabeled assistant message, another
+    // character's speech becomes a LABELED assistant message, and the human's
+    // messages are the only unlabeled `user` turns. That last property is the
+    // load-bearing one — a model reads every `user` turn as "the human just
+    // typed this", so nothing but the human may occupy that role.
     // Without a context, the legacy mapping (character → assistant) applies.
     let contextById = null;
     if (Array.isArray(participantContext) && participantContext.length > 0) {
@@ -163,7 +197,22 @@ export function buildPrompt({ character, conversation, history, newMessages, mem
         if (entry && targetCharacterId && entry.character_id === targetCharacterId) {
             messages.push({ role: 'assistant', content: msg.content });
         } else if (entry && entry.character_id !== targetCharacterId && typeof entry.name === 'string' && entry.name.trim() !== '') {
-            messages.push({ role: 'user', content: `[${entry.name} said to the group]: ${msg.content}` });
+            // Another character's speech. This MUST NOT be role 'user'.
+            //
+            // A chat model reads every `user` turn as "the human just typed
+            // this". Rendering Doug's line as a user turn told Monica that the
+            // human had just said "Monica, what's with the counting?", so she
+            // replied to the human as if he were Doug. A `[Name said to the
+            // group]` prefix cannot rescue that: a string inside a user turn
+            // loses to the role.
+            //
+            // `assistant` is the only remaining role that is standard across
+            // OpenAI-compatible endpoints, and keeping the line interleaved
+            // preserves the "who replied to what" ordering that a single
+            // trailing transcript block would destroy. The label is what
+            // keeps the target character from claiming these words as its own,
+            // and groupContextRule() states that contract explicitly.
+            messages.push({ role: 'assistant', content: `[${entry.name} said to the group]: ${msg.content}` });
         } else {
             messages.push({ role: 'assistant', content: msg.content });
         }
