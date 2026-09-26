@@ -574,7 +574,13 @@ describe('createHandsFreeController TTS cooperation', () => {
         await controller.enable();
         feed(controller, 30, silentFrame); // pre-roll before TTS
         controller.markSpeakingStart();
-        feed(controller, 50, () => frame(0.5)); // TTS leaking into the mic
+        // VOICE-003: residual echo from the speakers must sit in the band
+        // between the LISTENING VAD threshold (0.01) and the barge-in
+        // threshold (0.03). Amplitude below 0.03 is the whole point of the
+        // stronger barge-in threshold; sustained audio ABOVE it is a user
+        // interrupt by design and is covered by the VOICE-003 barge-in tests.
+        feed(controller, 50, () => frame(0.02)); // TTS leaking into the mic
+        assert.equal(controller.state, HANDSFREE_STATES.SPEAKING, 'echo is not an interrupt');
         controller.markSpeakingEnd();
         feed(controller, 30, silentFrame);
         feed(controller, 20, loudFrame); // a new real user utterance
