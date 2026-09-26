@@ -2202,7 +2202,7 @@ test('group prompt lists actual participant names instead of raw records', async
 
         assert.equal(mock.calls.length, 2);
         const sys = mock.calls[0][0].content;
-        assert.ok(sys.includes('Present participants in this conversation: Doug, Monica'),
+        assert.ok(sys.includes('Characters in this conversation: Doug, Monica'),
             'system prompt must contain readable participant names');
         assert.ok(!sys.includes('[object Object]'), 'system prompt must not stringify raw participant records');
     } finally {
@@ -2284,7 +2284,7 @@ test('group prompt keeps speaker identity of persisted history for the selected 
         const prompt = mock.calls[0];
         const system = prompt[0].content;
         assert.ok(system.includes('You are Monica.'));
-        assert.ok(system.includes('Present participants in this conversation: Doug, Monica'));
+        assert.ok(system.includes('Characters in this conversation: Doug, Monica'));
         assert.ok(!system.includes('[object Object]'));
 
         const monicaLine = prompt.find(m => m.content === 'Hi, I am Monica');
@@ -2293,9 +2293,24 @@ test('group prompt keeps speaker identity of persisted history for the selected 
 
         const dougLine = prompt.find(m => m.content.includes('Hi, I am Doug'));
         assert.ok(dougLine, 'Doug line must be present');
-        assert.equal(dougLine.role, 'user', 'another character\'s line must not be an assistant message');
+        // Another character's speech must never take the `user` role: a model
+        // reads every user turn as the human, which made characters address
+        // the human by the other character's name.
+        assert.equal(dougLine.role, 'assistant', 'another character must not be a user turn');
         assert.ok(dougLine.content.includes('[Doug said to the group]'), 'Doug line must be attributed to Doug');
-        assert.ok(!prompt.some(m => m.role === 'assistant' && m.content.includes('Hi, I am Doug')));
+        assert.ok(!prompt.some(m => m.role === 'assistant' && m.content === 'Hi, I am Doug'),
+            'the labeled Doug line must not appear as unlabeled own speech');
+        // The invariant that actually fixes the reported bug: no character
+        // speech may occupy the `user` role, because a model reads every user
+        // turn as the human.
+        for (const m of prompt.filter(x => x.role === 'user')) {
+            assert.ok(!m.content.startsWith('['),
+                `a labeled character line must never be a user turn: ${m.content}`);
+        }
+        const humanLines = ['Hello everyone', 'Monica, what are you working on today?'];
+        for (const m of prompt.filter(x => x.role === 'user')) {
+            assert.ok(humanLines.includes(m.content), `user turn must be the human's own message: ${m.content}`);
+        }
     } finally {
         tmp.cleanup();
     }
