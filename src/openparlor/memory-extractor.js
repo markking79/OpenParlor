@@ -1,5 +1,5 @@
 import * as persistence from './persistence.js';
-import { uniqueSignificantSequence } from './memory-text.js';
+import { uniqueSignificantSequence, normalizeSubject } from './memory-text.js';
 
 const MAX_CONTENT_LENGTH = 500;
 const MAX_CANDIDATES = 5;
@@ -73,7 +73,7 @@ function isMetaMemory(content) {
 /**
  * Validates a single candidate fact from the model output.
  * @param {unknown} candidate
- * @returns {{content: string, type: string, importance: number, confidence: number} | null}
+ * @returns {{content: string, type: string, importance: number, confidence: number, subject: string|null} | null}
  */
 function validateCandidate(candidate) {
     if (candidate === null || typeof candidate !== 'object' || Array.isArray(candidate)) return null;
@@ -89,13 +89,18 @@ function validateCandidate(candidate) {
         ? Math.max(0, Math.min(1, c.importance)) : 0.5;
     const confidence = typeof c.confidence === 'number' && Number.isFinite(c.confidence)
         ? Math.max(0, Math.min(1, c.confidence)) : 0.5;
-    return { content, type, importance, confidence };
+    // The subject is optional. A memory without one simply never supersedes
+    // anything, which is the safe default: an invented subject must not be
+    // able to retire a fact the user never corrected.
+    const subject = typeof c.subject === 'string' && normalizeSubject(c.subject) !== ''
+        ? c.subject.trim() : null;
+    return { content, type, importance, confidence, subject };
 }
 
 /**
  * Parses the model's JSON response into validated candidates.
  * @param {string} raw
- * @returns {Array<{content: string, type: string, importance: number, confidence: number}>}
+ * @returns {Array<{content: string, type: string, importance: number, confidence: number, subject: string|null}>}
  */
 export function parseCandidates(raw) {
     if (typeof raw !== 'string' || raw.trim() === '') return [];
@@ -190,8 +195,10 @@ export function buildExtractionPrompt(context) {
         '- Assign importance (0-1) and confidence (0-1) for each.',
         '- Return at most 5 candidates.',
         '- If there is nothing worth remembering, return an empty array.',
+        '- For each fact, also give a short "subject" naming what the fact is about (e.g. "user employer", "user sister").',
+        '- Use the SAME subject for a fact and any later correction of it, so the old one can be retired. Omit "subject" for one-off events that will never be corrected.',
         '',
-        'Respond with a JSON array of objects: [{"content": "...", "type": "...", "importance": 0.0, "confidence": 0.0}]',
+        'Respond with a JSON array of objects: [{"content": "...", "type": "...", "importance": 0.0, "confidence": 0.0, "subject": "..."}]',
     ].join('\n');
 
     const participantLine = Array.isArray(participants) && participants.length > 1
@@ -203,6 +210,59 @@ export function buildExtractionPrompt(context) {
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userPrompt },
     ];
+}
+
+/**
+ * Finds the active memories that conflict with a newly extracted candidate.
+ *
+ * Returns them split by which side is newer, because the two cases are
+ * opposites and the caller must not conflate them:
+ *
+ *   stale   -- existing memories that are NEWER than this candidate. The
+ *              candidate is a late extraction of an older statement, so it
+ *              must not retire them; it is itself the outdated one.
+ *   older   -- existing memories that this candidate corrects. It retires
+ *              these.
+ *
+ * A candidate supersedes an existing memory when:
+ *   - it declares a subject, and the existing memory has the SAME subject;
+ *   - the contents are genuinely different (an exact/near duplicate is a
+ *     duplicate, not a correction -- that case is already handled by
+ *     deduplicate());
+ *   - the existing memory is still active (we never re-supersede something
+ *     already retired, so chains stay flat and cannot loop).
+ *
+ * Without a subject we cannot tell a correction from a new fact, so nothing
+ * is superseded. Guessing here would silently delete the user's history.
+ *
+ * @param {{content: string, subject: string|null}} candidate
+ * @param {Array<object>} existing Active memories visible to the character
+ * @param {string} candidateSourceTime ISO timestamp of the turn this came from
+ * @returns {{stale: string[], older: string[]}} memory IDs, split by recency
+ */
+function findConflicts(candidate, existing, candidateSourceTime) {
+    const key = normalizeSubject(candidate.subject);
+    if (key === '') return { stale: [], older: [] };
+    const normalizedContent = normalizeForDedup(candidate.content);
+    const candidateTime = Date.parse(candidateSourceTime);
+    const stale = [];
+    const older = [];
+    for (const mem of existing) {
+        if (!mem || mem.active !== true) continue;
+        if (normalizeSubject(mem.subject) !== key) continue;
+        if (normalizeForDedup(mem.content) === normalizedContent) continue;
+        // Compare the SOURCE turn, never the arrival time. Extraction is
+        // fire-and-forget, so a slow call can deliver an old statement long
+        // after a newer one was already stored; ordering by arrival would let
+        // that stale fact retire the correction and resurrect the old answer.
+        const memTime = Date.parse(mem.source_created_at);
+        if (Number.isFinite(candidateTime) && Number.isFinite(memTime) && memTime > candidateTime) {
+            stale.push(mem.id);
+        } else {
+            older.push(mem.id);
+        }
+    }
+    return { stale, older };
 }
 
 /**
@@ -218,6 +278,9 @@ export function buildExtractionPrompt(context) {
  * @param {Array<{role: string, content: string}>} params.messages
  * @param {string} params.source_message_id
  * @param {string[]} params.known_by_character_ids
+ * @param {string|null} [params.source_timestamp] ISO time of the turn being
+ *   summarized. Supersession compares this, not arrival order, so a late
+ *   extraction cannot overwrite newer state.
  * @param {Array<{name: string}>} [params.participants] Character names present in group context
  * @param {{ chatCompletion: (messages: Array<{role: string, content: string}>) => Promise<{choices: Array<{message: {content: string}}>} } }} params.provider
  * @returns {Promise<Array<object>>} Persisted memories
@@ -230,9 +293,19 @@ export async function extractAndPersistMemories({
     messages,
     source_message_id,
     known_by_character_ids,
+    source_timestamp = null,
     participants,
     provider,
 }) {
+    // The turn this extraction describes, used to decide whether a candidate
+    // is newer or older than what is already stored. Extraction is
+    // fire-and-forget, so a slow call can deliver an old statement long after
+    // a newer one landed; ordering by arrival time would let the stale fact
+    // win. Defaults to now, which preserves the ordinary "latest wins" order.
+    const sourceTimestamp = Number.isFinite(Date.parse(source_timestamp))
+        ? new Date(Date.parse(source_timestamp)).toISOString()
+        : new Date().toISOString();
+
     const prompt = buildExtractionPrompt({ character, conversation, messages, participants });
     const completion = await provider.chatCompletion(prompt);
     const raw = typeof completion?.choices?.[0]?.message?.content === 'string'
@@ -248,6 +321,12 @@ export async function extractAndPersistMemories({
 
     const persisted = [];
     for (const candidate of candidates) {
+        const { stale, older } = findConflicts(candidate, existing, sourceTimestamp);
+        // A candidate that lost to a newer statement is itself recorded as
+        // outdated, rather than dropped: provenance is the point of keeping
+        // retired memories, and silently discarding it would make the store
+        // disagree with what the user actually said.
+        const isStale = stale.length > 0;
         const memory = persistence.createMemory(directories, owner_id, {
             character_id: character.id,
             conversation_id: conversation.id,
@@ -255,11 +334,33 @@ export async function extractAndPersistMemories({
             type: candidate.type,
             importance: candidate.importance,
             confidence: candidate.confidence,
-            active: true,
+            active: !isStale,
+            subject: candidate.subject,
+            source_created_at: sourceTimestamp,
             source_conversation_id: conversation.id,
             source_message_id,
             known_by_character_ids,
         });
+        // Retiring happens only AFTER the replacement is on disk; the other
+        // order leaves a window where the fact is neither current nor
+        // recorded if the write failed.
+        // A stale candidate retires NOTHING: the newer statement it lost to
+        // stays active, and the candidate itself is the outdated record.
+        // Retiring by ARRIVAL order instead would let a slow extraction
+        // resurrect a fact the user already corrected.
+        const toRetire = isStale ? [] : older;
+        for (const oldId of toRetire) {
+            persistence.updateMemory(directories, oldId, {
+                active: false,
+                superseded_by: memory.id,
+            });
+        }
+        // A stale candidate points at the newer statement that beat it.
+        if (isStale) {
+            persistence.updateMemory(directories, memory.id, {
+                superseded_by: stale[0],
+            });
+        }
         persisted.push(memory);
     }
     return persisted;

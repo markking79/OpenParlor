@@ -152,6 +152,26 @@ export function uniqueSignificantSequence(text) {
 }
 
 /**
+ * Normalizes a "subject" key so that two phrasings of the same subject
+ * ("User's job", "user job", "USER  JOB") collapse to one comparable key.
+ *
+ * Subjects are the basis of supersession: a correction ("I left Company A,
+ * I work at B now") arrives as a NEW memory whose subject matches the
+ * subject of an OLD one. Matching on free text is hopeless, so both sides
+ * are reduced to a deterministic key here rather than in each caller.
+ *
+ * @param {unknown} subject
+ * @returns {string} '' when there is no usable subject
+ */
+export function normalizeSubject(subject) {
+    if (typeof subject !== 'string') return '';
+    return subject
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, ' ')
+        .trim();
+}
+
+/**
  * Returns the set of stems for tokens that appear capitalized in the text.
  * Used to detect proper-name/entity matches between a query and a memory.
  * @param {unknown} text

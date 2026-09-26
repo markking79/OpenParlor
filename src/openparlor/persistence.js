@@ -72,6 +72,9 @@ const MAX_AVATAR_READ_BYTES = MAX_CARD_AVATAR_BYTES;
  * @property {number} confidence 0–1
  * @property {boolean} active
  * @property {string|null} superseded_by FK → Memory (nullable)
+ * @property {string|null} subject Stable "what is this fact about" key (nullable)
+ * @property {string|null} source_created_at ISO 8601 time of the SOURCE turn
+ *   (distinct from created_at, which is when extraction happened to run)
  * @property {string|null} source_conversation_id FK → Conversation (nullable)
  * @property {string|null} source_message_id FK → Message (nullable)
  * @property {string[]} known_by_character_ids
@@ -708,6 +711,15 @@ function normalizeMemory(value) {
         active: typeof mem.active === 'boolean' ? mem.active : true,
         pinned: typeof mem.pinned === 'boolean' ? mem.pinned : false,
         superseded_by: typeof mem.superseded_by === 'string' ? mem.superseded_by : null,
+        // Normalized so that two memories about the same thing produce the
+        // same key regardless of casing or spacing. null means "no stable
+        // subject", which disables supersession for that memory.
+        subject: typeof mem.subject === 'string' && mem.subject.trim() !== ''
+            ? mem.subject.trim().toLowerCase().replace(/\s+/g, ' ')
+            : null,
+        // Absent on legacy records; supersession falls back to created_at
+        // ordering when a memory has no recorded source time.
+        source_created_at: typeof mem.source_created_at === 'string' ? mem.source_created_at : null,
         source_conversation_id: typeof mem.source_conversation_id === 'string' ? mem.source_conversation_id : null,
         source_message_id: typeof mem.source_message_id === 'string' ? mem.source_message_id : null,
         known_by_character_ids: Array.isArray(mem.known_by_character_ids)
@@ -739,6 +751,8 @@ export function createMemory(directories, owner_id, data) {
         active: data.active ?? true,
         pinned: data.pinned ?? false,
         superseded_by: data.superseded_by ?? null,
+        subject: data.subject ?? null,
+        source_created_at: data.source_created_at ?? now,
         source_conversation_id: data.source_conversation_id ?? null,
         source_message_id: data.source_message_id ?? null,
         known_by_character_ids: data.known_by_character_ids ?? [],
