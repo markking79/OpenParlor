@@ -435,6 +435,15 @@ export function createOpenParlorChatRouter({
                                 writeRecord({ type: 'delta', text: delta });
                             }
                         }
+                        if (character && !speakerText) {
+                            // A selected speaker that produced no text is
+                            // invisible in the transcript but still consumed a
+                            // turn, so record it. The UI hides the empty
+                            // bubble; without this the cause is invisible.
+                            console.warn(
+                                `OpenParlor: speaker ${character.id} produced no text (conversation ${conversationId ?? 'none'})`,
+                            );
+                        }
                         if (participant && speakerText) {
                             // Never store a speaker label the model put on its
                             // OWN line, or it reaches the UI and is fed back as

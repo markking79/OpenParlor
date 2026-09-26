@@ -97,4 +97,24 @@ describe('group speaker label is never written by the speaker', () => {
         assert.equal(atStart, '', 'a new speaker must not inherit the previous text');
         assert.equal(collector.getMessages().length, 2);
     });
+
+    it('a speaker who produces no text is identifiable as empty', () => {
+        // Observed: the first selected character streamed nothing, so the
+        // client had a named bubble with no content and the transcript had no
+        // message for her at all. The collector must expose that state
+        // unambiguously so the turn can drop the bubble rather than render it.
+        const collector = createStreamMessageCollector();
+        collector.handleRecord({ type: 'speaker_start', character_id: 'char-1' });
+        // No deltas at all for this speaker.
+        const first = collector.getPendingMessage();
+        assert.equal(first.character_id, 'char-1', 'identity is assigned even with no text');
+        assert.equal(first.content, '', 'and it is observably empty');
+        collector.handleRecord({ type: 'speaker_start', character_id: 'char-2' });
+        collector.handleRecord({ type: 'delta', text: 'Rex only.' });
+        assert.deepEqual(
+            collector.getMessages().map(m => [m.character_id, m.content]),
+            [['char-1', ''], ['char-2', 'Rex only.']],
+            'the silent speaker is a distinct empty entry, not a missing one',
+        );
+    });
 });

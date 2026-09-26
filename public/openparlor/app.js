@@ -2724,6 +2724,26 @@ if (typeof document !== 'undefined') {
                 && sendConversationId === (currentConversation ? currentConversation.id : '')
                 && sendEpoch === selectionEpoch;
             if (streamDone && turnIdentityCurrent) voiceTurnTimer.markStreamComplete();
+
+            // Drop assistant bubbles that never received any text.
+            //
+            // The pending assistant message is created BEFORE the server
+            // identifies a speaker, and speaker_start assigns that identity, so
+            // a character the server selected but which produced no output
+            // ends up as a named, empty bubble. Observed in a group turn where
+            // the first selected character streamed nothing at all: her name
+            // and avatar rendered above an empty rectangle, and nothing was
+            // persisted for her, so the transcript and the display disagreed.
+            //
+            // A character with nothing to say should not appear, rather than
+            // appearing as a message that says nothing.
+            for (let i = currentMessages.length - 1; i >= assistantMsgStartIndex; i -= 1) {
+                const msg = currentMessages[i];
+                if (msg.role === 'assistant' && (msg.content ?? '') === '') {
+                    currentMessages.splice(i, 1);
+                }
+            }
+
             // Final full render: the delta path only updates the live bubble
             // text, so completed messages need a re-render to gain their TTS
             // controls and server-identified speaker.
