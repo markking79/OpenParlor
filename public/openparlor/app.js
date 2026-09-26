@@ -656,6 +656,7 @@ export function createSendCompletionHandler(deps) {
 
 import { createNdjsonParser, createStreamMessageCollector, normalizeConversation, resolveMessageCharacterId } from './conversations.js';
 import { createStreamingTtsSession } from './streaming-tts.js';
+import { toSpeechText } from './speech-text.js';
 import { buildCardExportFilename, normalizeCharacter, sanitizeCharacterInput, validateCharacterForm } from './characters.js';
 import { normalizeMemory, normalizeMemorySource, validateMemoryForm } from './memory.js';
 import { createFirstTokenEstimator, estimateResponseStartProgress, formatResponseStartProgress } from './progress.js';
@@ -766,6 +767,12 @@ if (typeof document !== 'undefined') {
     let ttsMarkedForTurn = false;
     const groupQueue = createGroupPlaybackQueue({
         playItem: (text, voice) => {
+            // VOICE-005: the displayed message keeps its markdown; only what
+            // is actually spoken is cleaned. An item that reduces to nothing
+            // (an image, a pure code block) resolves immediately so the queue
+            // drains instead of synthesizing silence.
+            const spoken = toSpeechText(text);
+            if (spoken === '') return Promise.resolve();
             return new Promise((resolve, reject) => {
                 let settled = false;
                 const onEnd = () => {
@@ -777,7 +784,7 @@ if (typeof document !== 'undefined') {
                 // only when this item's audio actually ends (or is
                 // explicitly stopped). A superseded start resolves null
                 // instead; the item settles then so the queue can drain.
-                playback.play(text, voice, onEnd).then((url) => {
+                playback.play(spoken, voice, onEnd).then((url) => {
                     if (!ttsMarkedForTurn) {
                         ttsMarkedForTurn = true;
                         voiceTurnTimer.markTtsReady();
@@ -799,6 +806,10 @@ if (typeof document !== 'undefined') {
     // the streaming session owns sequencing, so there is no shared queue
     // state to coordinate here.
     function synthesizeStreamingSentence({ text, voice, signal }) {
+        // VOICE-005: same boundary as the group-queue path. Hidden reasoning,
+        // code and formatting must never reach a synthesizer.
+        const spoken = toSpeechText(text);
+        if (spoken === '') return Promise.reject(new Error('Nothing to speak'));
         return getCsrfToken().then((token) => {
             return fetch('/api/openparlor/tts/synthesize', {
                 method: 'POST',
@@ -806,7 +817,7 @@ if (typeof document !== 'undefined') {
                     'Content-Type': 'application/json',
                     'X-CSRF-Token': token,
                 },
-                body: JSON.stringify({ text: text, voice: voice }),
+                body: JSON.stringify({ text: spoken, voice: voice }),
                 signal: signal,
             });
         }).then((response) => {
@@ -978,6 +989,27 @@ if (typeof document !== 'undefined') {
         } catch {
             // storage unavailable
         }
+    }
+
+    /**
+     * The medium this turn will be delivered in, for the server's
+     * response-style policy (VOICE-005).
+     *
+     * Auto-speak counts as 'voice' because it means the reply is read aloud;
+     * whether the user typed it or spoke it is irrelevant to how it should be
+     * written. Hands-free is distinct because the user is mid-conversation
+     * there, where a long reply is worse than in voice mode.
+     *
+     * Resolved fresh per send and never stored, so switching a toggle off
+     * immediately returns later turns to the text policy.
+     *
+     * @returns {'text'|'voice'|'hands_free'}
+     */
+    function currentResponseMode() {
+        if (handsfree && handsfree.isActive) return 'hands_free';
+        const id = currentConversation ? currentConversation.id : '';
+        if (id && (getAutoSpeakState(id) || getVoiceModeState(id))) return 'voice';
+        return 'text';
     }
 
     function updateVoiceModeButton() {
@@ -2578,6 +2610,10 @@ if (typeof document !== 'undefined') {
                     messages: [{ role: 'user', content: text }],
                     stream: true,
                     conversation_id: currentConversation.id,
+                    // VOICE-005: the server shapes the reply for the medium it
+                    // will be delivered in. Sent per request and never stored
+                    // on the conversation, so a later text turn is unaffected.
+                    response_mode: currentResponseMode(),
                 }),
                 signal: abortController.signal,
             });

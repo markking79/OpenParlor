@@ -90,6 +90,10 @@ const MAX_AVATAR_READ_BYTES = MAX_CARD_AVATAR_BYTES;
  * @property {number} [temperature]
  * @property {number} [max_tokens]
  * @property {boolean} [memory_enabled]
+ * @property {'concise'|'normal'|'detailed'} [voice_response_length]
+ *   User preference for how much a SPOKEN reply says (VOICE-005). Affects
+ *   conversational length only, never the character's intelligence or
+ *   personality.
  * @property {number} [memory_limit]
  * @property {string} updated_at ISO 8601
  */

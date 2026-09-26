@@ -7,6 +7,7 @@ import { buildPrompt } from './prompt-builder.js';
 import { applyPromptBudget, resolvePromptBudget, resolveGenerationReserve } from './prompt-budget.js';
 import { sanitizeSummaryForPrompt, updateConversationSummary } from './conversation-summary.js';
 import { retrieveMemories } from './memory-retrieval.js';
+import { normalizeResponseMode, normalizeVoiceResponseLength } from './response-style.js';
 import { extractAndPersistMemories } from './memory-extractor.js';
 import { selectSpeakers } from './speaker-director.js';
 
@@ -151,6 +152,24 @@ export function createOpenParlorChatRouter({
         const conversationId = typeof request.body.conversation_id === 'string' ? request.body.conversation_id : null;
         const handle = user.profile?.handle ?? 'unknown';
 
+        // VOICE-005: the delivery medium for THIS turn only.
+        //
+        // Deliberately request-scoped and never written to the conversation
+        // record. Persisting it would make a later text-only turn inherit the
+        // voice policy from a turn that happened to be spoken, which is the
+        // "stale mode state" the spec calls out. An unknown value falls back to
+        // text, so a malformed client changes nothing.
+        const responseMode = normalizeResponseMode(request.body.response_mode);
+        let voiceResponseLength = 'normal';
+        try {
+            voiceResponseLength = normalizeVoiceResponseLength(
+                persistence.getSettings(user.directories).voice_response_length,
+            );
+        } catch {
+            // A settings read failure must not block the conversation; the
+            // default length is a perfectly good answer.
+        }
+
         // Validate conversation, build server-side prompt, and persist the user's message
         let speakerContexts = null;
         let participantContext = null;
@@ -239,7 +258,7 @@ export function createOpenParlorChatRouter({
                     }
                 }
                 const prompt = applyPromptBudget(
-                    buildPrompt({ character, conversation, history, newMessages: safeMessages, memories: memoryLines, participantContext, summary }),
+                    buildPrompt({ character, conversation, history, newMessages: safeMessages, memories: memoryLines, participantContext, summary, responseMode, voiceResponseLength }),
                     resolvePromptBudget(modelConfig, resolveGenerationReserve(character)),
                 );
                 speakerContexts.push({ participant: speaker, character, prompt });
