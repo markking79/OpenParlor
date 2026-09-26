@@ -3,7 +3,7 @@ import path from 'node:path';
 
 /**
  * @typedef {Object} OpenParlorConfig
- * @property {{ provider: string, baseUrl: string, model: string, maxContextTokens: number }} model Model provider configuration; `maxContextTokens` is the serving deployment context window used for prompt budgeting (0 means unconfigured, falling back to the documented default budget)
+ * @property {{ provider: string, baseUrl: string, model: string, maxContextTokens: number, disableThinking: boolean }} model Model provider configuration; `maxContextTokens` is the serving deployment context window used for prompt budgeting (0 means unconfigured, falling back to the documented default budget); `disableThinking` suppresses a reasoning model's thinking phase (true by default, because OpenParlor renders only the spoken answer)
  * @property {{ provider: string, baseUrl: string, pythonExecutable: string, runnerPath: string, modelPath: string, modelCacheDir: string, maxAudioBytes: number, timeoutMs: number, language: string }} stt Speech-to-text provider configuration
  * @property {{ provider: string, baseUrl: string, voice: string }} tts Text-to-speech provider configuration
  */
@@ -14,10 +14,10 @@ import path from 'node:path';
  * defaults or secrets are ever supplied by this module.
  * The STT execution fields are a fixed server-owned whitelist for the local
  * faster-whisper adapter. They are deliberately not browser-editable.
- * @type {Readonly<{ model: Readonly<{ provider: string, baseUrl: string, model: string, maxContextTokens: number }>, stt: Readonly<{ provider: string, baseUrl: string, pythonExecutable: string, runnerPath: string, modelPath: string, modelCacheDir: string, maxAudioBytes: number, timeoutMs: number, language: string }>, tts: Readonly<{ provider: string, baseUrl: string, voice: string }> }>}
+ * @type {Readonly<{ model: Readonly<{ provider: string, baseUrl: string, model: string, maxContextTokens: number, disableThinking: boolean }>, stt: Readonly<{ provider: string, baseUrl: string, pythonExecutable: string, runnerPath: string, modelPath: string, modelCacheDir: string, maxAudioBytes: number, timeoutMs: number, language: string }>, tts: Readonly<{ provider: string, baseUrl: string, voice: string }> }>}
  */
 const OPENPARLOR_CONFIG_SCHEMA = Object.freeze({
-    model: Object.freeze({ provider: 'openai-compatible', baseUrl: '', model: '', maxContextTokens: 0 }),
+    model: Object.freeze({ provider: 'openai-compatible', baseUrl: '', model: '', maxContextTokens: 0, disableThinking: true }),
     stt: Object.freeze({ provider: '', baseUrl: '', pythonExecutable: '', runnerPath: '', modelPath: '', modelCacheDir: '', maxAudioBytes: 0, timeoutMs: 0, language: '' }),
     tts: Object.freeze({ provider: '', baseUrl: '', voice: '' }),
 });
@@ -37,12 +37,15 @@ function createDisabledConfig() {
 /**
  * Normalizes a single configuration field.
  * @param {*} value Raw parsed value
- * @param {string} defaultValue Default value from the schema
- * @returns {string} The value when it is a string, otherwise the default
+ * @param {string|number|boolean} defaultValue Default value from the schema
+ * @returns {string|number|boolean} The value when it matches the schema type, otherwise the default
  */
 function normalizeField(value, defaultValue) {
     if (typeof defaultValue === 'number') {
         return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : defaultValue;
+    }
+    if (typeof defaultValue === 'boolean') {
+        return typeof value === 'boolean' ? value : defaultValue;
     }
     return typeof value === 'string' ? value : defaultValue;
 }
