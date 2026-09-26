@@ -1,4 +1,5 @@
 import { RECENT_WINDOW_MESSAGES } from './conversation-summary.js';
+import { buildResponseStyleGuidance } from './response-style.js';
 
 const MAX_HISTORY_MESSAGES = 20;
 
@@ -92,6 +93,12 @@ function normalizeParticipantNames(entries) {
  *   Server-resolved character participants in participant order. When provided,
  *   the participant list in the system prompt uses these names and history is
  *   rendered speaker-relative to the target character.
+ * @param {unknown} [params.responseMode] Medium this turn is delivered in
+ *   ('text' | 'voice' | 'hands_free'). Voice and hands-free turns receive
+ *   response-style guidance; 'text' adds nothing, so a text-only chat
+ *   produces exactly the prompt it did before VOICE-005.
+ * @param {unknown} [params.voiceResponseLength] The user's spoken-length
+ *   preference ('concise' | 'normal' | 'detailed').
  * @param {string} [params.summary] Optional sanitized rolling summary of earlier
  *   turns. When present it is injected as a delimited untrusted context section
  *   (never as a character instruction) and the raw history window starts at
@@ -103,7 +110,7 @@ function normalizeParticipantNames(entries) {
  *   legacy last-N behavior is preserved.
  * @returns {Array<{role: string, content: string}>} Assembled model messages
  */
-export function buildPrompt({ character, conversation, history, newMessages, memories, currentTime, participantContext, summary }) {
+export function buildPrompt({ character, conversation, history, newMessages, memories, currentTime, participantContext, summary, responseMode, voiceResponseLength }) {
     const messages = [];
 
     // System prompt: global behavior + identity + persona + scenario + participants
@@ -146,6 +153,15 @@ export function buildPrompt({ character, conversation, history, newMessages, mem
             '[/Conversation Summary]',
         ].join('\n'));
     }
+    // VOICE-005 response-style policy. Appended LAST and only when non-empty,
+    // so it reads as a subordinate note about delivery rather than as another
+    // source of identity. For text mode this is '' and the prompt is unchanged.
+    const styleGuidance = buildResponseStyleGuidance({
+        mode: responseMode,
+        length: voiceResponseLength,
+    });
+    if (styleGuidance !== '') systemParts.push(styleGuidance);
+
     messages.push({ role: 'system', content: systemParts.join('\n\n') });
 
     // Speaker-relative history. When a participant context is provided, each
