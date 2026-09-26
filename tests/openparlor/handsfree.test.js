@@ -35,6 +35,9 @@ import {
 
 const SAMPLE_RATE = 16000;
 const FRAME_SAMPLES = 160;
+// 10 ms per frame at 16 kHz. The VAD is frame-driven, so every duration in
+// these tests is expressed in frames.
+const FRAME_MS = (FRAME_SAMPLES / SAMPLE_RATE) * 1000;
 
 function frame(amp) {
     const samples = new Float32Array(FRAME_SAMPLES);
@@ -47,6 +50,18 @@ const silentFrame = () => frame(0.001);
 
 function feed(hf, count, make = loudFrame) {
     for (let i = 0; i < count; i += 1) hf.onAudioFrame(make());
+}
+
+// VOICE-004: the endpoint pause is adaptive, so a test that asserts a captured
+// WAV length must derive the pause from the detector rather than hard-code a
+// duration. These tests are about what is captured (only the user's words, and
+// a bounded size), not about one particular pause length. This probe runs the
+// real detector over the same speech the test feeds and reports how many
+// silent frames it needs to endpoint.
+function endpointFramesAfterSpeech(speechFrames = 20) {
+    const probe = createEnergyVad({});
+    for (let i = 0; i < speechFrames; i += 1) probe.processFrame(loudFrame());
+    return Math.ceil(probe.requiredSilenceMs / FRAME_MS);
 }
 
 const flush = () => new Promise((resolve) => { setImmediate(resolve); });
@@ -205,27 +220,33 @@ describe('createEnergyVad', () => {
         assert.equal(vad.isActive, false);
     });
 
-    it('ends the utterance after the sustained silence', () => {
+    it('ends the utterance once the adaptive silence threshold is met', () => {
         const ends = [];
         const vad = createEnergyVad({ onSpeechEnd: (reason) => { ends.push(reason); } });
         for (let i = 0; i < 20; i += 1) vad.processFrame(loudFrame());
         assert.equal(vad.isActive, true);
-        for (let i = 0; i < 89; i += 1) vad.processFrame(silentFrame()); // 890 ms
-        assert.equal(vad.isActive, true);
-        vad.processFrame(silentFrame()); // 900 ms
+        // VOICE-004: the required pause is adaptive, so assert against the
+        // detector's own current threshold rather than a fixed 900 ms.
+        const required = vad.requiredSilenceMs;
+        assert.ok(required < 900, 'a short utterance endpoints faster than the old fixed wait');
+        const frames = Math.ceil(required / FRAME_MS);
+        for (let i = 0; i < frames - 1; i += 1) vad.processFrame(silentFrame());
+        assert.equal(vad.isActive, true, 'the pause is not quite long enough yet');
+        vad.processFrame(silentFrame());
         assert.equal(vad.isActive, false);
         assert.deepEqual(ends, ['silence']);
     });
 
     it('ends the utterance at the max duration cap', () => {
         const ends = [];
-        const vad = createEnergyVad({ onSpeechEnd: (reason) => { ends.push(reason); } });
+        // Explicit cap: this asserts the CAP behavior, not the default value.
+        const vad = createEnergyVad({ maxUtteranceMs: 1500, onSpeechEnd: (reason) => { ends.push(reason); } });
         for (let i = 0; i < 20; i += 1) vad.processFrame(loudFrame());
-        // utteranceStartMs is 0, so the cap hits at clockMs = 15000 (1500 frames).
-        for (let i = 0; i < 1479; i += 1) vad.processFrame(loudFrame());
-        assert.equal(vad.isActive, true);
+        // utteranceStartMs is 0, so the cap hits at clockMs = 1500 (150 frames).
+        for (let i = 0; i < 129; i += 1) vad.processFrame(loudFrame());
+        assert.equal(vad.isActive, true, 'not yet at the cap');
         vad.processFrame(loudFrame());
-        assert.equal(vad.isActive, false);
+        assert.equal(vad.isActive, false, 'the cap ended the utterance');
         assert.deepEqual(ends, ['max-duration']);
     });
 
@@ -416,13 +437,14 @@ describe('createHandsFreeController utterance pipeline', () => {
         ]);
         // The transcribed blob is a standalone WAV: the utterance started
         // right after enable, so the pre-roll ring held only the 200 ms of
-        // loud frames at begin time; endpointing added 900 ms of silence.
+        // loud frames at begin time, plus the adaptive endpointing silence.
         const wav = await parseWav(env.blobs[0]);
         assert.equal(wav.type, 'audio/wav');
         assert.equal(wav.sampleRate, SAMPLE_RATE);
         assert.equal(wav.channels, 1);
         assert.equal(wav.bitsPerSample, 16);
-        assert.equal(wav.dataLen, 1100 * (SAMPLE_RATE / 1000) * 2);
+        const capturedFrames = 20 + endpointFramesAfterSpeech(20);
+        assert.equal(wav.dataLen, capturedFrames * FRAME_SAMPLES * 2);
         assert.equal(wav.pcm[0], Math.round(0.1 * 32767), 'the loud onset leads the WAV');
         controller.markResponseComplete();
         assert.equal(controller.state, HANDSFREE_STATES.LISTENING);
@@ -541,9 +563,10 @@ describe('createHandsFreeController utterance pipeline', () => {
             controller.markResponseComplete();
         }
         assert.equal(env.blobs.length, 3, 'one independent WAV per cycle');
-        // Every cycle captures exactly 300 ms of pre-roll, 200 ms of speech,
-        // and 900 ms of endpointing silence — no growth across cycles.
-        const expectedBytes = 1400 * (SAMPLE_RATE / 1000) * 2;
+        // Every cycle captures the same 300 ms of pre-roll, 200 ms of speech,
+        // and the same adaptive endpointing pause — no growth across cycles.
+        const capturedFrames = 30 + 20 + endpointFramesAfterSpeech(20);
+        const expectedBytes = capturedFrames * FRAME_SAMPLES * 2;
         assert.deepEqual(dataLens, [expectedBytes, expectedBytes, expectedBytes]);
         assert.ok(
             controller.capture.bufferedSamples <= 1300 * (SAMPLE_RATE / 1000),
@@ -612,9 +635,9 @@ describe('createHandsFreeController TTS cooperation', () => {
         await flush();
         assert.equal(env.blobs.length, 1, 'one utterance should be transcribed');
         const wav = await parseWav(env.blobs[0]);
-        // The total number of samples should correspond to 200 ms of speech
-        // plus 900 ms of silence: 110 frames × FRAME_SAMPLES = 17600 samples.
-        const expectedSamples = 110 * FRAME_SAMPLES;
+        // 200 ms of speech plus the adaptive endpointing silence, with no
+        // pre-TTS audio: the ring was cleared when speaking began.
+        const expectedSamples = (20 + endpointFramesAfterSpeech(20)) * FRAME_SAMPLES;
         assert.equal(
             wav.pcm.length,
             expectedSamples,
@@ -868,11 +891,26 @@ describe('createPcmUtteranceCapture', () => {
     });
 
     it('hard-caps the active utterance at the max duration', () => {
+        // Explicit cap: this asserts the CAP behavior, not the default value.
+        const cap = createPcmUtteranceCapture({ maxUtteranceMs: 1500 });
+        cap.begin(0);
+        for (let i = 0; i < 2000; i += 1) cap.processFrame(loudFrame()); // 20 s fed
+        const out = cap.end();
+        assert.equal(out.samples.length, 1500 * (SAMPLE_RATE / 1000), 'oldest frames drop, newest are kept');
+    });
+
+    it('the capture cap and the detector cap share one default', () => {
+        // They must agree: the detector decides when a turn ends, the capture
+        // decides how much of it survives. A capture that capped earlier would
+        // silently discard the oldest audio of a long utterance.
         const cap = createPcmUtteranceCapture();
         cap.begin(0);
+        // Feed well past the OLD 15 s cap. Sharing the detector's cap means
+        // all of it is retained.
         for (let i = 0; i < 2000; i += 1) cap.processFrame(loudFrame()); // 20 s
         const out = cap.end();
-        assert.equal(out.samples.length, 15000 * (SAMPLE_RATE / 1000), 'oldest frames drop, newest are kept');
+        assert.equal(out.samples.length, 2000 * FRAME_SAMPLES,
+            'the capture must retain a 20 s utterance, so its cap is not 15 s');
     });
 
     it('discard() clears the active utterance and the pre-roll ring', () => {

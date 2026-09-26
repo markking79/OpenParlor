@@ -42,6 +42,8 @@ import { createStreamingTtsSession } from '../../public/openparlor/streaming-tts
 
 const SAMPLE_RATE = 16000;
 const FRAME_SAMPLES = 160;
+// 10 ms per frame at 16 kHz; the VAD is frame-driven, so durations are in frames.
+const FRAME_MS = (FRAME_SAMPLES / SAMPLE_RATE) * 1000;
 
 function frame(amp) {
     const samples = new Float32Array(FRAME_SAMPLES);
@@ -215,18 +217,22 @@ describe('createEnergyVad.adopt (VOICE-003)', () => {
         vad.adopt(300);
         assert.equal(vad.isHeld, false, 'adopt releases the TTS hold');
         assert.equal(vad.isActive, true, 'the utterance is already in progress');
-        for (let i = 0; i < 89; i += 1) vad.processFrame(silence());
-        assert.deepEqual(ends, [], '890 ms is not yet the endpoint');
+        // VOICE-004: endpointing is adaptive, and adopt() credits the 300 ms
+        // of speech already spent, so ask the detector for its own threshold.
+        const frames = Math.ceil(vad.requiredSilenceMs / FRAME_MS);
+        for (let i = 0; i < frames - 1; i += 1) vad.processFrame(silence());
+        assert.deepEqual(ends, [], 'the pause is not quite long enough yet');
         vad.processFrame(silence());
         assert.deepEqual(ends, ['silence'], 'a one-word interrupt can still end');
     });
 
     it('credits already-elapsed speech to the max-duration cap', () => {
         const ends = [];
-        const vad = createEnergyVad({ onSpeechEnd: (reason) => { ends.push(reason); } });
-        // Default cap is 15 s; a 14.5 s lookback plus 1 s of frames hits it.
-        vad.adopt(14500);
-        for (let i = 0; i < 100; i += 1) vad.processFrame(silence());
+        // Explicit cap so this asserts the CREDIT, not the default value.
+        const vad = createEnergyVad({ maxUtteranceMs: 1000, onSpeechEnd: (reason) => { ends.push(reason); } });
+        // A 0.9 s lookback plus 0.2 s of frames crosses the 1 s cap.
+        vad.adopt(900);
+        for (let i = 0; i < 20; i += 1) vad.processFrame(silence());
         assert.deepEqual(ends, ['max-duration'], 'the cap is measured from the real onset');
     });
 });

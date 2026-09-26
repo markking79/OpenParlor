@@ -110,11 +110,44 @@ export function computeFrameRms(samples) {
 // per instance so a later adaptive detector can tune them without code
 // changes upstream.
 const DEFAULT_VAD_OPTIONS = {
+    // VOICE-004: one threshold decides "is the speaker talking". The old
+    // separate silenceThreshold is gone: it existed only to zero the endpoint
+    // pause on any frame above it, which made endpointing restart on room
+    // noise. Everything below the speech threshold now extends the pause
+    // instead, so the second knob had no honest meaning left.
     speechThreshold: 0.01,
-    silenceThreshold: 0.005,
     startSustainMs: 200,
-    endSilenceMs: 900,
-    maxUtteranceMs: 15000,
+    // VOICE-004: adaptive endpointing. The silence needed to end an utterance
+    // scales with how much has actually been said, between these bounds.
+    // A one-word answer ends briskly; a long story is allowed to hesitate.
+    minEndSilenceMs: 600,
+    maxEndSilenceMs: 1500,
+    // Speech time at which the required pause reaches maxEndSilenceMs.
+    adaptiveRampMs: 8000,
+    // A blip shorter than this does not count as the speaker resuming, so a
+    // cough, a lip smack, or a keyboard click cannot cancel a real pause.
+    minResumeSpeechMs: 80,
+    // How long the signal may dip below speechThreshold before we conclude the
+    // speech actually stopped. Real speech crosses the threshold constantly:
+    // between syllables, and for 300-400ms at a time when someone hesitates.
+    // Requiring strictly continuous energy -- at the start AND when resuming --
+    // meant a soft-spoken person could never start, and once speaking, could
+    // never have a pause reset. Both were cut off mid-sentence.
+    //
+    // Sized to match minEndSilenceMs on purpose: a gap shorter than the pause
+    // that would end an utterance must not count as "the speech stopped".
+    // These thresholds answer the same question, so they must not disagree.
+    maxSpeechDipMs: 600,
+    // Hard cap, not a soft target: no pause will ever let an utterance run
+    // past this. It exists to rescue a stuck microphone, NOT to bound a
+    // conversation -- the adaptive pause ends real speech long before it.
+    //
+    // Sized with deliberate headroom above the required 30-second-story
+    // dogfood scenario. A 30 s story is roughly 25 s of speech plus breath
+    // pauses, i.e. ~30 s measured from the onset; a 30 s cap left almost no
+    // margin and truncated longer monologues. 45 s of UNBROKEN sound is
+    // unambiguously a stuck mic, which is what this cap is for.
+    maxUtteranceMs: 45000,
     preRollMs: 300,
 };
 
@@ -123,17 +156,35 @@ const DEFAULT_VAD_OPTIONS = {
  *
  * Frame-driven (no wall clock): each processFrame advances an internal clock
  * by the frame's duration, which makes behavior fully deterministic under
- * test. Speech start requires `startSustainMs` of sustained loud frames (a
- * tiny click/spike below that never triggers). Once active, the utterance
- * ends after `endSilenceMs` of sustained quiet frames or when the utterance
- * reaches `maxUtteranceMs` (hard cap). `hold()` suppresses detection while
- * TTS audio plays (half-duplex); `release()` clears any in-progress state.
+ * test. There is no endpoint timer anywhere -- "did the pause last long
+ * enough" is answered from accumulated frame durations, so all timing logic
+ * lives in this one component and a cancelled utterance can never leave
+ * anything pending to fire later.
+ *
+ * State machine (VOICE-004): IDLE -> SPEAKING -> POSSIBLE_END -> IDLE.
+ * A quiet frame enters POSSIBLE_END; speech resumes and returns to SPEAKING;
+ * a pause long enough to satisfy the adaptive threshold ends the utterance.
+ *
+ * Speech start requires `startSustainMs` of accumulated loud energy, and the
+ * speaker must return above `speechThreshold` within `maxSpeechDipMs` of their
+ * last loud frame (a click or a bang never sustains either). The pause
+ * required to end scales with the speech time actually accumulated
+ * (minEndSilenceMs for a one-word answer, ramping to maxEndSilenceMs once
+ * adaptiveRampMs of speech has been said), so short replies do not feel
+ * sluggish and long ones tolerate a mid-sentence hesitation.
+ * `maxUtteranceMs` remains a hard cap.
+ *
+ * `hold()` suppresses detection while TTS audio plays; `release()` clears any
+ * in-progress state.
  *
  * @param {{
  *   speechThreshold?: number,
- *   silenceThreshold?: number,
  *   startSustainMs?: number,
- *   endSilenceMs?: number,
+ *   minEndSilenceMs?: number,
+ *   maxEndSilenceMs?: number,
+ *   adaptiveRampMs?: number,
+ *   minResumeSpeechMs?: number,
+ *   maxSpeechDipMs?: number,
  *   maxUtteranceMs?: number,
  *   preRollMs?: number,
  *   onSpeechStart?: (lookbackMs: number) => void,
@@ -147,15 +198,20 @@ const DEFAULT_VAD_OPTIONS = {
  *   adopt: (lookbackMs?: number) => void,
  *   isActive: boolean,
  *   isHeld: boolean,
+ *   state: 'idle'|'speaking'|'possibleEnd',
+ *   requiredSilenceMs: number,
  *   preRollMs: number,
  * }}
  */
 export function createEnergyVad(opts = {}) {
     const {
         speechThreshold = DEFAULT_VAD_OPTIONS.speechThreshold,
-        silenceThreshold = DEFAULT_VAD_OPTIONS.silenceThreshold,
         startSustainMs = DEFAULT_VAD_OPTIONS.startSustainMs,
-        endSilenceMs = DEFAULT_VAD_OPTIONS.endSilenceMs,
+        minEndSilenceMs = DEFAULT_VAD_OPTIONS.minEndSilenceMs,
+        maxEndSilenceMs = DEFAULT_VAD_OPTIONS.maxEndSilenceMs,
+        adaptiveRampMs = DEFAULT_VAD_OPTIONS.adaptiveRampMs,
+        minResumeSpeechMs = DEFAULT_VAD_OPTIONS.minResumeSpeechMs,
+        maxSpeechDipMs = DEFAULT_VAD_OPTIONS.maxSpeechDipMs,
         maxUtteranceMs = DEFAULT_VAD_OPTIONS.maxUtteranceMs,
         preRollMs = DEFAULT_VAD_OPTIONS.preRollMs,
         onSpeechStart = null,
@@ -165,14 +221,64 @@ export function createEnergyVad(opts = {}) {
     let holding = false;
     let active = false;
     let speechStreakMs = 0;
+    // Consecutive quiet frames while a start is still pending, and while a
+    // resume is still pending. A short dip between syllables must not discard
+    // the accumulated streak, but a genuine pause must.
+    let startGapMs = 0;
+    let resumeGapMs = 0;
+    // Length of the pause currently in progress (0 while SPEAKING).
     let silenceMs = 0;
+    // Consecutive speech above threshold while inside a pause. Only once this
+    // reaches minResumeSpeechMs does the speaker count as having resumed.
+    let resumeStreakMs = 0;
     let clockMs = 0;
     let utteranceStartMs = 0;
+    // Speech time actually accumulated, excluding pauses. Drives the adaptive
+    // endpoint threshold.
+    let speechMs = 0;
 
     function reset() {
         active = false;
         speechStreakMs = 0;
+        startGapMs = 0;
+        resumeGapMs = 0;
         silenceMs = 0;
+        resumeStreakMs = 0;
+        speechMs = 0;
+    }
+
+    /**
+     * The pause currently required to end the utterance, in ms.
+     *
+     * Scales with the speech actually said so far: a one-word answer wants a
+     * brisk endpoint, while a long story earns patience for a
+     * mid-sentence hesitation. Pure function of internal state, so tests can
+     * assert the ramp directly.
+     *
+     * @returns {number}
+     */
+    function requiredSilenceMs() {
+        if (!(adaptiveRampMs > 0)) return maxEndSilenceMs;
+        const ratio = Math.min(1, Math.max(0, speechMs / adaptiveRampMs));
+        return minEndSilenceMs + (maxEndSilenceMs - minEndSilenceMs) * ratio;
+    }
+
+    function endUtterance(reason) {
+        active = false;
+        silenceMs = 0;
+        resumeStreakMs = 0;
+        speechMs = 0;
+        // The start streak must die with the utterance. Leaving it set let the
+        // NEXT utterance's streak accumulate on top of this one, so the
+        // reported lookback grew by one frame per turn (200ms, 210ms, 220ms,
+        // ...) and the capture layer rewound further and further into the
+        // past on every cycle. An unbounded pre-roll is both a memory leak
+        // and a way to feed stale audio from earlier turns into the current
+        // transcription.
+        speechStreakMs = 0;
+        startGapMs = 0;
+        resumeGapMs = 0;
+        if (onSpeechEnd) onSpeechEnd(reason);
     }
 
     function processFrame(frame) {
@@ -186,10 +292,15 @@ export function createEnergyVad(opts = {}) {
         if (!active) {
             silenceMs = 0;
             if (rms >= speechThreshold) {
+                startGapMs = 0;
                 speechStreakMs += frameMs;
                 if (speechStreakMs >= startSustainMs) {
                     active = true;
                     silenceMs = 0;
+                    resumeStreakMs = 0;
+                    // The confirmed streak is speech, and counts toward the
+                    // adaptive threshold from the moment the utterance began.
+                    speechMs = speechStreakMs;
                     // Approximate the true speech onset: the sustained
                     // streak began speechStreakMs ago.
                     utteranceStartMs = Math.max(0, clockMs - speechStreakMs);
@@ -202,23 +313,68 @@ export function createEnergyVad(opts = {}) {
                     }
                 }
             } else {
-                speechStreakMs = 0;
+                // A dip below threshold is NOT automatically silence. Real
+                // speech crosses the threshold constantly: between syllables,
+                // and for 300-400ms at a time when someone hesitates mid
+                // sentence. Resetting the streak on the FIRST quiet frame
+                // meant a genuine speaker could never start at all.
+                //
+                // The invariant: a gap shorter than the pause that would END
+                // an utterance is part of speech, not the end of it. So the
+                // pending start tolerates dips up to maxSpeechDipMs, while the
+                // streak itself counts ONLY genuinely loud energy. A click
+                // cannot sustain a start (60ms is not 200ms of voice) but a
+                // hesitant speaker, who keeps returning above threshold,
+                // accumulates real speech time and starts normally.
+                startGapMs += frameMs;
+                if (startGapMs > maxSpeechDipMs) speechStreakMs = 0;
             }
             return;
         }
 
-        // Active utterance: look for endpointing silence or the hard cap.
-        if (rms < silenceThreshold) {
-            silenceMs += frameMs;
+        // Active utterance: IDLE -> SPEAKING <-> POSSIBLE_END.
+        if (rms >= speechThreshold) {
+            if (silenceMs > 0) {
+                // In a pause. A single blip is not the speaker resuming.
+                resumeGapMs = 0;
+                resumeStreakMs += frameMs;
+                if (resumeStreakMs >= minResumeSpeechMs) {
+                    // Real speech resumed: POSSIBLE_END -> SPEAKING. The pause
+                    // is discarded and does not count as speech.
+                    silenceMs = 0;
+                    resumeStreakMs = 0;
+                }
+            } else {
+                // Continuous speech.
+                resumeGapMs = 0;
+                speechMs += frameMs;
+            }
         } else {
-            silenceMs = 0;
+            // Below the speech threshold, so this is not the speaker talking.
+            // It EXTENDS the pause and, critically, never RESETS it.
+            //
+            // That includes ordinary room noise. The previous implementation
+            // zeroed the pause on any frame above the old silenceThreshold, so
+            // a single hiss in a noisy room restarted endpointing and a long
+            // pause could never complete. Ignoring such frames outright is
+            // just as wrong: the utterance would then hang until the hard cap.
+            // Extending is the only behavior that is both stable and
+            // terminating.
+            //
+            // A pending "the speaker resumed" streak is NOT discarded on the
+            // first quiet frame, for the same reason as at the start: a
+            // soft-spoken person's syllable is only briefly above threshold,
+            // so demanding strictly consecutive frames meant the pause never
+            // reset and quiet speakers were cut off mid-sentence.
+            resumeGapMs += frameMs;
+            if (resumeGapMs > maxSpeechDipMs) resumeStreakMs = 0;
+            silenceMs += frameMs;
         }
-        if (silenceMs >= endSilenceMs) {
-            active = false;
-            if (onSpeechEnd) onSpeechEnd('silence');
+
+        if (silenceMs >= requiredSilenceMs()) {
+            endUtterance('silence');
         } else if (clockMs - utteranceStartMs >= maxUtteranceMs) {
-            active = false;
-            if (onSpeechEnd) onSpeechEnd('max-duration');
+            endUtterance('max-duration');
         }
     }
 
@@ -240,6 +396,10 @@ export function createEnergyVad(opts = {}) {
      * endpoint detection, crediting `lookbackMs` of already-elapsed speech so
      * the max-duration cap is measured from the real onset.
      *
+     * VOICE-004: the same credit feeds the adaptive threshold, so an
+     * interrupting turn that has already spoken for a second is not treated
+     * like a one-word answer when deciding how long to wait.
+     *
      * Without this, a short interrupt ("wait", one word) would have to satisfy
      * the full start-sustain window again and the utterance could never end,
      * leaving Hands-Free stuck in HEARING.
@@ -252,11 +412,13 @@ export function createEnergyVad(opts = {}) {
         active = true;
         speechStreakMs = 0;
         silenceMs = 0;
+        resumeStreakMs = 0;
         // Deliberately allowed to be negative: a confirmed interrupt proves
         // speech began BEFORE this VAD's clock reached the lookback, so
         // clamping to zero would push the max-duration cap into the future.
         const back = Number.isFinite(lookbackMs) && lookbackMs > 0 ? lookbackMs : 0;
         utteranceStartMs = clockMs - back;
+        speechMs = back;
     }
 
     return {
@@ -267,6 +429,14 @@ export function createEnergyVad(opts = {}) {
         adopt,
         get isActive() { return active; },
         get isHeld() { return holding; },
+        // IDLE / SPEAKING / POSSIBLE_END (VOICE-004). Exposed so the endpoint
+        // contract is directly assertable, and so a future status surface can
+        // show "did you stop talking?" without duplicating detector state.
+        get state() {
+            if (!active) return 'idle';
+            return silenceMs > 0 ? 'possibleEnd' : 'speaking';
+        },
+        get requiredSilenceMs() { return requiredSilenceMs(); },
         get preRollMs() { return preRollMs; },
     };
 }
@@ -522,7 +692,12 @@ export function createPcmUtteranceCapture(opts = {}) {
     const {
         preRollMs = 300,
         maxLookbackMs = 1000,
-        maxUtteranceMs = 15000,
+        // Same source as the detector's hard cap. These two limits MUST
+        // agree: the VAD decides when an utterance ends, and the capture
+        // decides how much of it survives. If the capture's cap were the
+        // smaller of the two, a long utterance would silently lose its
+        // oldest audio while the detector still believed it was speaking.
+        maxUtteranceMs = DEFAULT_VAD_OPTIONS.maxUtteranceMs,
     } = opts;
 
     let sampleRate = 0;
