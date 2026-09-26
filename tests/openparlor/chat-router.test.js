@@ -2316,6 +2316,61 @@ test('group prompt keeps speaker identity of persisted history for the selected 
     }
 });
 
+// End-to-end regression for the reported routing bug: a character asked the
+// user a question, the user answered, and a DIFFERENT character responded.
+// Routing runs over the real persisted history, so this covers the whole
+// path from stored messages to the model call.
+test('the character who asked the question is the one who answers the user', async () => {
+    const tmp = makeTempDirs();
+    try {
+        const dirs = { root: tmp.root };
+        persistence.ensureOpenParlorDirs(dirs);
+        const doug = persistence.createCharacter(dirs, 'alice', { name: 'Doug', system_prompt: 'You are Doug.' });
+        const monica = persistence.createCharacter(dirs, 'alice', { name: 'Monica', system_prompt: 'You are Monica.' });
+        const conv = persistence.createConversation(dirs, 'alice', doug.id, 'Group');
+        findAndModifyConversation(dirs, conv.id, data => {
+            data.participants.push({ id: 'part-monica', character_id: monica.id, role: 'character' });
+        });
+        const conversation = persistence.getConversation(dirs, conv.id);
+        const dougParticipant = conversation.participants.find(p => p.character_id === doug.id);
+        const monicaParticipant = conversation.participants.find(p => p.character_id === monica.id);
+
+        // The reported transcript: Monica introduces herself, then Doug asks
+        // the user a question.
+        persistence.appendMessage(dirs, conv.id, monicaParticipant.id, 'I\'m Monica!', 'character');
+        persistence.appendMessage(dirs, conv.id, dougParticipant.id, 'I\'m Doug, by the way. What\'s your name?', 'character');
+
+        const mock = mockProvider(() => completion);
+        const user = { profile: { handle: 'alice' }, directories: dirs };
+
+        await withChatServer({
+            loadConfig: async () => configuredConfig,
+            createProvider: () => mock.provider,
+            runMemoryExtraction: async () => [],
+        }, user, async baseUrl => {
+            const result = await postChat(baseUrl, {
+                messages: [{ role: 'user', content: 'Oh, my name is Mark.' }],
+                conversation_id: conv.id,
+            });
+            assert.equal(result.status, 200);
+        });
+
+        // Doug asked, so only Doug may be prompted.
+        assert.equal(mock.calls.length, 1, 'exactly one character answers the reply');
+        const prompt = mock.calls[0];
+        assert.ok(prompt[0].content.includes('You are Doug.'),
+            'the asker (Doug) must generate the reply, not the bystander');
+        assert.ok(!prompt[0].content.includes('You are Monica.'),
+            'Monica must not be prompted for an answer to Doug\'s question');
+        // The pending question is still visible in Doug's own prompt.
+        const dougLine = prompt.find(m => m.content === 'I\'m Doug, by the way. What\'s your name?');
+        assert.ok(dougLine, 'Doug\'s own earlier turn must be present as his own speech');
+        assert.equal(dougLine.role, 'assistant');
+    } finally {
+        tmp.cleanup();
+    }
+});
+
 // --- STAB-005: rolling summary + prompt budget integration ----------------
 
 test('POST /chat injects the stored rolling summary and drops the summarized prefix from raw history', async () => {
